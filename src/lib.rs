@@ -48,3 +48,4 @@ pub mod pcp;
 
 /// Reauthenticated Data QUIC lane pool with fault-driven repair.
 pub mod resilient_data;
+pub mod punch;
