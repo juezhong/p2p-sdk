@@ -31,3 +31,6 @@ pub mod ice_agent;
 #[cfg(test)]
 mod ice_quinn_integration;
 pub mod manual_ice_v2;
+
+pub mod ice_gather;
+pub mod ice_multi;
