@@ -39,3 +39,5 @@ pub mod ice_multi;
 mod manual_full_integration;
 
 pub mod local_network;
+
+pub mod nat_pmp;
