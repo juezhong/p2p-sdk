@@ -8,6 +8,7 @@
 use quinn::Connection;
 
 #[derive(Clone)]
+#[allow(dead_code)]
 pub struct DualQuic {
     control: Connection,
     data: Connection,
@@ -18,10 +19,11 @@ pub enum DualQuicError {
     SameConnection,
 }
 
+#[allow(dead_code)]
 impl DualQuic {
     /// Caller must verify that both connections refer to the same authenticated
     /// peer and negotiated application session. This is not done here yet.
-    pub fn new(control: Connection, data: Connection) -> Result<Self, DualQuicError> {
+    pub(crate) fn new(control: Connection, data: Connection) -> Result<Self, DualQuicError> {
         if control.stable_id() == data.stable_id() {
             return Err(DualQuicError::SameConnection);
         }
