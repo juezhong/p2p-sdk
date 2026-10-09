@@ -45,6 +45,7 @@ pub mod multi_interface;
 
 pub mod nat_pmp;
 pub mod pcp;
+pub mod pcp_lease;
 
 /// Reauthenticated Data QUIC lane pool with fault-driven repair.
 pub mod resilient_data;
