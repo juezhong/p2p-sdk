@@ -7,6 +7,7 @@ pub mod candidate;
 pub mod config;
 pub mod state;
 pub mod stun;
+pub mod stun_client;
 
 pub use candidate::{Candidate, CandidateKind, Family, TransportProtocol};
 pub use config::{Config, ConfigError};
