@@ -68,3 +68,10 @@
 - M1 的**第一个纯编解码子任务**：[PR #4](https://github.com/juezhong/p2p-sdk/pull/4) 已合并，RFC 8489 STUN Binding request / response 与 IPv4/IPv6 XOR-MAPPED-ADDRESS 解码、边界/事务标识测试；合并提交 `dbd0d7b`。PR 最新 GitHub Actions fmt/Clippy/test 已通过。
 - 仍**没有**真正的 STUN UDP Client、ICE candidate pair 检查、Quinn/TLS 安全连接、实际 NAT 穿透、自动信令。编解码模块本身不认证 peer；其解析结果不可单独视为可信路径。
 - 下一项：Tokio UDP STUN 收发（随机 Transaction ID、服务端源地址验证、退避重试、超时/取消/脱敏诊断），接着验证 ICE Agent + Quinn 同一有效 UDP 映射；再开展真实双机 NAT 测试。
+
+## 当前进行中：STUN UDP 探针（2026-10-09）
+
+- 用户确认：Transfer 专用 `P2PT` 20 字节控制帧**不是 RFC 标准**，不应仅为假想复用提升到 SDK。保持在 Transfer 项目；独立 `feat/shared-control-framing` 实验分支不合并、无 PR。
+- [SDK PR #5](https://github.com/juezhong/p2p-sdk/pull/5)：新增 Tokio UDP 独立 STUN 地址探针、随机事务 ID、来源校验、重试/超时及 mock server 测试；请以最新 CI 的结果判定是否可合并。
+- **限制**：探针 socket 并非 ICE/Quinn 的正式 socket，不可把其映射视为直连通路；ICE Agent、Quinn TLS 和真实双机通信都尚未完成。
+- 下一个优先事项：选择/验证 ICE 实现并证明 ICE 与 Quinn 同一有效 UDP 映射的所有权和分包逻辑，随后进行加密双向 Stream Echo。
