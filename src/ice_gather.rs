@@ -16,6 +16,7 @@ use crate::{
 
 const HOST_PRIORITY: u32 = 2_130_706_431;
 const SRFLX_PRIORITY: u32 = 1_690_000_000;
+const PORTMAP_PRIORITY: u32 = 1_800_000_000;
 
 #[derive(Debug)]
 pub enum CandidateGatherError {
@@ -86,10 +87,56 @@ pub async fn gather(
     Ok(GatherResult { description, mapping })
 }
 
+/// Attach a gateway-confirmed mapping as an ICE candidate ONLY if it
+/// maps this exact UDP owner's host IP and source port. The remote peer must
+/// still successfully run authenticated ICE connectivity checks: a gateway
+/// mapping reply alone is never a usable QUIC path.
+pub fn add_portmapped_candidate(
+    description: &mut IceDescription,
+    local: SocketAddr,
+    external: SocketAddr,
+) -> Result<bool, CandidateGatherError> {
+    if description.candidates.iter().all(|c| {
+        c.kind != IceCandidateType::Host || c.address != local
+    }) || external.port() == 0 || external.ip().is_unspecified()
+        || external.ip().is_multicast() || external.is_ipv4() != local.is_ipv4()
+    {
+        return Err(CandidateGatherError::InvalidLocalEndpoint);
+    }
+    if description.candidates.iter().any(|c| c.address == external) {
+        return Ok(false);
+    }
+    if description.candidates.len() >= MAX_CANDIDATES {
+        return Ok(false);
+    }
+    description.candidates.push(IceCandidate {
+        address: external,
+        kind: IceCandidateType::PortMapped,
+        priority: PORTMAP_PRIORITY,
+    });
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::udp_owner::UdpOwner;
+
+    #[tokio::test]
+    async fn gateway_mapping_must_match_real_ice_udp_owner_before_advertising() {
+        let owner = UdpOwner::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let mut desc = gather(&owner.handle, &[], IceRole::Controlling,
+            Duration::from_secs(1)).await.unwrap().description;
+        let actual = owner.handle.local_address();
+        let mapped: SocketAddr = "198.51.100.9:55001".parse().unwrap();
+        assert!(add_portmapped_candidate(&mut desc, actual, mapped).unwrap());
+        assert_eq!(desc.candidates.last().unwrap().kind, IceCandidateType::PortMapped);
+        assert!(!add_portmapped_candidate(&mut desc, actual, mapped).unwrap());
+        assert!(add_portmapped_candidate(&mut desc,
+            "127.0.0.1:9999".parse().unwrap(), mapped).is_err());
+        assert!(add_portmapped_candidate(&mut desc,
+            actual, "[2001:db8::10]:50000".parse().unwrap()).is_err());
+    }
 
     #[tokio::test]
     async fn lan_without_stun_always_gathers_same_udp_socket() {
