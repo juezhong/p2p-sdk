@@ -237,3 +237,10 @@
 - 此分支新增 `manual_full_integration.rs`，模拟用户显式确认六位校验码：同一实际 UDP Owner Gather → v2 INVITE/REPLY 交换 ICE 描述并验证 → 双端标准 ICE nominated pair → 原 UDP Socket 上分别建立 Control/Data QUIC → 双向 TLS 证书验证、双连接 Session HMAC → Control/Data 双 Stream Echo → 单独关闭 Data 后 Control 继续 Echo。
 - 自动化测试在 localhost Linux 上运行；通过只表示完整模块链路本地可用，不等于真实双机跨 NAT 或证明自动用户确认 UI 安全。证书在测试中由代码生成和显式信任，真实使用需匹配配对安全信任与长期身份机制。
 - 下一阶段：候选端点/网卡发现、真实 Internet NAT 路径、STUN 暴露的地址是否可达、ICE consent/restart、Transfer CLI 全链路连接/文件传输及五平台用户验证。
+
+## 手动连接码携带 TLS 实际证书信任根（2026-10-09，开发 PR）
+
+- 因用户不应另行拷贝证书/密钥，`manual_ice_v2.rs` 新增包含**公开 X.509 DER 证书**的 INVITE/REPLY API（证书长度上限 2KiB，整个识别码有界）。原先仅有证书指纹无法让初次使用者配置标准 rustls 信任根；本改进让收到完整 V2 并核对配对码后可把严格匹配的对端 DER 放入 RootStore，而不跳过 TLS 验证。
+- 回复仍绑定邀请全文哈希并附 HMAC，X.509 DER 与 v1 指纹不一致时 fail closed；扩展完整集成测试从**交换码提取证书**构建双向 TLS 信任，而不再由测试直接共享证书对象。
+- 实际用户必须独立核对六位配对码；连接码泄露公开证书/局域网 IP/短期 ICE 密码，不宜在日志/不可信渠道分发。未做真实双机、持久设备证书生命周期、过期撤销、Web UI。
+- 最终用户 Debug/Release 仍在 Transfer；SDK 只负责库与自动化测试。
