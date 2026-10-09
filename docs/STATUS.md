@@ -89,3 +89,11 @@
 - SDK [PR #7](https://github.com/juezhong/p2p-sdk/pull/7) 已通过 CI 并合并，提交 `58c8fe1`：RFC 9443 STUN/QUIC 报文预分类、逻辑 Control/Data 角色与 ADR-0002；原 PR #6 因与 #5 冲突而关闭、未合并。
 - **控制面和数据面继续分离**：一个已验证的 UDP 数据端点可以承载 STUN/ICE/QUIC，但应用的 Control RPC/ACK/取消与 bulk Data Stream 必须逻辑分离；将来最多四条额外 data-only QUIC 的 UDP 端口必须重新验证连通性。当前仅有角色策略模型，没有真实 Stream API。
 - 尚未完成 ICE agent、Quinn UDP 适配和 TLS 身份认证、真实控制/数据 Stream 及真实两机 NAT 验证。下一阶段优先实现共享 UDP I/O Owner + ICE/Quinn 安全 Stream Echo，证明路径和报文分流稳定性。
+
+## 本轮 M1 开发：双 QUIC 控制/数据隔离（2026-10-09）
+
+- 已决定首版使用独立 Control QUIC + Data QUIC，**共用实际 ICE 验证的 UDP Endpoint**，两条连接具有各自生命周期；控制和数据 Stream 不是同一 QUIC 下仅逻辑分离。完整要求见 `docs/decisions/0003-dual-quic-control-data.md`。
+- 新增 `src/dual_quic.rs` Quinn 双连接句柄内部模型（构造函数仅 crate 内部可访问，**尚不执行 Peer Identity / Session ID 绑定**）；接入 Quinn 依赖。当前仍不是真实的安全 P2P Session。
+- 新增数据链接上限语义说明：默认 1 Control + 1 Data，额外 Data QUIC 的 0–4 配置不包括基础 Data。
+- 核心下一步：真实单 Quinn Endpoint 同 UDP Socket 双 QUIC 测试，Data 连接单独关闭后 Control RPC 成功；再引入双连接共同身份/会话绑定、ICE 路径与数据链接重建。
+- 即使 Control 和 Data 独立 QUIC，也不能抵抗同一 UDP Socket 或 NAT/物理路径故障，需有重连；高吞吐共用带宽须做控制延迟实测。
