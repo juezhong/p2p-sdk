@@ -8,6 +8,7 @@ pub mod channel;
 pub mod dual_quic;
 pub mod config;
 pub mod packet_demux;
+pub mod peer_pin;
 pub mod manual_pairing;
 pub mod session_binding;
 pub mod state;
