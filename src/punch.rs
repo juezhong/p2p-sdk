@@ -116,10 +116,15 @@ impl AuthenticatedPunch {
         remote: &IceDescription,
     ) -> Result<usize, UdpOwnerError> {
         let now = unix_seconds().map_err(|_| UdpOwnerError::Io)?;
-        let packet = self.make_packet(now).map_err(|_| UdpOwnerError::Entropy)?;
+        if remote.validate().is_err() || remote.role != opposite(self.role) {
+            return Err(UdpOwnerError::Io);
+        }
         let mut sent = 0usize;
         for candidate in &remote.candidates {
             if candidate.address.is_ipv4() == handle.local_address().is_ipv4() {
+                // Fresh nonce per destination allows independently validated
+                // peer-reflexive paths without false replay collisions.
+                let packet = self.make_packet(now).map_err(|_| UdpOwnerError::Entropy)?;
                 handle.send_punch(candidate.address, &packet).await?;
                 sent += 1;
             }
