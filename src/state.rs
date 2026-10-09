@@ -15,7 +15,10 @@ pub enum ConnectionPhase {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StateError {
-    InvalidTransition { from: ConnectionPhase, to: ConnectionPhase },
+    InvalidTransition {
+        from: ConnectionPhase,
+        to: ConnectionPhase,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -24,11 +27,17 @@ pub struct ConnectionState {
 }
 
 impl Default for ConnectionState {
-    fn default() -> Self { Self { phase: ConnectionPhase::Created } }
+    fn default() -> Self {
+        Self {
+            phase: ConnectionPhase::Created,
+        }
+    }
 }
 
 impl ConnectionState {
-    pub fn phase(&self) -> ConnectionPhase { self.phase }
+    pub fn phase(&self) -> ConnectionPhase {
+        self.phase
+    }
 
     pub fn transition(&mut self, next: ConnectionPhase) -> Result<(), StateError> {
         use ConnectionPhase::*;
@@ -43,7 +52,10 @@ impl ConnectionState {
                 | (Connected, Checking)
         ) || !matches!(self.phase, Closed | Failed) && matches!(next, Closed | Failed);
         if !valid {
-            return Err(StateError::InvalidTransition { from: self.phase, to: next });
+            return Err(StateError::InvalidTransition {
+                from: self.phase,
+                to: next,
+            });
         }
         self.phase = next;
         Ok(())
