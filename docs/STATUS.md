@@ -153,3 +153,10 @@
 - 自动测试覆盖 localhost 上两条独立 Control/Data QUIC 的双向证书指纹校验、错误指纹拒绝、无客户端证书拒绝，以及缺少证书或信任根的配置拒绝。**这是 loopback 测试，不等于真实 NAT 测试。**
 - 尚未将 `ManualConfirmation`、临时密钥派生、两条 QUIC mTLS/Pin 校验和 HMAC 会话绑定合并为不可绕过的高层已授权 Session。生产级设备证书持久化/轮换/撤销和 ICE/Quinn 共 UDP I/O Owner、跨平台/双机网络验证仍未完成。
 - 下一开发重点：高层经验证双连接 Session 构造门禁；随后真实 ICE offer/answer 与 Quinn 共端口、两机 Stream Echo 测试。
+
+## SDK 与 Transfer 分工及手动安全会话（2026-10-09）
+
+- **SDK 不实现文件上传、文件下载、文件协议、磁盘 I/O 或 GUI。** 这些属于 `juezhong/p2p-transfer`。SDK 提供身份、手动/可选服务器信令、ICE/NAT、独立 Control QUIC 与 Data QUIC 及网络诊断。
+- 本开发分支提供 `VerifiedManualSession`：过期拒绝、人工验证码与本次配对绑定、实际两条 QUIC TLS 叶证书指纹验证、Control/Data 会话 HMAC 证明，并将原始会话组装函数收紧到 crate 内部。
+- 尚缺少真正 ICE 选路、网络路径共 UDP 接收复用，以及 QUIC 身份长期轮换/凭据撤销；SDK API 仍允许低层 `quinn::Connection` 处理，不应误认为应用无法自行绕开 SDK 的高层授权。正式安全会话需要强制走 `VerifiedManualSession` 门禁。
+- 以后开发完成和 CI 结果优先同步评论到 SDK 长期文档 PR #2；Transfer 相关依赖与业务状态同步评论到 Transfer 长期文档 PR #1，**两个记录 PR 不合并**。

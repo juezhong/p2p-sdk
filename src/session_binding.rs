@@ -128,7 +128,7 @@ impl AuthenticatedLink {
 
 /// Initiator side: one bounded, bidirectional QUIC stream for mutual session
 /// proof. Does not disable TLS verification or trust arbitrary certificates.
-pub async fn authenticate_initiator(
+pub(crate) async fn authenticate_initiator(
     connection: Connection,
     credentials: &SessionCredentials,
     role: ChannelRole,
@@ -178,7 +178,7 @@ pub async fn authenticate_initiator(
 
 /// Responder side. `guard` must be owned by the application session and
 /// shared across both QUIC connections; not recreated for every incoming link.
-pub async fn authenticate_responder(
+pub(crate) async fn authenticate_responder(
     connection: Connection,
     credentials: &SessionCredentials,
     expected_role: ChannelRole,

@@ -19,3 +19,5 @@ pub mod tls_identity;
 pub use candidate::{Candidate, CandidateKind, Family, TransportProtocol};
 pub use config::{Config, ConfigError};
 pub use state::{ConnectionPhase, ConnectionState, StateError};
+
+pub mod verified_session;

@@ -115,6 +115,20 @@ impl ManualConfirmation {
         }
         Ok(())
     }
+
+    /// Verify that the explicitly confirmed code belongs to this precise
+    /// pairing, not merely to a caller-supplied session ID.
+    pub(crate) fn ensure_pairing_confirmed(
+        &self,
+        session_id: [u8; 16],
+        comparison_code: u32,
+    ) -> Result<(), PeerPinError> {
+        self.ensure_confirmed(session_id)?;
+        if self.expected_comparison_code != comparison_code {
+            return Err(PeerPinError::InvalidCode);
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
