@@ -143,6 +143,7 @@ impl GatewayLease {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::Ipv4Addr;
 
     fn fixture() -> netdev::Interface {
         let mut device = netdev::Interface::dummy();
