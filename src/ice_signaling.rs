@@ -6,6 +6,7 @@
 //! It must not be treated as trusted merely because it parses correctly.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use crate::session_binding::SessionCredentials;
 
 pub const MAX_CANDIDATES: usize = 32;
 pub const MAX_ICE_SIGNAL_SIZE: usize = 4096;
@@ -20,6 +21,9 @@ pub enum IceSignalError {
     InvalidFormat,
     UnsupportedVersion,
     Truncated,
+    Unauthorized,
+    WrongSession,
+    WrongRole,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -64,8 +68,8 @@ impl std::fmt::Debug for IceDescription {
 
 impl IceDescription {
     pub fn validate(&self) -> Result<(), IceSignalError> {
-        if !(4..=256).contains(&self.ufrag.len())
-            || !(22..=256).contains(&self.password.len())
+        if !(4..=255).contains(&self.ufrag.len())
+            || !(22..=255).contains(&self.password.len())
             || !self.ufrag.bytes().all(is_ice_char)
             || !self.password.bytes().all(is_ice_char)
         {
@@ -195,6 +199,66 @@ fn take<'a>(data: &'a [u8], pos: &mut usize, n: usize) -> Result<&'a [u8], IceSi
     Ok(s)
 }
 
+
+const AUTH_MAGIC: &[u8; 4] = b"P2IA";
+const AUTH_OVERHEAD: usize = 4 + 16 + 2 + 32;
+
+/// An authenticated ICE description scoped to one paired session. This
+/// message is confidential only if its delivery channel is confidential:
+/// authentication itself does not encrypt host candidates / ICE password.
+pub fn seal_description(
+    desc: &IceDescription,
+    credentials: &SessionCredentials,
+) -> Result<Vec<u8>, IceSignalError> {
+    let payload = desc.encode()?;
+    let role = role_tag(desc.role);
+    let tag = credentials.ice_signal_tag(role, &payload);
+    let mut out = Vec::with_capacity(AUTH_OVERHEAD + payload.len());
+    out.extend_from_slice(AUTH_MAGIC);
+    out.extend_from_slice(&credentials.session_id());
+    out.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    out.extend_from_slice(&payload);
+    out.extend_from_slice(&tag);
+    Ok(out)
+}
+
+/// Reject foreign sessions and forged descriptions *before* exposing any ICE
+/// parameters to a connectivity checker.
+pub fn open_description(
+    packet: &[u8],
+    credentials: &SessionCredentials,
+    expected_role: IceRole,
+) -> Result<IceDescription, IceSignalError> {
+    if packet.len() < AUTH_OVERHEAD || packet.len() > MAX_ICE_SIGNAL_SIZE + AUTH_OVERHEAD
+        || &packet[..4] != AUTH_MAGIC
+    {
+        return Err(IceSignalError::InvalidFormat);
+    }
+    if packet[4..20] != credentials.session_id() {
+        return Err(IceSignalError::WrongSession);
+    }
+    let n = u16::from_be_bytes([packet[20], packet[21]]) as usize;
+    if n > MAX_ICE_SIGNAL_SIZE || packet.len() != AUTH_OVERHEAD + n || n < 9 {
+        return Err(IceSignalError::InvalidFormat);
+    }
+    let payload = &packet[22..22 + n];
+    if !credentials.verify_ice_signal(role_tag(expected_role), payload, &packet[22 + n..]) {
+        return Err(IceSignalError::Unauthorized);
+    }
+    let desc = IceDescription::decode(payload)?;
+    if desc.role != expected_role {
+        return Err(IceSignalError::WrongRole);
+    }
+    Ok(desc)
+}
+
+fn role_tag(role: IceRole) -> u8 {
+    match role {
+        IceRole::Controlling => 1,
+        IceRole::Controlled => 2,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -249,6 +313,22 @@ mod tests {
         let formatted = format!("{:?}", desc());
         assert!(!formatted.contains("abcdefghijkl"));
         assert!(!formatted.contains("Abcd1234"));
+    }
+
+    #[test]
+    fn detects_wrong_session_wrong_role_and_tampering() {
+        let credentials = SessionCredentials::new([7; 16], [9; 32]).unwrap();
+        let different = SessionCredentials::new([8; 16], [9; 32]).unwrap();
+        let signal = seal_description(&desc(), &credentials).unwrap();
+        assert_eq!(open_description(&signal, &credentials, IceRole::Controlling), Ok(desc()));
+        assert_eq!(open_description(&signal, &different, IceRole::Controlling), Err(IceSignalError::WrongSession));
+        assert_eq!(open_description(&signal, &credentials, IceRole::Controlled), Err(IceSignalError::Unauthorized));
+        let mut tampered = signal.clone();
+        tampered[28] ^= 1;
+        assert_eq!(open_description(&tampered, &credentials, IceRole::Controlling), Err(IceSignalError::Unauthorized));
+        let mut trailing = signal;
+        trailing.push(0);
+        assert_eq!(open_description(&trailing, &credentials, IceRole::Controlling), Err(IceSignalError::InvalidFormat));
     }
 
     #[test]
