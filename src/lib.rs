@@ -5,6 +5,7 @@
 
 pub mod candidate;
 pub mod config;
+pub mod packet_demux;
 pub mod state;
 pub mod stun;
 
