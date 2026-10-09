@@ -97,3 +97,10 @@
 - 新增数据链接上限语义说明：默认 1 Control + 1 Data，额外 Data QUIC 的 0–4 配置不包括基础 Data。
 - 核心下一步：真实单 Quinn Endpoint 同 UDP Socket 双 QUIC 测试，Data 连接单独关闭后 Control RPC 成功；再引入双连接共同身份/会话绑定、ICE 路径与数据链接重建。
 - 即使 Control 和 Data 独立 QUIC，也不能抵抗同一 UDP Socket 或 NAT/物理路径故障，需有重连；高吞吐共用带宽须做控制延迟实测。
+
+## 双 QUIC 故障隔离验证（2026-10-09）
+
+- [PR #8](https://github.com/juezhong/p2p-sdk/pull/8) 已经通过 Actions 并 squash 合并到 `main`（`291224ff`）；其中 `DualQuic` 仍是内部句柄模型，不负责真实 ICE 或配对身份绑定。
+- [PR #9](https://github.com/juezhong/p2p-sdk/pull/9) 正开发 Quinn loopback 双 QUIC 集成测试：同一客户端 Endpoint/UDP 端口两条连接、测试专用证书验证、先控制 RPC、关闭数据连接、后控制 RPC。
+- 本测试只验证 Quinn Connection 级隔离；不是 ICE/共享 STUN I/O、真实 NAT/IPv6、防火墙、身份 Session 绑定或 Data 重连测试。以 PR #9 GitHub Actions 最新结果为准，未通过不合并。
+- 下一任务：控制/数据连接的设备身份与会话 ID 绑定，然后 ICE/QUIC 共 UDP I/O Owner、真实双机连通性和数据故障重建。
