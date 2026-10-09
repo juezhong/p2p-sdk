@@ -348,6 +348,9 @@ mod quinn_integration_tests {
             let (complete_tx, complete_rx) = tokio::sync::oneshot::channel::<()>();
             let server_task = tokio::spawn(async move {
                 let guard = ReplayGuard::new(4).unwrap();
+                // Keep both authenticated QUIC handles alive until the client
+                // has completed the full dual-lane handshake.
+                let mut accepted_links = Vec::new();
                 for role in [ChannelRole::Control, ChannelRole::Data] {
                     let incoming = server.accept().await.expect("incoming connection");
                     let connection = incoming.await.expect("TLS authentication");
@@ -356,7 +359,9 @@ mod quinn_integration_tests {
                     ).await.expect("authenticated session-bound connection");
                     assert_eq!(link.role(), role);
                     assert_eq!(link.session_id(), [4; 16]);
+                    accepted_links.push(link);
                 }
+                assert_eq!(accepted_links.len(), 2);
                 complete_rx.await.expect("client completed both handshakes");
                 server.close(0u32.into(), b"test complete");
             });
