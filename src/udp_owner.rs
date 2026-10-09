@@ -67,6 +67,22 @@ impl UdpOwnerHandle {
             .await.map_err(|_| UdpOwnerError::Closed)
     }
 
+    /// Send an authenticated punch probe from the exact existing ICE/QUIC
+    /// UDP port. The receiver authenticates packets before learning prflx.
+    pub async fn send_punch(&self, destination: SocketAddr, packet: &[u8])
+        -> Result<(), UdpOwnerError>
+    {
+        if destination.port() == 0 || destination.ip().is_unspecified()
+            || destination.is_ipv4() != self.local_address.is_ipv4()
+            || packet.len() != crate::punch::PACKET_BYTES
+            || classify_datagram(packet) != PacketRoute::Punch
+        {
+            return Err(UdpOwnerError::Io);
+        }
+        self.ice_outbound.send((destination, packet.to_vec())).await
+            .map_err(|_| UdpOwnerError::Closed)
+    }
+
     pub fn local_address(&self) -> SocketAddr {
         self.local_address
     }
@@ -103,6 +119,8 @@ impl UdpOwnerHandle {
 pub struct UdpOwner {
     pub handle: UdpOwnerHandle,
     pub ice_packets: mpsc::Receiver<InboundDatagram>,
+    /// Only a verified PunchAuthenticator may turn these into prflx candidates.
+    pub punch_packets: mpsc::Receiver<InboundDatagram>,
     pub(crate) quic_packets: mpsc::Receiver<InboundDatagram>,
     pub(crate) socket: Arc<UdpSocket>,
     pub(crate) quic_adapter_taken: bool,
@@ -116,11 +134,14 @@ impl UdpOwner {
         let (actions_tx, actions_rx) = mpsc::channel(QUEUE_CAPACITY);
         let (ice_out_tx, ice_out_rx) = mpsc::channel(QUEUE_CAPACITY);
         let (ice_tx, ice_rx) = mpsc::channel(QUEUE_CAPACITY);
+        let (punch_tx, punch_rx) = mpsc::channel(QUEUE_CAPACITY);
         let (quic_tx, quic_rx) = mpsc::channel(QUEUE_CAPACITY);
-        let task = tokio::spawn(run_owner(Arc::clone(&socket), actions_rx, ice_out_rx, ice_tx, quic_tx));
+        let task = tokio::spawn(run_owner(Arc::clone(&socket),
+            actions_rx, ice_out_rx, ice_tx, punch_tx, quic_tx));
         Ok(Self {
             handle: UdpOwnerHandle { local_address: local, actions: actions_tx, ice_outbound: ice_out_tx },
             ice_packets: ice_rx,
+            punch_packets: punch_rx,
             quic_packets: quic_rx,
             socket,
             quic_adapter_taken: false,
@@ -140,6 +161,7 @@ async fn run_owner(
     mut actions: mpsc::Receiver<Query>,
     mut ice_outbound: mpsc::Receiver<(SocketAddr, Vec<u8>)>,
     ice_tx: mpsc::Sender<InboundDatagram>,
+    punch_tx: mpsc::Sender<InboundDatagram>,
     quic_tx: mpsc::Sender<InboundDatagram>,
 ) {
     let mut pending = HashMap::<(SocketAddr, [u8; 12]), Query>::new();
@@ -194,6 +216,11 @@ async fn run_owner(
                             }
                         }
                         let _ = ice_tx.try_send(InboundDatagram {
+                            source, bytes: bytes.to_vec()
+                        });
+                    }
+                    PacketRoute::Punch => {
+                        let _ = punch_tx.try_send(InboundDatagram {
                             source, bytes: bytes.to_vec()
                         });
                     }
@@ -265,6 +292,29 @@ mod tests {
         assert_eq!(ice.source, server_address);
         assert_eq!(ice.bytes, binding_request(TransactionId([51; 12])));
         task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn punch_and_quic_are_demuxed_on_same_bound_socket() {
+        let mut a = UdpOwner::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let b = UdpOwner::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let credentials = crate::session_binding::SessionCredentials::new(
+            [9; 16], [7; 32],
+        ).unwrap();
+        let outgoing = crate::punch::AuthenticatedPunch::new(
+            credentials.clone(), crate::ice_signaling::IceRole::Controlling,
+        );
+        let incoming = crate::punch::AuthenticatedPunch::new(
+            credentials, crate::ice_signaling::IceRole::Controlled,
+        );
+        let stamp = crate::punch::unix_seconds().unwrap();
+        let packet = outgoing.make_packet(stamp).unwrap();
+        b.handle.send_punch(a.handle.local_address(), &packet).await.unwrap();
+        let received = timeout(Duration::from_secs(1), a.punch_packets.recv())
+            .await.unwrap().unwrap();
+        assert_eq!(received.source, b.handle.local_address());
+        assert_eq!(incoming.authenticate(&received.bytes, received.source, stamp),
+            Ok(b.handle.local_address()));
     }
 
     #[tokio::test]

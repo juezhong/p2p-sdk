@@ -92,6 +92,26 @@ impl SessionCredentials {
         mac.update(payload);
         mac.verify_slice(tag).is_ok()
     }
+
+    // Punch probes have a distinct MAC domain and cannot be replayed as
+    // session binding or ICE signaling. Secrets remain private to SDK.
+    pub(crate) fn punch_tag(&self, payload: &[u8]) -> [u8; 32] {
+        let mut mac = HmacSha256::new_from_slice(&self.secret).expect("fixed key");
+        mac.update(b"p2p-sdk/authenticated-udp-punch/v1");
+        mac.update(&self.session_id);
+        mac.update(payload);
+        let mut tag = [0u8; 32];
+        tag.copy_from_slice(&mac.finalize().into_bytes());
+        tag
+    }
+
+    pub(crate) fn verify_punch_tag(&self, payload: &[u8], tag: &[u8]) -> bool {
+        let mut mac = HmacSha256::new_from_slice(&self.secret).expect("fixed key");
+        mac.update(b"p2p-sdk/authenticated-udp-punch/v1");
+        mac.update(&self.session_id);
+        mac.update(payload);
+        mac.verify_slice(tag).is_ok()
+    }
 }
 
 /// Keeps the nonces of *successfully authenticated* peer connections for
