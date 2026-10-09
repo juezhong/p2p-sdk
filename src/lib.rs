@@ -4,7 +4,9 @@
 //! production-ready connectivity is implemented yet.
 
 pub mod candidate;
+pub mod channel;
 pub mod config;
+pub mod packet_demux;
 pub mod state;
 pub mod stun;
 pub mod stun_client;
