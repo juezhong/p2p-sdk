@@ -160,3 +160,11 @@
 - 本开发分支提供 `VerifiedManualSession`：过期拒绝、人工验证码与本次配对绑定、实际两条 QUIC TLS 叶证书指纹验证、Control/Data 会话 HMAC 证明，并将原始会话组装函数收紧到 crate 内部。
 - 尚缺少真正 ICE 选路、网络路径共 UDP 接收复用，以及 QUIC 身份长期轮换/凭据撤销；SDK API 仍允许低层 `quinn::Connection` 处理，不应误认为应用无法自行绕开 SDK 的高层授权。正式安全会话需要强制走 `VerifiedManualSession` 门禁。
 - 以后开发完成和 CI 结果优先同步评论到 SDK 长期文档 PR #2；Transfer 相关依赖与业务状态同步评论到 Transfer 长期文档 PR #1，**两个记录 PR 不合并**。
+
+## M1 安全手动会话入口已合并（2026-10-09）
+
+- [SDK PR #14](https://github.com/juezhong/p2p-sdk/pull/14) 已通过 [GitHub Actions #37912990238](https://github.com/juezhong/p2p-sdk/actions/runs/37912990238) 并 squash 合并到 main（commit `954246f`）。
+- 新增 `VerifiedManualSession` 高层构造入口：在绑定独立 Control/Data QUIC 前验证配对未过期、用户明确确认的比较码属于**同一次** Session、两条实际 TLS 叶证书指纹一致、双向会话 HMAC 认证；缩小低层 `DualQuic::from_authenticated_links`/`authenticate_*` 公开范围。
+- 目前仅证明了已有单元/loopback 集成测试通过；**没有**全链路生产级手动连接体验、真实双机 ICE/Quinn 共 Socket/NAT 穿透，且高层会话函数还需要单独的端到端 mTLS 双连接回归测试。不能称为已可发布 SDK。
+- **职责提醒**：文件上传/下载及落盘、文件块与业务 UI 都属于 `p2p-transfer`，不是 SDK。进度和后续任务定期评论到 SDK 记录 PR #2 及 Transfer 记录 PR #1，两份记录 PR 均不合并。
+- 下一步首要任务：将 ICE candidates/credentials 纳入 INVITE/REPLY，设计一个实际 UDP Socket Owner 使 ICE 检查与 Quinn 共用映射，完成真实 Stream Echo 和双机测试。
