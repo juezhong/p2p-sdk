@@ -4,7 +4,7 @@
 //! It does NOT bind new UDP sockets, advertise TURN relays or assume that a
 //! server-reflexive address is externally reachable before nomination.
 
-use std::{net::SocketAddr, time::{Duration, Instant}};
+use std::time::{Duration, Instant};
 
 use is::{
     stun::{StunMessage, StunPacket},
