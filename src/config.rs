@@ -11,7 +11,12 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
-        Self { prefer_ipv6: true, enable_stun: true, enable_port_mapping: false, candidate_limit: 64 }
+        Self {
+            prefer_ipv6: true,
+            enable_stun: true,
+            enable_port_mapping: false,
+            candidate_limit: 64,
+        }
     }
 }
 
