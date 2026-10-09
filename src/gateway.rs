@@ -9,9 +9,9 @@ use std::{net::{SocketAddr, SocketAddrV4}, time::Duration};
 use tokio::sync::watch;
 
 use crate::{
-    nat_pmp::{PortMapError, UdpMapping},
+    nat_pmp::PortMapError,
     nat_pmp_lease::{NatPmpLease, NatPmpLeaseStatus},
-    pcp::{PcpError, PcpUdpMapping},
+    pcp::PcpError,
     pcp_lease::{PcpLease, PcpLeaseStatus},
 };
 
@@ -144,6 +144,7 @@ impl GatewayLease {
 mod tests {
     use super::*;
     use std::net::Ipv4Addr;
+    use crate::{nat_pmp::UdpMapping, pcp::PcpUdpMapping};
 
     fn fixture() -> netdev::Interface {
         let mut device = netdev::Interface::dummy();
