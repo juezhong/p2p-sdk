@@ -303,12 +303,14 @@ impl ResilientDataLanes {
         let mut status = self.subscribe();
         tokio::time::timeout(deadline, async {
             loop {
+                // Never advertise a healthy Data pool after Control has died.
+                // In particular, an already-full pool must not pass readiness.
+                if self.state.control.close_reason().is_some() {
+                    return Err(LanePoolError::ShuttingDown);
+                }
                 let active = self.available().await;
                 if active.len() >= minimum {
                     return Ok(active);
-                }
-                if self.state.control.close_reason().is_some() {
-                    return Err(LanePoolError::ShuttingDown);
                 }
                 tokio::select! {
                     update = status.changed() => {
