@@ -111,3 +111,9 @@
 - [SDK PR #10](https://github.com/juezhong/p2p-sdk/pull/10) 当前待验收：应用 Session ID + HMAC-SHA256 双向随机挑战、Control/Data 角色证明、共享有界 nonce replay guard；双连接组合需验证角色和 Session 一致。
 - **尚未完成**：真实设备公钥与两个 QUIC TLS 连接绑定、会话凭据发行/过期撤销、ICE/QUIC 共底层 Socket、NAT 测试、data lane 重连。因此不能认为 PR #10 是完整的认证 Session。
 - 下一步：PR #10 CI 通过并合并后，补齐真实双连接握手端到端测试、TLS 设备身份绑定及 ICE/Quinn I/O Owner。独立设计 PR SDK #2、Transfer #1 继续保持不合并。
+
+## M1 最近完成（2026-10-09）
+
+- [SDK PR #10](https://github.com/juezhong/p2p-sdk/pull/10) 已经通过最后一次 GitHub Actions 完整检查并合并（commit `a8f497d`）。新增双向 HMAC-SHA256 会话挑战证明、Control/Data 角色和 Session ID 校验、共享 nonce 防重放缓存与双 QUIC 的真实 loopback 握手测试；先前测试因服务器过早关闭/丢弃连接句柄失败，现已修复并通过。
+- **验证边界**：这些是共享 Session Secret 的应用层证明，Quinn 测试使用明确的 TLS 信任根。尚不能代替设备长期公钥身份、Session 凭据生成/过期/撤销、真实 ICE 路径与跨 NAT 验证，不是可直接投入生产的完整认证 Session。
+- **下一个首要任务**：实现 TLS 设备身份验证与双 QUIC 设备身份一致性检查，随后真实 ICE + Quinn 同 UDP I/O Owner、IPv4/IPv6 连通性检查。继续分离 Control QUIC 与 Data QUIC。
