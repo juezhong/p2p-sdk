@@ -82,3 +82,10 @@
 - SDK 原 [PR #6](https://github.com/juezhong/p2p-sdk/pull/6) 因 PR #5 合并后的 `lib.rs` 和 `STATUS.md` 冲突，内容重建在 [PR #7](https://github.com/juezhong/p2p-sdk/pull/7)；不得把 #6 覆盖回 main。
 - PR #7 实现 RFC 9443 STUN/QUIC 报文预分类，新增 Control/Data 角色策略值类型与 `docs/CONTROL_DATA_PLAN.md`；**控制面和数据面逻辑分离**，同时允许同一有效 UDP Socket 承载网络协议分流。
 - 暂未实现真实 Quinn `AsyncUdpSocket` 适配、ICE 连通性检查/提名、数据和控制 Stream 开流 API、TLS 握手及真实双机验证。下一阶段优先选型并测试 ICE/Quinn 同一 UDP I/O Owner 的安全握手原型。
+
+## 开发检查点（2026-10-09，最新）
+
+- SDK [PR #5](https://github.com/juezhong/p2p-sdk/pull/5) 已通过 CI 并合并，新增 Tokio STUN UDP 映射探针，提交 `645050e`。
+- SDK [PR #7](https://github.com/juezhong/p2p-sdk/pull/7) 已通过 CI 并合并，提交 `58c8fe1`：RFC 9443 STUN/QUIC 报文预分类、逻辑 Control/Data 角色与 ADR-0002；原 PR #6 因与 #5 冲突而关闭、未合并。
+- **控制面和数据面继续分离**：一个已验证的 UDP 数据端点可以承载 STUN/ICE/QUIC，但应用的 Control RPC/ACK/取消与 bulk Data Stream 必须逻辑分离；将来最多四条额外 data-only QUIC 的 UDP 端口必须重新验证连通性。当前仅有角色策略模型，没有真实 Stream API。
+- 尚未完成 ICE agent、Quinn UDP 适配和 TLS 身份认证、真实控制/数据 Stream 及真实两机 NAT 验证。下一阶段优先实现共享 UDP I/O Owner + ICE/Quinn 安全 Stream Echo，证明路径和报文分流稳定性。
