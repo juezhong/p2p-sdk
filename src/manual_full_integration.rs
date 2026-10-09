@@ -219,6 +219,18 @@ mod tests {
             assert!(secure.control().close_reason().is_none());
             done_tx.send(()).unwrap();
             server_task.await.unwrap();
+            secure.control().closed().await;
+            // The pool must fail closed immediately once Control is gone:
+            // even previously healthy Data connections are not permission
+            // to keep transferring outside the verified session.
+            assert!(matches!(
+                pool.wait_for_count(1, Duration::from_secs(1)).await,
+                Err(crate::resilient_data::LanePoolError::ShuttingDown),
+            ));
+            assert!(matches!(
+                pool.open_uni(Duration::from_secs(1)).await,
+                Err(crate::resilient_data::LanePoolError::ShuttingDown),
+            ));
             client.close(0u32.into(), b"completed");
         }).await.expect("full manual-to-QUIC secure session test timeout");
     }
