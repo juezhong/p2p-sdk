@@ -313,3 +313,72 @@ mod tests {
         assert!(matches!(ReplayGuard::new(4097), Err(BindingError::InvalidLimit)));
     }
 }
+
+#[cfg(test)]
+mod quinn_integration_tests {
+    use super::*;
+    use std::{net::SocketAddr, sync::Arc};
+
+    #[tokio::test]
+    async fn two_quic_connections_are_bound_to_one_authenticated_session() {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let certificate =
+                rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+            let cert = certificate.cert.der().clone();
+            let key = rustls::pki_types::PrivateKeyDer::Pkcs8(
+                certificate.signing_key.serialize_der().into(),
+            );
+            let server_tls = quinn::ServerConfig::with_single_cert(vec![cert.clone()], key).unwrap();
+            let server =
+                quinn::Endpoint::server(server_tls, "127.0.0.1:0".parse::<SocketAddr>().unwrap())
+                    .unwrap();
+            let address = server.local_addr().unwrap();
+
+            let mut roots = rustls::RootCertStore::empty();
+            roots.add(cert).unwrap();
+            let client_tls =
+                quinn::ClientConfig::with_root_certificates(Arc::new(roots)).unwrap();
+            let mut client =
+                quinn::Endpoint::client("127.0.0.1:0".parse::<SocketAddr>().unwrap()).unwrap();
+            client.set_default_client_config(client_tls);
+            let client_local_addr = client.local_addr().unwrap();
+
+            let credentials = SessionCredentials::new([4; 16], [5; 32]).unwrap();
+            let server_creds = credentials.clone();
+            let server_task = tokio::spawn(async move {
+                let guard = ReplayGuard::new(4).unwrap();
+                for role in [ChannelRole::Control, ChannelRole::Data] {
+                    let incoming = server.accept().await.expect("incoming connection");
+                    let connection = incoming.await.expect("TLS authentication");
+                    let link = authenticate_responder(
+                        connection, &server_creds, role, &guard, Duration::from_secs(3),
+                    ).await.expect("authenticated session-bound connection");
+                    assert_eq!(link.role(), role);
+                    assert_eq!(link.session_id(), [4; 16]);
+                }
+                // Keep the server endpoint alive until the client has
+                // successfully constructed and verified the connection pair.
+                let (_, rx) = tokio::sync::oneshot::channel::<()>();
+                // The client does not need the server to shut down to prove
+                // its connection state: this task can finish and drop the
+                // endpoint only after it receives the explicit completion.
+                drop(rx);
+            });
+
+            let control = client.connect(address, "localhost").unwrap().await.unwrap();
+            let control = authenticate_initiator(
+                control, &credentials, ChannelRole::Control, Duration::from_secs(3),
+            ).await.unwrap();
+            let data = client.connect(address, "localhost").unwrap().await.unwrap();
+            let data = authenticate_initiator(
+                data, &credentials, ChannelRole::Data, Duration::from_secs(3),
+            ).await.unwrap();
+            assert_eq!(client.local_addr().unwrap(), client_local_addr);
+            let pair = crate::dual_quic::DualQuic::from_authenticated_links(control, data)
+                .expect("same verified application session");
+            assert_ne!(pair.control().stable_id(), pair.data().stable_id());
+            server_task.await.unwrap();
+            client.close(0u32.into(), b"test complete");
+        }).await.expect("authentication loopback test timeout");
+    }
+}
