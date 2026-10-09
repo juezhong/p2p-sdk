@@ -117,3 +117,10 @@
 - [SDK PR #10](https://github.com/juezhong/p2p-sdk/pull/10) 已经通过最后一次 GitHub Actions 完整检查并合并（commit `a8f497d`）。新增双向 HMAC-SHA256 会话挑战证明、Control/Data 角色和 Session ID 校验、共享 nonce 防重放缓存与双 QUIC 的真实 loopback 握手测试；先前测试因服务器过早关闭/丢弃连接句柄失败，现已修复并通过。
 - **验证边界**：这些是共享 Session Secret 的应用层证明，Quinn 测试使用明确的 TLS 信任根。尚不能代替设备长期公钥身份、Session 凭据生成/过期/撤销、真实 ICE 路径与跨 NAT 验证，不是可直接投入生产的完整认证 Session。
 - **下一个首要任务**：实现 TLS 设备身份验证与双 QUIC 设备身份一致性检查，随后真实 ICE + Quinn 同 UDP I/O Owner、IPv4/IPv6 连通性检查。继续分离 Control QUIC 与 Data QUIC。
+
+## 手动配对 M1（2026-10-09）
+
+- 在新功能分支 `feat/m1-manual-invite-reply` 研发单纯 INVITE/REPLY 不依赖消息服务器的临时 X25519 + HKDF-SHA256 会话密钥派生；6 位人工比较码；身份 TLS 指纹记录。用户无需另输 Session Secret。
+- 消息服务器将来只替代人工传递信令，不参与业务数据/密钥派生。
+- **当前限制**：连接码还不包含 ICE 候选，未实现真实 TLS 指纹绑定、人工验证码确认门禁、设备信任、真实网络连接；不能声称手动配对已完整可用。
+- 下一步：检查 CI、修复构建与测试；继续 ICE offer/answer、绑定真实证书、比较码确认及跨平台安全测试。
