@@ -15,19 +15,11 @@ pub enum ChannelError {
     InvalidParallelDataLimit,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ChannelPolicy {
     /// Maximum number of extra, independently connected data-only QUIC links.
     /// A single authenticated QUIC link can still carry many data streams.
     pub max_extra_data_connections: u8,
-}
-
-impl Default for ChannelPolicy {
-    fn default() -> Self {
-        Self {
-            max_extra_data_connections: 0,
-        }
-    }
 }
 
 impl ChannelPolicy {
