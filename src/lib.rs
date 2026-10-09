@@ -40,6 +40,9 @@ mod manual_full_integration;
 
 pub mod local_network;
 
+/// Parallel, direct-only ICE candidate discovery and nomination by real UDP interface.
+pub mod multi_interface;
+
 pub mod nat_pmp;
 pub mod pcp;
 
