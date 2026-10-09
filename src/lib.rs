@@ -6,6 +6,7 @@
 pub mod candidate;
 pub mod config;
 pub mod state;
+pub mod stun;
 
 pub use candidate::{Candidate, CandidateKind, Family, TransportProtocol};
 pub use config::{Config, ConfigError};
