@@ -244,3 +244,10 @@
 - 回复仍绑定邀请全文哈希并附 HMAC，X.509 DER 与 v1 指纹不一致时 fail closed；扩展完整集成测试从**交换码提取证书**构建双向 TLS 信任，而不再由测试直接共享证书对象。
 - 实际用户必须独立核对六位配对码；连接码泄露公开证书/局域网 IP/短期 ICE 密码，不宜在日志/不可信渠道分发。未做真实双机、持久设备证书生命周期、过期撤销、Web UI。
 - 最终用户 Debug/Release 仍在 Transfer；SDK 只负责库与自动化测试。
+
+## SDK → Transfer 联合开发与发版策略（2026-10-09）
+
+- SDK 仅作为 Rust 库，不独立发布给用户的 Debug/Release；内部保留自动化网络测试。用户五平台下载及跨 NAT 验收统一走 `p2p-transfer`（Windows x86_64，macOS x86_64/aarch64，Linux x86_64/aarch64）。
+- 当前 #20、#21、#22 已合并；[PR #23](https://github.com/juezhong/p2p-sdk/pull/23) 最新 CI [#37920087927](https://github.com/juezhong/p2p-sdk/actions/runs/37920087927) 通过并合并（`b09f7e0`），完善手动配对 TLS 身份交换。
+- 优先 LAN host 直连和经同一 Socket 的 Quinn，随后 IPv6/IPv4 STUN/NAT 候选，绝不实现数据 Relay/TURN；不可达路径返回 NoDirectPath。**真实跨 NAT 和两机打洞还没有经过用户验收。**
+- 下一任务：SDK 生产会话的握手/ICE consent/restart/路径恢复及真实双机通信入口，与 Transfer CLI 端到端接线；用户从 Transfer 验证，不需要独立 SDK Debug。细节持续追加评论到长期记录 PR #2。
