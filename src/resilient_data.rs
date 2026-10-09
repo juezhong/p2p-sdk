@@ -488,9 +488,8 @@ async fn maintain_independent_creator_lane(
         if *stopped.borrow() || state.control.close_reason().is_some() {
             break;
         }
-        if let Some(connection) = state.lanes.read().await[index].clone()
-            .filter(|c| c.close_reason().is_none())
-        {
+        let current = { state.lanes.read().await[index].clone() };
+        if let Some(connection) = current.filter(|c| c.close_reason().is_none()) {
             tokio::select! {
                 _ = stopped.changed() => break,
                 _ = state.control.closed() => break,
