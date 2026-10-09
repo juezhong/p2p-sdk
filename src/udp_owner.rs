@@ -128,14 +128,9 @@ async fn run_owner(
         tokio::select! {
             _ = sweep.tick() => {
                 let now = Instant::now();
-                pending.retain(|_, q| {
-                    if now >= q.deadline || q.answer.is_closed() {
-                        let _ = q.answer.send(Err(UdpOwnerError::Timeout));
-                        false
-                    } else {
-                        true
-                    }
-                });
+                // Query futures enforce their own timeout. Dropping an
+                // expired sender frees a transaction slot without blocking.
+                pending.retain(|_, q| now < q.deadline && !q.answer.is_closed());
             }
             request = actions.recv() => {
                 let Some(q) = request else { break; };
