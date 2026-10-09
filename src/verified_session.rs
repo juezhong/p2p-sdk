@@ -8,6 +8,7 @@
 use std::time::Duration;
 
 use quinn::Connection;
+use tokio::sync::mpsc;
 
 use crate::{
     channel::ChannelRole,
@@ -34,6 +35,15 @@ pub struct VerifiedManualSession {
     remote_certificate_sha256: [u8; 32],
 }
 
+/// An authenticated QUIC link is no longer usable. Data and Control failures
+/// are separate events: losing a data lane must not tear down healthy Control.
+/// Receiving an event does NOT imply that ICE or the QUIC lane was repaired.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SessionLinkEvent {
+    DataDisconnected,
+    ControlDisconnected,
+}
+
 impl VerifiedManualSession {
     pub fn control(&self) -> &Connection {
         self.connections.control()
@@ -53,6 +63,42 @@ impl VerifiedManualSession {
 
     pub fn close_data(&self) {
         self.connections.close_data();
+    }
+
+    /// Observe link termination independently of Control RPC traffic.
+    /// The monitor does not extend lifetimes or suppress actual disconnects.
+    /// The caller may continue Control operations after DataDisconnected,
+    /// but must reauthenticate a replacement Data QUIC connection before
+    /// resuming data. ControlDisconnected requires a new verified session.
+    ///
+    /// Dropping the receiver stops the watcher without closing either QUIC
+    /// connection. All events are emitted once for this watcher.
+    pub fn watch_link_termination(&self) -> mpsc::UnboundedReceiver<SessionLinkEvent> {
+        let control = self.control().clone();
+        let data = self.data().clone();
+        let (sender, receiver) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            tokio::select! {
+                biased;
+                _ = sender.closed() => return,
+                _ = control.closed() => {
+                    let _ = sender.send(SessionLinkEvent::ControlDisconnected);
+                    return;
+                },
+                _ = data.closed() => {
+                    if sender.send(SessionLinkEvent::DataDisconnected).is_err() {
+                        return;
+                    }
+                },
+            }
+            tokio::select! {
+                _ = sender.closed() => {},
+                _ = control.closed() => {
+                    let _ = sender.send(SessionLinkEvent::ControlDisconnected);
+                },
+            }
+        });
+        receiver
     }
 }
 

@@ -176,8 +176,15 @@ mod tests {
             }
             rpc(secure.control(), b"control message", b"control ack").await;
             rpc(secure.data(), b"data message", b"data ack").await;
+            let mut monitor = secure.watch_link_termination();
             secure.close_data();
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(3), monitor.recv()).await.unwrap(),
+                Some(crate::verified_session::SessionLinkEvent::DataDisconnected),
+            );
             secure.data().closed().await;
+            // A failed DATA lane must not be reported as Control failure.
+            assert!(monitor.try_recv().is_err());
             rpc(secure.control(), b"control after data close", b"still alive").await;
             assert!(secure.control().close_reason().is_none());
             done_tx.send(()).unwrap();
