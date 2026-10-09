@@ -110,7 +110,6 @@ impl UpnpLease {
         let task = tokio::spawn(async move {
             let mut active_port = port;
             let mut igd = igd;
-            let mut active_router = router;
             loop {
                 let period = Duration::from_secs((lifetime.as_secs() / 2).max(1));
                 tokio::select! {
@@ -124,7 +123,7 @@ impl UpnpLease {
                 // A router reboot may change the IGD control service; require
                 // discovery and matching the OS-bound interface again.
                 let updated = async {
-                    let verified = discover(local, active_router, deadline).await?;
+                    let verified = discover(local, router, deadline).await?;
                     let public = public_ip(&verified, deadline).await?;
                     let port = map_port(&verified, local, Some(active_port),
                         lifetime.as_secs() as u32, deadline).await?;
@@ -139,16 +138,15 @@ impl UpnpLease {
                         }
                         igd = replacement;
                         active_port = port;
-                        active_router = router;
+                        let generation = changed.borrow().generation.wrapping_add(1);
                         changed.send_replace(UpnpStatus {
-                            external: Some(SocketAddrV4::new(public, port)),
-                            generation: changed.borrow().generation.wrapping_add(1),
+                            external: Some(SocketAddrV4::new(public, port)), generation,
                         });
                     }
                     Err(_) => {
+                        let generation = changed.borrow().generation.wrapping_add(1);
                         changed.send_replace(UpnpStatus {
-                            external: None,
-                            generation: changed.borrow().generation.wrapping_add(1),
+                            external: None, generation,
                         });
                         tokio::select! {
                             _ = sleep(Duration::from_secs(1)) => {}
@@ -157,10 +155,8 @@ impl UpnpLease {
                     }
                 }
             }
-            changed.send_replace(UpnpStatus {
-                external: None,
-                generation: changed.borrow().generation.wrapping_add(1),
-            });
+            let generation = changed.borrow().generation.wrapping_add(1);
+            changed.send_replace(UpnpStatus { external: None, generation });
             timeout(deadline, igd.remove_port(PortMappingProtocol::UDP, active_port))
                 .await.map_err(|_| UpnpError::CleanupFailed)?
                 .map_err(|_| UpnpError::CleanupFailed)
