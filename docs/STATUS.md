@@ -181,3 +181,12 @@
 - 新批次 `feat/m1-quinn-shared-udp-adapter` 将 Quinn `AsyncUdpSocket` 与该 Owner 的 QUIC 队列及**相同的真实 UDP Socket 发送路径**相接，禁用 QUIC bit greasing；增加同源端口 STUN 发现和真正 Quinn TLS Stream Echo 并发的 localhost 集成测试。以对应 CI 结果为准。
 - **未完成**：ICE Agent、经过 STUN MESSAGE-INTEGRITY 认证的 ICE 检查/提名、真实 NAT 穿透/端口映射/公网双机测试；adapter 当前不支持 ECN/源 IP 附加信息/GSO-GRO，跨平台性能与可靠性仍待检验。
 - SDK 不实现文件业务，文件/目录/上传下载均在 Transfer。长期记录 PR 的评论是跨会话开发索引。
+
+## M1 网络核心双批次已验证（2026-10-09）
+
+- [SDK PR #15](https://github.com/juezhong/p2p-sdk/pull/15) 合并 `862eeb21`，CI 全绿：带 Session HMAC 的有限 ICE 候选编解码、同端口 Multi-STUN 并发/映射差异报告、单 `recv_from` 的真实 UDP I/O Owner。
+- [SDK PR #16](https://github.com/juezhong/p2p-sdk/pull/16) 合并 `726ad563`，[CI 成功](https://github.com/juezhong/p2p-sdk/actions/runs/37914763174)：真正 Quinn `AsyncUdpSocket` Adapter，在同一个 UDP Socket 上同时实现 STUN 探测与 Quinn TLS 双端 Stream Echo（**localhost**）。已禁止 QUIC bit greasing；首轮 Quinn API 编译错误已修复。
+- **已解决的关键原型风险**：STUN/QUIC 不必使用分离的 UDP 源端口，已在单台 Linux CI 机器的环回环境证明共享实际 Socket 具备基本收发能力；但尚未证明不同 NAT/多网卡上的真实 ICE 穿透可靠性。
+- **仍缺少**：标准 ICE agent 的短期 MESSAGE-INTEGRITY、双端 candidate-pair 检查/提名/consent、主机网卡候选收集、手动 INVITE/REPLY 中实际交换候选的 v2 协议、IPv6 防火墙及 PCP/NAT-PMP/UPnP、实际跨运营商/路由器的手工测试。
+- **下一批开发应优先**评估并接入 Sans-I/O 标准 ICE agent（可评估 `is` crate），由现有 UDP Owner 驱动收包、发送和定时器，实现真实双方认证的 pair nomination，再让 Quinn 仅使用该 nominated address 与相同 Socket。验证 Control QUIC/Data QUIC 独立，增加高负载背压和跨平台测试。
+- SDK 仍不包含文件上传、下载、文件协议、落盘或界面；这些全部属于 Transfer。两份记录型 PR 不合并，优先在 PR 评论中持续交接。
