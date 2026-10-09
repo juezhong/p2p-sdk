@@ -151,6 +151,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn idle_control_and_data_connections_survive_default_thirty_second_timeout() {
+        tokio::time::timeout(Duration::from_secs(55), async {
+            let server_identity = identity("localhost");
+            let client_identity = identity("client.local");
+            let server_config = authenticated_server_config(
+                vec![server_identity.cert.clone()], private_key(&server_identity.key),
+                trust(&client_identity.cert),
+            ).unwrap();
+            let server = quinn::Endpoint::server(
+                server_config, "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+            ).unwrap();
+            let address = server.local_addr().unwrap();
+            let server_task = tokio::spawn(async move {
+                let mut links = Vec::new();
+                for _ in 0..2 {
+                    links.push(server.accept().await.unwrap().await.unwrap());
+                }
+                tokio::time::sleep(Duration::from_secs(38)).await;
+                assert!(links.iter().all(|link| link.close_reason().is_none()),
+                    "idle server connections must still be alive");
+                server.close(0u32.into(), b"test complete");
+            });
+            let config = authenticated_client_config(
+                vec![client_identity.cert.clone()], private_key(&client_identity.key),
+                trust(&server_identity.cert),
+            ).unwrap();
+            let mut client = quinn::Endpoint::client(
+                "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+            ).unwrap();
+            client.set_default_client_config(config);
+            let control = client.connect(address, "localhost").unwrap().await.unwrap();
+            let data = client.connect(address, "localhost").unwrap().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(36)).await;
+            assert!(control.close_reason().is_none(), "Control QUIC timed out during idle");
+            assert!(data.close_reason().is_none(), "Data QUIC timed out during idle");
+            client.close(0u32.into(), b"test complete");
+            server_task.await.unwrap();
+        }).await.expect("idle QUIC regression exceeded deadline");
+    }
+
+    #[tokio::test]
     async fn mutual_tls_authenticates_two_connections_and_rejects_other_pins() {
         tokio::time::timeout(Duration::from_secs(15), async {
             let server_identity = identity("localhost");
