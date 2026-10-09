@@ -39,10 +39,13 @@ pub fn authenticated_server_config(
     if trusted_clients.is_empty() {
         return Err(TlsConfigError::EmptyTrustRoots);
     }
-    let verifier = WebPkiClientVerifier::builder(trusted_clients)
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let verifier = WebPkiClientVerifier::builder_with_provider(trusted_clients, provider.clone())
         .build()
         .map_err(|_| TlsConfigError::InvalidClientVerifier)?;
-    let mut tls = rustls::ServerConfig::builder()
+    let mut tls = rustls::ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|_| TlsConfigError::IncompatibleQuicTls)?
         .with_client_cert_verifier(verifier)
         .with_single_cert(cert_chain, key)
         .map_err(|_| TlsConfigError::InvalidCertificateOrKey)?;
@@ -66,7 +69,9 @@ pub fn authenticated_client_config(
     if trusted_servers.is_empty() {
         return Err(TlsConfigError::EmptyTrustRoots);
     }
-    let mut tls = rustls::ClientConfig::builder()
+    let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        .with_safe_default_protocol_versions()
+        .map_err(|_| TlsConfigError::IncompatibleQuicTls)?
         .with_root_certificates((*trusted_servers).clone())
         .with_client_auth_cert(cert_chain, key)
         .map_err(|_| TlsConfigError::InvalidCertificateOrKey)?;
