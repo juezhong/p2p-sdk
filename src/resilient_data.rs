@@ -28,6 +28,8 @@ use crate::{
         authenticate_initiator, authenticate_responder, ReplayGuard, SessionCredentials,
     },
     verified_session::VerifiedManualSession,
+    udp_owner::UdpOwner,
+    quinn_socket::{demux_endpoint_config, QuinnUdpAdapter},
 };
 
 pub const MAX_DATA_LANES: usize = 4;
@@ -171,6 +173,54 @@ impl ResilientDataLanes {
             tokio::spawn(async move {
                 maintain_creator_lane(state, stopped, endpoint, remote, credentials, remote_pin, index).await;
             });
+        }
+        Ok(pool)
+    }
+
+
+    /// Like start_creator, but each additional authenticated Data QUIC uses
+    /// its own UDP socket and source port bound to the ICE-nominated local IP.
+    /// This matches Go's independent 5-tuple preference and permits one lane
+    /// to lose its NAT mapping without taking down the base Control socket.
+    ///
+    /// The initial Data connection remains on the originally nominated socket.
+    /// Extra lanes reauthenticate with the existing verified peer certificate
+    /// pin and fresh HMAC challenges. A new UDP port is *not* an ICE nomination;
+    /// if the NAT blocks it, the pool continues with remaining valid lanes.
+    pub fn start_creator_with_independent_udp(
+        session: &VerifiedManualSession,
+        endpoint: Endpoint,
+        remote: SocketAddr,
+        pairing: &ManualPairing,
+        tls: quinn::ClientConfig,
+        desired: usize,
+    ) -> Result<Self, LanePoolError> {
+        let local_ip = endpoint.local_addr().map_err(|_| LanePoolError::Transport)?.ip();
+        if local_ip.is_unspecified() || local_ip.is_multicast()
+            || local_ip.is_ipv4() != remote.is_ipv4()
+        {
+            return Err(LanePoolError::Transport);
+        }
+        let (pool, stopped) = Self::initialize(session, pairing, desired)?;
+        let credentials = pairing.credentials.clone();
+        let remote_pin = pairing.remote_tls_cert_sha256;
+        for index in 0..desired {
+            let state = Arc::clone(&pool.state);
+            let credentials = credentials.clone();
+            let stopped = stopped.clone();
+            if index == 0 {
+                let endpoint = endpoint.clone();
+                tokio::spawn(async move {
+                    maintain_creator_lane(state, stopped, endpoint, remote,
+                        credentials, remote_pin, index).await;
+                });
+            } else {
+                let tls = tls.clone();
+                tokio::spawn(async move {
+                    maintain_independent_creator_lane(state, stopped, local_ip,
+                        remote, credentials, remote_pin, tls, index).await;
+                });
+            }
         }
         Ok(pool)
     }
@@ -407,6 +457,93 @@ async fn maintain_creator_lane(
         if let Some(connection) = connected {
             if state.install(connection.clone(), Some(index)).await {
                 delay = RETRY_INITIAL;
+                continue;
+            }
+            connection.close(1u32.into(), b"data lane not needed");
+        }
+        tokio::select! {
+            _ = stopped.changed() => break,
+            _ = state.control.closed() => break,
+            _ = tokio::time::sleep(delay) => {},
+        }
+        delay = delay.saturating_mul(2).min(RETRY_MAX);
+    }
+}
+
+/// Build and release each independent UDP port with its Data lane.
+/// On true disconnection the next attempt takes a fresh source port, so a
+/// broken NAT mapping or stale 5-tuple cannot pin all lanes to one mapping.
+async fn maintain_independent_creator_lane(
+    state: Arc<LaneState>,
+    mut stopped: watch::Receiver<bool>,
+    local_ip: std::net::IpAddr,
+    remote: SocketAddr,
+    credentials: SessionCredentials,
+    pin: [u8; 32],
+    tls: quinn::ClientConfig,
+    index: usize,
+) {
+    let mut delay = RETRY_INITIAL;
+    loop {
+        if *stopped.borrow() || state.control.close_reason().is_some() {
+            break;
+        }
+        if let Some(connection) = state.lanes.read().await[index].clone()
+            .filter(|c| c.close_reason().is_none())
+        {
+            tokio::select! {
+                _ = stopped.changed() => break,
+                _ = state.control.closed() => break,
+                _ = connection.closed() => {
+                    state.clear(index, connection.stable_id()).await;
+                }
+            }
+            continue;
+        }
+        let result = async {
+            let mut owner = UdpOwner::bind(SocketAddr::new(local_ip, 0))
+                .await.map_err(|_| ())?;
+            let adapter = QuinnUdpAdapter::from_owner(&mut owner).map_err(|_| ())?;
+            let mut endpoint = Endpoint::new_with_abstract_socket(
+                demux_endpoint_config(), None, Arc::new(adapter),
+                quinn::default_runtime().ok_or(())?,
+            ).map_err(|_| ())?;
+            endpoint.set_default_client_config(tls.clone());
+            let connection = endpoint.connect(remote, "localhost")
+                .map_err(|_| ())?.await.map_err(|_| ())?;
+            if PeerCertificatePin::new(pin).map_err(|_| ())?
+                .verify_connection(&connection).is_err()
+            {
+                connection.close(1u32.into(), b"wrong peer certificate");
+                return Err(());
+            }
+            let clone = connection.clone();
+            match authenticate_initiator(
+                connection, &credentials, ChannelRole::Data, HANDSHAKE_DEADLINE,
+            ).await {
+                Ok(_) => Ok((owner, endpoint, clone)),
+                Err(_) => {
+                    clone.close(1u32.into(), b"data session proof failed");
+                    Err(())
+                }
+            }
+        };
+        let connected = tokio::select! {
+            _ = stopped.changed() => break,
+            _ = state.control.closed() => break,
+            result = tokio::time::timeout(HANDSHAKE_DEADLINE, result) =>
+                result.ok().and_then(Result::ok),
+        };
+        if let Some((_owner, _endpoint, connection)) = connected {
+            if state.install(connection.clone(), Some(index)).await {
+                delay = RETRY_INITIAL;
+                // These values must stay alive for the entire QUIC lane.
+                tokio::select! {
+                    _ = stopped.changed() => break,
+                    _ = state.control.closed() => break,
+                    _ = connection.closed() => {}
+                }
+                state.clear(index, connection.stable_id()).await;
                 continue;
             }
             connection.close(1u32.into(), b"data lane not needed");
