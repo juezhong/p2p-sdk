@@ -13,3 +13,4 @@ path = "src/lib.rs"
 [dependencies]
 tokio = { version = "1", features = ["net", "time", "rt", "macros"] }
 getrandom = "0.3"
+quinn = "0.11"
