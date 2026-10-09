@@ -47,8 +47,10 @@ mod tests {
 
     #[test]
     fn rejects_unbounded_candidate_configuration() {
-        let mut config = Config::default();
-        config.candidate_limit = 0;
+        let mut config = Config {
+            candidate_limit: 0,
+            ..Config::default()
+        };
         assert_eq!(config.validate(), Err(ConfigError::InvalidCandidateLimit));
         config.candidate_limit = 1025;
         assert_eq!(config.validate(), Err(ConfigError::InvalidCandidateLimit));
