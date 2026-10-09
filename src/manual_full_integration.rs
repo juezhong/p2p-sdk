@@ -161,6 +161,9 @@ mod tests {
                 assert_eq!(request.read_to_end(64).await.unwrap(), b"repaired data");
                 response.write_all(b"repaired ack").await.unwrap();
                 response.finish().unwrap();
+                let mut next_stream = pool.accept_uni(Duration::from_secs(8))
+                    .await.expect("receive from authenticated repaired pool");
+                assert_eq!(next_stream.read_to_end(64).await.unwrap(), b"pool data");
 
                 let (mut response, mut request) = secure.control().accept_bi().await.unwrap();
                 assert_eq!(request.read_to_end(64).await.unwrap(), b"control after data close");
@@ -207,6 +210,10 @@ mod tests {
                 .await.unwrap();
             assert!(!recovered.iter().any(|c| c.stable_id() == secure.data().stable_id()));
             rpc(&recovered[0], b"repaired data", b"repaired ack").await;
+            let mut outgoing = pool.open_uni(Duration::from_secs(8))
+                .await.expect("open stream from authenticated 4-lane pool");
+            outgoing.write_all(b"pool data").await.unwrap();
+            outgoing.finish().unwrap();
             assert!(monitor.try_recv().is_err());
             rpc(secure.control(), b"control after data close", b"still alive").await;
             assert!(secure.control().close_reason().is_none());
