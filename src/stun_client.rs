@@ -141,7 +141,7 @@ mod tests {
             IpAddr::V6(ip) => ip.octets().to_vec(),
         };
         for (i, byte) in octets.iter().enumerate() {
-            let mask = if i < 4 { cookie[i] } else { request[8 + i] };
+            let mask = if i < 4 { cookie[i] } else { request[8 + i - 4] };
             value.push(byte ^ mask);
         }
         let mut packet = Vec::from(request);
