@@ -79,6 +79,7 @@ mod tests {
             client.set_default_client_config(client_config);
             let client_udp_address = client.local_addr().unwrap();
 
+            let (verified_tx, verified_rx) = tokio::sync::oneshot::channel::<()>();
             let server_task = tokio::spawn(async move {
                 let control = server.accept().await.expect("control incoming")
                     .await.expect("control handshake");
@@ -98,6 +99,9 @@ mod tests {
                 data.closed().await;
                 let control = control_task.await.expect("control task join");
                 assert!(control.close_reason().is_none(), "control QUIC must remain connected");
+                // Do not tear down the server Endpoint before the client has
+                // asserted that the control QUIC survived the data QUIC close.
+                verified_rx.await.expect("client verified control survives");
                 server.close(0u32.into(), b"test complete");
             });
 
@@ -119,6 +123,7 @@ mod tests {
             pair.data().closed().await;
             echo(pair.control(), b"second").await;
             assert!(pair.control().close_reason().is_none());
+            verified_tx.send(()).expect("signal client verification");
             server_task.await.expect("server join");
             client.close(0u32.into(), b"test complete");
         }).await.expect("dual-connection isolation test timeout");
