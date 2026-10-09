@@ -78,7 +78,7 @@ pub async fn gather(
                 });
             }
         }
-        Some(report)
+        if report.observations.is_empty() { None } else { Some(report) }
         } else {
             None
         }
