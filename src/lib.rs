@@ -27,3 +27,6 @@ pub mod multi_stun;
 pub mod udp_owner;
 pub mod quinn_socket;
 pub mod ice_agent;
+
+#[cfg(test)]
+mod ice_quinn_integration;
