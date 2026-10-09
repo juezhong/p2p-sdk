@@ -168,3 +168,9 @@
 - 目前仅证明了已有单元/loopback 集成测试通过；**没有**全链路生产级手动连接体验、真实双机 ICE/Quinn 共 Socket/NAT 穿透，且高层会话函数还需要单独的端到端 mTLS 双连接回归测试。不能称为已可发布 SDK。
 - **职责提醒**：文件上传/下载及落盘、文件块与业务 UI 都属于 `p2p-transfer`，不是 SDK。进度和后续任务定期评论到 SDK 记录 PR #2 及 Transfer 记录 PR #1，两份记录 PR 均不合并。
 - 下一步首要任务：将 ICE candidates/credentials 纳入 INVITE/REPLY，设计一个实际 UDP Socket Owner 使 ICE 检查与 Quinn 共用映射，完成真实 Stream Echo 和双机测试。
+
+## 2026-10-09 合并式 M1 网络基础开发（进行中）
+
+- 功能分支 `feat/m1-ice-signaling-udp-router-multistun` 同时开发：有界 ICE 描述+Session HMAC、同一 UDP 端口 Multi-STUN 一致性观察、单一 `recv_from` UDP Owner 与 STUN/ICE/QUIC 有界分包队列。详见 `docs/M1_NETWORK_INTEGRATION.md`。CI 未成功前不能声称已验证。
+- **尚未实现完整 ICE Agent、ICE/Quinn 共真实 Socket 适配、ICE 检查/提名、手动 v2 携带候选、真实 NAT/IPv6/端口映射**。这些仍是首要阻塞。
+- SDK 没有任何上传/下载/目录/文件块等 Transfer 业务模块。两份长期设计 PR 继续保持开放且不合并，重要状态评论到 SDK #2 / Transfer #1。
