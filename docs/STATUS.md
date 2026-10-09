@@ -217,3 +217,10 @@
 2. 从真正本机网卡收集 host + 多 STUN srflx 候选并加入 ICE candidate pairs；独立 IPv4/IPv6 UDP owner 路径。
 3. 保活、撤销、ICE restart 与双 QUIC 恢复；持续 Nomination 路径有效性验证。基于网络环境和性能数据补充可选 PCP/NAT-PMP/UPnP。
 4. 开发 SDK CLI 联机 Echo/诊断测试工具（不是 Transfer），实现真实两台机器 LAN/跨 NAT 测试，并按文档登记 Windows/macOS/Linux 手测结果；无直连路径必须 NoDirectPath，不允许中继。
+
+## 手动配对 ICE INVITE/REPLY v2（2026-10-09，开发中）
+
+- 功能分支 `feat/m1-manual-ice-v2` 新增离线 V2 配对信令：完整带限额的 ICE credentials/candidates 随 INVITE/REPLY 一来一回交换；REPLY 绑定整份原始 INVITE 摘要，并以双方 X25519/HKDF 派生的会话密钥为 REPLY 完整性提供 HMAC。
+- 测试覆盖 IPv4/IPv6 候选交换、会话一致、INVITE 候选替换检测、REPLY 候选篡改检测、过期与错误角色；待 CI 验证，不提前标记完成。
+- 仍没有真实两机用户 CLI、候选发现、身份确认 UI 与完整经 mTLS 的 Session 一体化；v2 会包含 ICE 短期密码/本地 IP，不能安全公开分享，终端与日志不应自动打印原始连接码。配对仍必须独立核对六位比较码。
+- 调整发布策略：SDK 仅作为库，正式跨平台用户测试/发布由 `p2p-transfer` 承担，SDK Debug PR #19 不合并。
