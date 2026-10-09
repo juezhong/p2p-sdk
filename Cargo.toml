@@ -11,7 +11,7 @@ name = "p2p_sdk"
 path = "src/lib.rs"
 
 [dependencies]
-tokio = { version = "1", features = ["net", "time", "rt", "macros"] }
+tokio = { version = "1", features = ["net", "time", "rt", "macros", "sync"] }
 getrandom = "0.3"
 quinn = "0.11"
 
