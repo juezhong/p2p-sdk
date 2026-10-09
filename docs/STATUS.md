@@ -174,3 +174,10 @@
 - 功能分支 `feat/m1-ice-signaling-udp-router-multistun` 同时开发：有界 ICE 描述+Session HMAC、同一 UDP 端口 Multi-STUN 一致性观察、单一 `recv_from` UDP Owner 与 STUN/ICE/QUIC 有界分包队列。详见 `docs/M1_NETWORK_INTEGRATION.md`。CI 未成功前不能声称已验证。
 - **尚未实现完整 ICE Agent、ICE/Quinn 共真实 Socket 适配、ICE 检查/提名、手动 v2 携带候选、真实 NAT/IPv6/端口映射**。这些仍是首要阻塞。
 - SDK 没有任何上传/下载/目录/文件块等 Transfer 业务模块。两份长期设计 PR 继续保持开放且不合并，重要状态评论到 SDK #2 / Transfer #1。
+
+## M1 共 Socket 的真实 Quinn 适配（2026-10-09 进行中）
+
+- 上一批 [SDK PR #15](https://github.com/juezhong/p2p-sdk/pull/15) 已通过 fmt/Clippy/测试并合并（`862eeb21`），新增有界 ICE 认证描述、Multi-STUN 和单 UDP `recv_from()` Owner。
+- 新批次 `feat/m1-quinn-shared-udp-adapter` 将 Quinn `AsyncUdpSocket` 与该 Owner 的 QUIC 队列及**相同的真实 UDP Socket 发送路径**相接，禁用 QUIC bit greasing；增加同源端口 STUN 发现和真正 Quinn TLS Stream Echo 并发的 localhost 集成测试。以对应 CI 结果为准。
+- **未完成**：ICE Agent、经过 STUN MESSAGE-INTEGRITY 认证的 ICE 检查/提名、真实 NAT 穿透/端口映射/公网双机测试；adapter 当前不支持 ECN/源 IP 附加信息/GSO-GRO，跨平台性能与可靠性仍待检验。
+- SDK 不实现文件业务，文件/目录/上传下载均在 Transfer。长期记录 PR 的评论是跨会话开发索引。
