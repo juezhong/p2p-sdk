@@ -100,6 +100,44 @@ pub async fn query_same_socket(
     Ok(MappingReport { local_address: local, observations })
 }
 
+
+/// Query several servers concurrently through the *existing* single-reader
+/// UDP owner. Unlike `query_same_socket`, this works while ICE/QUIC packets
+/// are being demultiplexed by that owner. The owner remains responsible for
+/// correlation and the actual UDP port.
+pub async fn query_via_owner(
+    owner: &crate::udp_owner::UdpOwnerHandle,
+    servers: &[SocketAddr],
+    deadline: Duration,
+) -> Result<MappingReport, MultiStunError> {
+    let local = owner.local_address();
+    if servers.is_empty() || servers.len() > MAX_SERVERS || deadline.is_zero()
+        || servers.iter().any(|s| s.port() == 0 || s.ip().is_unspecified()
+            || s.ip().is_multicast() || s.is_ipv4() != local.is_ipv4())
+    {
+        return Err(MultiStunError::InvalidServers);
+    }
+    let mut unique = std::collections::HashSet::new();
+    if !servers.iter().all(|s| unique.insert(*s)) {
+        return Err(MultiStunError::InvalidServers);
+    }
+    let mut tasks = tokio::task::JoinSet::new();
+    for &server in servers {
+        let handle = owner.clone();
+        tasks.spawn(async move {
+            (server, handle.query_stun(server, deadline).await)
+        });
+    }
+    let mut observations = Vec::with_capacity(servers.len());
+    while let Some(result) = tasks.join_next().await {
+        if let Ok((server, Ok(mapped_address))) = result {
+            observations.push(StunObservation { server, mapped_address });
+        }
+    }
+    observations.sort_by_key(|o| o.server);
+    Ok(MappingReport { local_address: local, observations })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -173,6 +211,27 @@ mod tests {
         let silent = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let only = query_same_socket(&source, &[silent.local_addr().unwrap()], Duration::from_millis(10)).await.unwrap();
         assert_eq!(only.consistency(), MappingConsistency::InsufficientData);
+    }
+
+    #[tokio::test]
+    async fn multi_stun_via_single_udp_owner_preserves_source_port() {
+        let owner = crate::udp_owner::UdpOwner::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let destinations = [a.local_addr().unwrap(), b.local_addr().unwrap()];
+        let servers = [a, b].into_iter().map(|server| tokio::spawn(async move {
+            let mut buf = [0u8; 128];
+            let (n, src) = server.recv_from(&mut buf).await.unwrap();
+            server.send_to(&response(&buf[..n], "192.0.2.2:40001".parse().unwrap()), src).await.unwrap();
+            src
+        })).collect::<Vec<_>>();
+        let report = query_via_owner(&owner.handle, &destinations, Duration::from_secs(2))
+            .await.unwrap();
+        assert_eq!(report.consistency(), MappingConsistency::Consistent);
+        assert_eq!(report.observations.len(), 2);
+        for server in servers {
+            assert_eq!(server.await.unwrap(), report.local_address);
+        }
     }
 
     #[tokio::test]
