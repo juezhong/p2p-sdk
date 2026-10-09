@@ -245,6 +245,77 @@ mod tests {
         task.await.unwrap();
     }
 
+
+    #[tokio::test]
+    async fn renewal_and_deletion_reuse_nonce_and_original_internal_port() {
+        let gateway = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let gateway_addr = gateway.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut nonce = None;
+            for (i, expected_lifetime, assigned_port) in [
+                (0, 120u32, 52001u16),
+                (1, 240u32, 52002u16),
+                (2, 0u32, 0u16),
+            ] {
+                let mut buf = [0u8; MAX_PACKET];
+                let (len, source) = gateway.recv_from(&mut buf).await.unwrap();
+                assert_eq!(len, PACKET_LEN);
+                assert_eq!(buf[0], VERSION);
+                assert_eq!(buf[1], MAP_REQUEST);
+                assert_eq!(buf[36], UDP_PROTOCOL_NUMBER);
+                assert_eq!(u16::from_be_bytes([buf[40], buf[41]]), 50000);
+                assert_eq!(u32::from_be_bytes(buf[4..8].try_into().unwrap()), expected_lifetime);
+                if i == 0 {
+                    assert_eq!([buf[42], buf[43]], [0, 0]);
+                    nonce = Some(buf[24..36].to_vec());
+                } else {
+                    assert_eq!(buf[24..36], nonce.as_ref().unwrap()[..]);
+                    assert_eq!(u16::from_be_bytes([buf[42], buf[43]]),
+                        if i == 1 { 52001 } else { 52002 });
+                }
+                let mut reply = [0u8; PACKET_LEN];
+                reply[0] = VERSION;
+                reply[1] = MAP_REPLY;
+                reply[4..8].copy_from_slice(&expected_lifetime.to_be_bytes());
+                reply[8..12].copy_from_slice(&(i as u32 + 1).to_be_bytes());
+                reply[24..36].copy_from_slice(&buf[24..36]);
+                reply[36] = UDP_PROTOCOL_NUMBER;
+                reply[40..42].copy_from_slice(&50000u16.to_be_bytes());
+                reply[42..44].copy_from_slice(&assigned_port.to_be_bytes());
+                reply[44..60].copy_from_slice(&to_wire_ip(
+                    "198.51.100.9".parse().unwrap()));
+                gateway.send_to(&reply, source).await.unwrap();
+            }
+        });
+        let local = "127.0.0.1:50000".parse().unwrap();
+        let first = request_udp_mapping(local, gateway_addr,
+            Duration::from_secs(120), Duration::from_secs(1)).await.unwrap();
+        assert_eq!(first.external_address.port(), 52001);
+        let second = renew_udp_mapping(&first, gateway_addr,
+            Duration::from_secs(240), Duration::from_secs(1)).await.unwrap();
+        assert_eq!(second.mapping_nonce, first.mapping_nonce);
+        assert_eq!(second.external_address.port(), 52002);
+        release_udp_mapping(&second, gateway_addr, Duration::from_secs(1))
+            .await.unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn refuses_zero_length_creates_and_renewals() {
+        let local = "127.0.0.1:50000".parse().unwrap();
+        let router = "127.0.0.1:5351".parse().unwrap();
+        assert!(matches!(request_udp_mapping(local, router,
+            Duration::from_millis(1), Duration::from_secs(1)).await,
+            Err(PcpError::InvalidInput)));
+        let invalid = PcpUdpMapping {
+            local_address: local, external_address: "198.51.100.1:60000".parse().unwrap(),
+            lifetime_seconds: 0, epoch_seconds: 0, mapping_nonce: [1; 12],
+        };
+        assert!(matches!(renew_udp_mapping(&invalid, router,
+            Duration::from_secs(30), Duration::from_secs(1)).await,
+            Err(PcpError::InvalidInput)));
+    }
+
     #[tokio::test]
     async fn rejects_foreign_gateway_and_unmatched_nonce() {
         let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
