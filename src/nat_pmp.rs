@@ -115,6 +115,51 @@ pub async fn request_udp_mapping(
     })
 }
 
+/// Delete an existing UDP mapping using RFC 6886's zero-lifetime request.
+/// Unlike creation, deletion does not require querying the external IP first.
+/// This packet must originate from the local interface owning the QUIC socket,
+/// and must name that socket's actual internal port.
+pub async fn release_udp_mapping(
+    local: SocketAddrV4,
+    gateway: SocketAddrV4,
+    transaction_timeout: Duration,
+) -> Result<(), PortMapError> {
+    if local.port() == 0 || local.ip().is_unspecified()
+        || gateway.port() == 0 || gateway.ip().is_unspecified()
+        || gateway.ip().is_multicast() || transaction_timeout.is_zero()
+    {
+        return Err(PortMapError::InvalidInput);
+    }
+    let socket = UdpSocket::bind(SocketAddrV4::new(*local.ip(), 0))
+        .await.map_err(PortMapError::Io)?;
+    let mut packet = [0u8; 12];
+    packet[1] = MAP_UDP_REQUEST;
+    packet[4..6].copy_from_slice(&local.port().to_be_bytes());
+    // Requested external port 0 and lifetime 0 remove the mapping.
+    // The router's actual external port may have changed before deletion.
+    let result: ((), ()) = transact(
+        &socket, SocketAddr::V4(gateway), &packet,
+        MAP_UDP_REPLY, transaction_timeout,
+        |reply| {
+            if reply.len() != 16 || reply[0] != VERSION
+                || reply[1] != MAP_UDP_REPLY
+            {
+                return None;
+            }
+            let code = u16::from_be_bytes([reply[2], reply[3]]);
+            if code != 0 { return Some(Err(PortMapError::UnsupportedOrDenied(code))); }
+            let internal = u16::from_be_bytes([reply[8], reply[9]]);
+            let life = u32::from_be_bytes(reply[12..16].try_into().unwrap());
+            if internal != local.port() || life != 0 {
+                return Some(Err(PortMapError::InvalidResponse));
+            }
+            Some(Ok(((), ())))
+        },
+    ).await?;
+    let _ = result;
+    Ok(())
+}
+
 /// Correlate by exact UDP gateway source, opcode, version and request-specific
 /// echoed fields; ignore stray packets without consuming the whole timeout.
 async fn transact<T, U, F>(
@@ -190,6 +235,30 @@ mod tests {
         assert_eq!(result.external_address, "198.51.100.100:49322".parse().unwrap());
         assert_eq!(result.granted_lifetime_seconds, 1800);
         control.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn releases_exact_internal_udp_port_with_zero_lifetime() {
+        let router = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let gateway = match router.local_addr().unwrap() {
+            SocketAddr::V4(addr) => addr, _ => unreachable!(),
+        };
+        let task = tokio::spawn(async move {
+            let mut buffer = [0u8; 128];
+            let (count, from) = router.recv_from(&mut buffer).await.unwrap();
+            assert_eq!(count, 12);
+            assert_eq!(buffer[1], MAP_UDP_REQUEST);
+            assert_eq!(&buffer[4..6], &44444u16.to_be_bytes());
+            assert_eq!(&buffer[6..8], &[0, 0]);
+            assert_eq!(&buffer[8..12], &[0, 0, 0, 0]);
+            let mut reply = [0u8; 16];
+            reply[1] = MAP_UDP_REPLY;
+            reply[8..10].copy_from_slice(&44444u16.to_be_bytes());
+            router.send_to(&reply, from).await.unwrap();
+        });
+        release_udp_mapping("127.0.0.1:44444".parse().unwrap(),
+            gateway, Duration::from_secs(1)).await.unwrap();
+        task.await.unwrap();
     }
 
     #[tokio::test]
