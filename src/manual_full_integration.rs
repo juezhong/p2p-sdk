@@ -155,9 +155,8 @@ mod tests {
                 pool.wait_for_count(4, Duration::from_secs(8)).await.unwrap();
                 secure.data().closed().await;
                 let replacement = pool.wait_for_count(4, Duration::from_secs(8))
-                    .await.unwrap().into_iter()
-                    .find(|c| c.stable_id() != secure.data().stable_id())
-                    .unwrap();
+                    .await.unwrap().into_iter().next().unwrap();
+                assert_ne!(replacement.stable_id(), secure.data().stable_id());
                 let (mut response, mut request) = replacement.accept_bi().await.unwrap();
                 assert_eq!(request.read_to_end(64).await.unwrap(), b"repaired data");
                 response.write_all(b"repaired ack").await.unwrap();
