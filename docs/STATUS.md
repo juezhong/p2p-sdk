@@ -251,3 +251,9 @@
 - 当前 #20、#21、#22 已合并；[PR #23](https://github.com/juezhong/p2p-sdk/pull/23) 最新 CI [#37920087927](https://github.com/juezhong/p2p-sdk/actions/runs/37920087927) 通过并合并（`b09f7e0`），完善手动配对 TLS 身份交换。
 - 优先 LAN host 直连和经同一 Socket 的 Quinn，随后 IPv6/IPv4 STUN/NAT 候选，绝不实现数据 Relay/TURN；不可达路径返回 NoDirectPath。**真实跨 NAT 和两机打洞还没有经过用户验收。**
 - 下一任务：SDK 生产会话的握手/ICE consent/restart/路径恢复及真实双机通信入口，与 Transfer CLI 端到端接线；用户从 Transfer 验证，不需要独立 SDK Debug。细节持续追加评论到长期记录 PR #2。
+
+## M2 网关端口映射的 SDK 基础（功能 PR 进行中，2026-10-09）
+
+- 开发分支 `feat/m2-nat-pmp-portmapping` 同批实现 RFC 6886 NAT-PMP / RFC 6887 PCP MAP 的 UDP 网关事务、严格 gateway/nonce/端口关联、防伪装回复和模拟网关测试；实现只有匹配当前真实 ICE/Quinn UDP Owner 端口时才允许添加 port-mapped ICE candidate。见 `docs/GATEWAY_PORTMAP.md`。
+- 仍没实现 UPnP、网关自动发现、映射 lease 续期/删除、真实路由器/跨 NAT 测试；API 仅为显式网关的低层组件，暂不在 Transfer UI 默认启用。最新 Actions 未成功前不能标已验收。
+- 完整 Transfer 发行继续以 CLI Go 行为对照和五架构 CI + 用户两台机器实际 NAT 穿透验证为门槛；SDK 不开发文件业务。
