@@ -2,7 +2,7 @@
 name = "p2p-sdk"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.82"
+rust-version = "1.85"
 license = "GPL-2.0-only"
 description = "Direct-only P2P connectivity SDK (early development)"
 
@@ -14,6 +14,7 @@ path = "src/lib.rs"
 tokio = { version = "1", features = ["net", "time", "rt", "macros", "sync"] }
 getrandom = "0.3"
 quinn = "0.11"
+is = "0.11.1"
 hmac = "0.12"
 sha2 = "0.10"
 rustls = "0.23"
