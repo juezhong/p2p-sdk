@@ -17,8 +17,8 @@
 | STUN / IPv4 NAT | 多 STUN 映射发现；安全 UDP punch、动态 prflx | Multi-STUN / 同 UDP Owner / ICE Host+srflx 基础，未完成动态 prflx 或现场验证 | 不同路由器、CGNAT、端点依赖映射、UDP 封锁；无直连时报告 NoDirectPath |
 | IPv6 有状态防火墙 | 双向 UDP 安全探测，全球路由 IPv6 优先 | 单地址族 ICE 基础，无全路由策略 | 双栈下 Stateful firewall 允许回程时 IPv6 直连、否则快速尝试 IPv4 |
 | 网关显式映射 | PCP/NAT-PMP/UPnP 可用则尝试、失败仍保留其它有效路径 | PCP/NAT-PMP 编解码/查询原型，尚无自动网关发现/UPnP/续租 | 真实网关发起/续租/撤销，合法映射加入候选且与实际绑定 UDP 一致 |
-| 多独立 QUIC | 主 Control 和最多四条 DATA 连接；可用 lane 数减少不退出会话 | 目前仅固定独立 Control QUIC + Data QUIC 两条 | 1~4 lane 独立认证、按需建立、Data 单链断开不影响 Control |
-| Data 失效恢复 | 背景修复 loop + authenticated re-dial + 5-tuple 独立源端口优先 | **已新增** typed Data/Control 断链观察接口；尚未重新拨号/认证/替换 data slot | 单 lane 断开期间继续 status，补回 lane 且不丢未确认业务数据 |
+| 多独立 QUIC | 主 Control 和最多四条 DATA 连接；可用 lane 数减少不退出会话 | **基础已实现**：SDK PR #29 支持 1~4 条独立认证 Data QUIC；目前这些连接复用初始 ICE 提名 UDP 5-tuple，没有 Go 的独立 UDP 源端口优先策略 | 1~4 lane 独立认证 + 新端口 UDP 路径认证/回退、Data 单链断开不影响 Control |
+| Data 失效恢复 | 背景修复 loop + authenticated re-dial + 5-tuple 独立源端口优先 | **部分实现**：SDK PR #29 真正建立 4 lane、Data 丢失时重拨并重新双向 mTLS/HMAC 认证；同一 UDP 路径上环回恢复后的新 Data Stream 已通过。仍缺独立源端口/跨 NAT 路径修复，Transfer 正在实现业务使用（PR #25），传输途中 ACK 补传未完成 | 单 lane 断开期间继续 status，补回 lane 且不丢未确认业务数据 |
 | Control/网络路径失效 | 主控制断链 Go 现有实现也会结束会话；Rust 对等目标可进一步提供重连会话 | 尚无 ICE restart/路径切换和 Session 重新认证 | 故障显式状态、路径变化后仅经重新 ICE 和 mTLS/会话鉴权恢复；不伪报同一原始 QUIC |
 | SDK 诊断 | candidate、映射类型、UDP 源端口、QUIC lane 数/方向、传输状态 | 只提供基础 endpoint / close_reason | 稳定脱敏诊断 API / status 数据；日志不泄露邀请码/HMAC/私钥 |
 | 安全身份约束 | Go TLS + token/证书指纹；离线手工信令 | Rust 手动 v2 + 双向 TLS/HMAC + 人工 SAS，当前配对码较长 | 无可认证路径时拒绝；每条重连 lane 重新认证；明文文件传输禁止 |
