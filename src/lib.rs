@@ -44,6 +44,7 @@ pub mod local_network;
 pub mod multi_interface;
 
 pub mod nat_pmp;
+pub mod nat_pmp_lease;
 pub mod pcp;
 pub mod pcp_lease;
 
