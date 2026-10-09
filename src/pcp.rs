@@ -42,26 +42,72 @@ pub struct PcpUdpMapping {
     pub mapping_nonce: [u8; 12],
 }
 
-/// Request a UDP MAP for an existing independently-bound Quinn UDP port.
-/// PCP requests originate from the same local IP, not from Quinn's port.
+/// Create a fresh PCP MAP for an existing, independently bound ICE/QUIC UDP
+/// socket. An untrusted reply never becomes an ICE candidate without checks.
 pub async fn request_udp_mapping(
     local: SocketAddr,
     gateway: SocketAddr,
     lifetime: Duration,
     time_budget: Duration,
 ) -> Result<PcpUdpMapping, PcpError> {
+    let mut nonce = [0u8; 12];
+    getrandom::fill(&mut nonce).map_err(|_| PcpError::Entropy)?;
+    transact_map(local, gateway, lifetime, time_budget, nonce, 0, false).await
+}
+
+/// Renew the *same* PCP lease, preserving the original 96-bit nonce.
+/// Generating a new nonce here would create another router mapping instead
+/// of renewing the existing one, potentially leaking the previous mapping.
+/// The router may change the external address or port on renewal: callers
+/// must invalidate/recheck their ICE candidate when this occurs.
+pub async fn renew_udp_mapping(
+    mapping: &PcpUdpMapping,
+    gateway: SocketAddr,
+    lifetime: Duration,
+    time_budget: Duration,
+) -> Result<PcpUdpMapping, PcpError> {
+    if mapping.lifetime_seconds == 0 {
+        return Err(PcpError::InvalidInput);
+    }
+    transact_map(mapping.local_address, gateway, lifetime, time_budget,
+        mapping.mapping_nonce, mapping.external_address.port(), false).await
+}
+
+/// Explicitly delete a PCP lease with a zero-lifetime MAP request, reusing the
+/// original nonce. This operation must be awaited during orderly shutdown.
+/// A process crash cannot guarantee cleanup; router lease expiration remains
+/// the independent safety bound.
+pub async fn release_udp_mapping(
+    mapping: &PcpUdpMapping,
+    gateway: SocketAddr,
+    time_budget: Duration,
+) -> Result<(), PcpError> {
+    transact_map(mapping.local_address, gateway, Duration::ZERO, time_budget,
+        mapping.mapping_nonce, mapping.external_address.port(), true).await?;
+    Ok(())
+}
+
+async fn transact_map(
+    local: SocketAddr,
+    gateway: SocketAddr,
+    lifetime: Duration,
+    time_budget: Duration,
+    nonce: [u8; 12],
+    suggested_port: u16,
+    deleting: bool,
+) -> Result<PcpUdpMapping, PcpError> {
     if local.port() == 0 || local.ip().is_unspecified() || local.ip().is_multicast()
         || gateway.port() == 0 || gateway.ip().is_unspecified()
         || gateway.ip().is_multicast() || gateway.is_ipv4() != local.is_ipv4()
-        || lifetime.is_zero() || lifetime.as_secs() > u32::MAX as u64 || time_budget.is_zero()
+        || lifetime.as_secs() > u32::MAX as u64 || time_budget.is_zero()
+        || (deleting && !lifetime.is_zero())
+        || (!deleting && lifetime.as_secs() == 0)
     {
         return Err(PcpError::InvalidInput);
     }
 
     let socket = UdpSocket::bind(SocketAddr::new(local.ip(), 0))
         .await.map_err(PcpError::Io)?;
-    let mut nonce = [0u8; 12];
-    getrandom::fill(&mut nonce).map_err(|_| PcpError::Entropy)?;
     let mut request = [0u8; PACKET_LEN];
     request[0] = VERSION;
     request[1] = MAP_REQUEST;
@@ -70,8 +116,8 @@ pub async fn request_udp_mapping(
     request[24..36].copy_from_slice(&nonce);
     request[36] = UDP_PROTOCOL_NUMBER;
     request[40..42].copy_from_slice(&local.port().to_be_bytes());
-    // Suggested external port zero: let the gateway choose; no hidden
-    // assumption that the returned mapping equals the requested port.
+    request[42..44].copy_from_slice(&suggested_port.to_be_bytes());
+
     let mut response = [0u8; MAX_PACKET];
     let expires = Instant::now() + time_budget;
     for attempt in 0..3u32 {
@@ -91,15 +137,24 @@ pub async fn request_udp_mapping(
                     let result = response[3];
                     if result != 0 { return Err(PcpError::UnsupportedOrDenied(result)); }
                     let lifetime_seconds = u32::from_be_bytes(
-                        response[4..8].try_into().expect("slice length"),
-                    );
+                        response[4..8].try_into().expect("validated response size"));
                     let epoch_seconds = u32::from_be_bytes(
-                        response[8..12].try_into().expect("slice length"),
-                    );
+                        response[8..12].try_into().expect("validated response size"));
+                    if deleting {
+                        if lifetime_seconds == 0 {
+                            return Ok(PcpUdpMapping {
+                                local_address: local,
+                                external_address: SocketAddr::new(local.ip(), suggested_port),
+                                lifetime_seconds: 0,
+                                epoch_seconds,
+                                mapping_nonce: nonce,
+                            });
+                        }
+                        continue;
+                    }
                     let assigned_port = u16::from_be_bytes([response[42], response[43]]);
                     let assigned_ip = from_wire_ip(
-                        response[44..60].try_into().expect("slice length"),
-                    );
+                        response[44..60].try_into().expect("validated response size"));
                     if lifetime_seconds == 0 || assigned_port == 0
                         || assigned_ip.is_unspecified() || assigned_ip.is_multicast()
                         || assigned_ip.is_ipv4() != local.is_ipv4()
@@ -188,6 +243,77 @@ mod tests {
         assert_eq!(mapping.external_address, "198.51.100.90:60555".parse().unwrap());
         assert_eq!(mapping.lifetime_seconds, 1800);
         task.await.unwrap();
+    }
+
+
+    #[tokio::test]
+    async fn renewal_and_deletion_reuse_nonce_and_original_internal_port() {
+        let gateway = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let gateway_addr = gateway.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut nonce = None;
+            for (i, expected_lifetime, assigned_port) in [
+                (0, 120u32, 52001u16),
+                (1, 240u32, 52002u16),
+                (2, 0u32, 0u16),
+            ] {
+                let mut buf = [0u8; MAX_PACKET];
+                let (len, source) = gateway.recv_from(&mut buf).await.unwrap();
+                assert_eq!(len, PACKET_LEN);
+                assert_eq!(buf[0], VERSION);
+                assert_eq!(buf[1], MAP_REQUEST);
+                assert_eq!(buf[36], UDP_PROTOCOL_NUMBER);
+                assert_eq!(u16::from_be_bytes([buf[40], buf[41]]), 50000);
+                assert_eq!(u32::from_be_bytes(buf[4..8].try_into().unwrap()), expected_lifetime);
+                if i == 0 {
+                    assert_eq!([buf[42], buf[43]], [0, 0]);
+                    nonce = Some(buf[24..36].to_vec());
+                } else {
+                    assert_eq!(buf[24..36], nonce.as_ref().unwrap()[..]);
+                    assert_eq!(u16::from_be_bytes([buf[42], buf[43]]),
+                        if i == 1 { 52001 } else { 52002 });
+                }
+                let mut reply = [0u8; PACKET_LEN];
+                reply[0] = VERSION;
+                reply[1] = MAP_REPLY;
+                reply[4..8].copy_from_slice(&expected_lifetime.to_be_bytes());
+                reply[8..12].copy_from_slice(&(i as u32 + 1).to_be_bytes());
+                reply[24..36].copy_from_slice(&buf[24..36]);
+                reply[36] = UDP_PROTOCOL_NUMBER;
+                reply[40..42].copy_from_slice(&50000u16.to_be_bytes());
+                reply[42..44].copy_from_slice(&assigned_port.to_be_bytes());
+                reply[44..60].copy_from_slice(&to_wire_ip(
+                    "198.51.100.9".parse().unwrap()));
+                gateway.send_to(&reply, source).await.unwrap();
+            }
+        });
+        let local = "127.0.0.1:50000".parse().unwrap();
+        let first = request_udp_mapping(local, gateway_addr,
+            Duration::from_secs(120), Duration::from_secs(1)).await.unwrap();
+        assert_eq!(first.external_address.port(), 52001);
+        let second = renew_udp_mapping(&first, gateway_addr,
+            Duration::from_secs(240), Duration::from_secs(1)).await.unwrap();
+        assert_eq!(second.mapping_nonce, first.mapping_nonce);
+        assert_eq!(second.external_address.port(), 52002);
+        release_udp_mapping(&second, gateway_addr, Duration::from_secs(1))
+            .await.unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn refuses_zero_length_creates_and_renewals() {
+        let local = "127.0.0.1:50000".parse().unwrap();
+        let router = "127.0.0.1:5351".parse().unwrap();
+        assert!(matches!(request_udp_mapping(local, router,
+            Duration::from_millis(1), Duration::from_secs(1)).await,
+            Err(PcpError::InvalidInput)));
+        let invalid = PcpUdpMapping {
+            local_address: local, external_address: "198.51.100.1:60000".parse().unwrap(),
+            lifetime_seconds: 0, epoch_seconds: 0, mapping_nonce: [1; 12],
+        };
+        assert!(matches!(renew_udp_mapping(&invalid, router,
+            Duration::from_secs(30), Duration::from_secs(1)).await,
+            Err(PcpError::InvalidInput)));
     }
 
     #[tokio::test]
