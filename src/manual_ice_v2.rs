@@ -218,7 +218,9 @@ fn decode_wire(
     Ok(packet)
 }
 
-fn split_wire(bytes: &[u8]) -> Result<(&[u8], &[u8], &[u8]), ManualIceError> {
+type WireSections<'a> = (&'a [u8], &'a [u8], &'a [u8]);
+
+fn split_wire(bytes: &[u8]) -> Result<WireSections<'_>, ManualIceError> {
     if bytes.len() < 9 {
         return Err(ManualIceError::InvalidCode);
     }
