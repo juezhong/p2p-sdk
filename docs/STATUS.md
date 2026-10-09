@@ -145,3 +145,11 @@
 - 新开发分支 `feat/m1-mutual-tls-verified-session`：新增 `tls_identity.rs`，在 Quinn 服务端强制客户端证书，在客户端强制服务器证书验证，并增加两条连接的 loopback 双向证书检查与无证书客户端拒绝测试。
 - 注意：当前只实现双向 TLS 配置基础，仍未将 ManualConfirmation/证书 Pin 与应用 Session 构造接口统一为不可绕过的高层 API；未实现 ICE/Quinn 同 UDP I/O Owner、真实 NAT 穿透、密钥撤销。CI 完整通过之前不合并。
 - 下一任务：将手工配对的明确确认、两条 QUIC 的双向 TLS 身份和 Session Secret 证明组合成不可绕过的 Session 构造状态机，然后开展真实双机 ICE/Quinn 验证。
+
+## 本轮 M1 双向 TLS 证书校验（2026-10-09）
+
+- [SDK PR #13](https://github.com/juezhong/p2p-sdk/pull/13) 已通过 [GitHub Actions #37912246917](https://github.com/juezhong/p2p-sdk/actions/runs/37912246917) 的自动格式化/Clippy/全部单元测试，并 squash 合并至 main（commit `e9e2cf8d`）。
+- 新增 `tls_identity.rs`：Quinn 服务端明确要求并验证客户端 TLS 证书，客户端也验证服务端证书，使用明确选择的 rustls `ring` CryptoProvider、独立信任根、ALPN 及禁止 0-RTT。
+- 自动测试覆盖 localhost 上两条独立 Control/Data QUIC 的双向证书指纹校验、错误指纹拒绝、无客户端证书拒绝，以及缺少证书或信任根的配置拒绝。**这是 loopback 测试，不等于真实 NAT 测试。**
+- 尚未将 `ManualConfirmation`、临时密钥派生、两条 QUIC mTLS/Pin 校验和 HMAC 会话绑定合并为不可绕过的高层已授权 Session。生产级设备证书持久化/轮换/撤销和 ICE/Quinn 共 UDP I/O Owner、跨平台/双机网络验证仍未完成。
+- 下一开发重点：高层经验证双连接 Session 构造门禁；随后真实 ICE offer/answer 与 Quinn 共端口、两机 Stream Echo 测试。
