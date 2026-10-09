@@ -17,8 +17,9 @@ pub enum ChannelError {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ChannelPolicy {
-    /// Maximum number of extra, independently connected data-only QUIC links.
-    /// A single authenticated QUIC link can still carry many data streams.
+    /// Additional data-only QUIC links beyond the required first data QUIC.
+    /// The control QUIC connection is NOT counted here. Zero means one
+    /// control connection plus one separate data connection.
     pub max_extra_data_connections: u8,
 }
 
@@ -41,7 +42,7 @@ mod tests {
     }
 
     #[test]
-    fn defaults_to_one_transport_without_extra_data_links() {
+    fn defaults_to_one_control_and_one_data_quic_without_extra_links() {
         let policy = ChannelPolicy::default();
         assert_eq!(policy.max_extra_data_connections, 0);
         assert!(policy.validate().is_ok());
