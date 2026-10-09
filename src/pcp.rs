@@ -10,7 +10,7 @@
 //! firewall policy are separate higher-level work.
 
 use std::{
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    net::{IpAddr, Ipv6Addr, SocketAddr},
     time::Duration,
 };
 
@@ -142,6 +142,7 @@ fn from_wire_ip(raw: [u8; 16]) -> IpAddr {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::Ipv4Addr;
     use tokio::time::timeout;
 
     #[test]
