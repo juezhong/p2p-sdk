@@ -6,6 +6,7 @@
 //! This is an experimental transport building block; ICE is not wired up.
 
 use quinn::Connection;
+use crate::{channel::ChannelRole, session_binding::AuthenticatedLink};
 
 #[derive(Clone)]
 #[allow(dead_code)]
@@ -17,12 +18,29 @@ pub struct DualQuic {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DualQuicError {
     SameConnection,
+    InvalidRole,
+    SessionMismatch,
 }
 
 #[allow(dead_code)]
 impl DualQuic {
-    /// Caller must verify that both connections refer to the same authenticated
-    /// peer and negotiated application session. This is not done here yet.
+    /// Both links must have completed QUIC/TLS authentication and matching
+    /// session-bound proofs. Peer device identity is a separate future layer.
+    pub fn from_authenticated_links(control: AuthenticatedLink, data: AuthenticatedLink) -> Result<Self, DualQuicError> {
+        if control.role() != ChannelRole::Control || data.role() != ChannelRole::Data {
+            return Err(DualQuicError::InvalidRole);
+        }
+        if control.session_id() != data.session_id() {
+            return Err(DualQuicError::SessionMismatch);
+        }
+        let (control, data) = (control.connection().clone(), data.connection().clone());
+        if control.stable_id() == data.stable_id() {
+            return Err(DualQuicError::SameConnection);
+        }
+        Ok(Self { control, data })
+    }
+
+    #[cfg(test)]
     pub(crate) fn new(control: Connection, data: Connection) -> Result<Self, DualQuicError> {
         if control.stable_id() == data.stable_id() {
             return Err(DualQuicError::SameConnection);
