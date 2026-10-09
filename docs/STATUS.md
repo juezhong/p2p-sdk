@@ -217,3 +217,9 @@
 2. 从真正本机网卡收集 host + 多 STUN srflx 候选并加入 ICE candidate pairs；独立 IPv4/IPv6 UDP owner 路径。
 3. 保活、撤销、ICE restart 与双 QUIC 恢复；持续 Nomination 路径有效性验证。基于网络环境和性能数据补充可选 PCP/NAT-PMP/UPnP。
 4. 开发 SDK CLI 联机 Echo/诊断测试工具（不是 Transfer），实现真实两台机器 LAN/跨 NAT 测试，并按文档登记 Windows/macOS/Linux 手测结果；无直连路径必须 NoDirectPath，不允许中继。
+
+## 跨五平台 Debug 验证（2026-10-09，功能 PR 待验收）
+
+- 新功能 PR：`feat/m1-debug-five-platforms`，添加 SDK-only `p2p-sdk-debug`，支持 `selftest`（真实 localhost ICE 提名 + 同一 UDP Socket 上双独立 Quinn TLS Stream Echo）和 `stun IP:PORT`（单独探测 Socket 映射观察）；详见 `docs/DEBUG_TESTING.md`。
+- 新 GitHub Actions Debug 矩阵：Windows x64、macOS x64/arm64、Linux x64/arm64，原生 build/selftest，成功后上传 Debug executable Artifacts。必须分别确认 5 项 CI，不能只凭 workflow 文件就宣称构建成功。
+- 仍无跨两机完整 ICE INVITE/REPLY 和真实 NAT 验证，Debug 不是正式 SDK Release。SDK 没有任何文件业务。
