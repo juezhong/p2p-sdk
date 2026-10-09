@@ -163,6 +163,7 @@ mod tests {
                 server_config, "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
             ).unwrap();
             let address = server.local_addr().unwrap();
+            let (finished_tx, finished_rx) = tokio::sync::oneshot::channel::<()>();
             let server_task = tokio::spawn(async move {
                 let mut links = Vec::new();
                 for _ in 0..2 {
@@ -171,6 +172,7 @@ mod tests {
                 tokio::time::sleep(Duration::from_secs(38)).await;
                 assert!(links.iter().all(|link| link.close_reason().is_none()),
                     "idle server connections must still be alive");
+                let _ = finished_tx.send(());
                 server.close(0u32.into(), b"test complete");
             });
             let config = authenticated_client_config(
@@ -186,6 +188,7 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(36)).await;
             assert!(control.close_reason().is_none(), "Control QUIC timed out during idle");
             assert!(data.close_reason().is_none(), "Data QUIC timed out during idle");
+            finished_rx.await.unwrap();
             client.close(0u32.into(), b"test complete");
             server_task.await.unwrap();
         }).await.expect("idle QUIC regression exceeded deadline");
