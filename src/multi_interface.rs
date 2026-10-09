@@ -16,7 +16,7 @@ use std::{collections::HashSet, net::SocketAddr, time::Duration};
 use tokio::task::JoinSet;
 
 use crate::{
-    ice_agent::{IceCheckError, NominatedPath},
+    ice_agent::NominatedPath,
     ice_gather::{gather, CandidateGatherError},
     ice_multi::nominate_direct_candidates,
     ice_signaling::{IceDescription, IceRole, MAX_CANDIDATES},
