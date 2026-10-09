@@ -68,3 +68,9 @@
 - M1 的**第一个纯编解码子任务**：[PR #4](https://github.com/juezhong/p2p-sdk/pull/4) 已合并，RFC 8489 STUN Binding request / response 与 IPv4/IPv6 XOR-MAPPED-ADDRESS 解码、边界/事务标识测试；合并提交 `dbd0d7b`。PR 最新 GitHub Actions fmt/Clippy/test 已通过。
 - 仍**没有**真正的 STUN UDP Client、ICE candidate pair 检查、Quinn/TLS 安全连接、实际 NAT 穿透、自动信令。编解码模块本身不认证 peer；其解析结果不可单独视为可信路径。
 - 下一项：Tokio UDP STUN 收发（随机 Transaction ID、服务端源地址验证、退避重试、超时/取消/脱敏诊断），接着验证 ICE Agent + Quinn 同一有效 UDP 映射；再开展真实双机 NAT 测试。
+
+## 架构决策待验收（2026-10-09）
+
+- [PR #6](https://github.com/juezhong/p2p-sdk/pull/6)：RFC 9443 STUN/QUIC 分包分类器 + 六项穿透能力路线 + ADR-0002。采用每个数据候选统一 UDP I/O Owner 的端口/Socket 复用策略，信令与 PCP/NAT-PMP/UPnP 控制可以使用独立连接。
+- RFC 9443 模式下必须在 Quinn 禁用 `grease_quic_bit`。分类器代码不是完整 Socket Demux/ICE/Quinn 适配，也没有实测 NAT 穿透。
+- 下一步：以真实底层 Socket 和 Quinn `AsyncUdpSocket` 接口为原型验证互斥收包、分发、背压/唤醒、ICE 连通性检查、TLS 身份认证的端到端 Stream Echo，之后再上多 STUN 与映射控制。使用 CI 与真实网络抓包记录验收。
