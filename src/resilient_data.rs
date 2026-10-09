@@ -224,8 +224,16 @@ impl ResilientDataLanes {
         }).await.map_err(|_| LanePoolError::TimedOut)?
     }
 
-    pub fn shutdown(&self) {
+    /// Stop background repair and close only Data connections; Control
+    /// remains owned by the verified session.
+    pub async fn shutdown(&self) {
         self.stop.send_replace(true);
+        let mut lanes = self.state.lanes.write().await;
+        for conn in lanes.iter_mut().filter_map(Option::take) {
+            conn.close(0u32.into(), b"data pool stopped");
+        }
+        drop(lanes);
+        self.state.publish().await;
     }
 }
 
