@@ -196,3 +196,24 @@
 - 新分支 `feat/m1-ice-agent-direct-checks` 引入第三方独立 Sans-I/O `is` ICE Agent（0.11.1，MSRV 1.85），通过原 UDP Owner 同端口进行真实 RFC 8445 检查；有 host↔host 双 Agent 授权提名的 localhost 测试，超时应为 NoDirectPath。
 - 此模块暂只针对一个 IPv4/IPv6 同族 host candidate；需要 CI 成功后才算验证。ICE 候选收集、srflx/prflx 映射整合、多网卡、真正跨 NAT、双 QUIC 控制/数据 Session 与 ICE nominated pair 一体化、consent 保活与 restart 仍未完成。
 - 继续保持 SDK 与 Transfer 业务独立，记录 PR #2/#1 不合并。
+
+## 四批 M1 网络能力已合并：ICE 正式提名 + Quinn 同 Socket（2026-10-09）
+
+**完成并有 GitHub Actions 证据**：
+- PR [#15](https://github.com/juezhong/p2p-sdk/pull/15) `862eeb21`：ICE 候选/凭据会话 HMAC 编解码、多 STUN、单 UDP Owner，CI 通过。
+- PR [#16](https://github.com/juezhong/p2p-sdk/pull/16) `726ad563`：真实 Quinn AsyncUdpSocket 共享 STUN UDP Socket、Quinn TLS Echo，CI [#37914763174](https://github.com/juezhong/p2p-sdk/actions/runs/37914763174) 通过。
+- PR [#17](https://github.com/juezhong/p2p-sdk/pull/17) `a9b0265f`：标准 Sans-I/O `is` ICE Agent 连接单 UDP Owner，运行 RFC 8445 双端 host candidate integrity/check/nomination，NoDirectPath 测试，CI [#37915693838](https://github.com/juezhong/p2p-sdk/actions/runs/37915693838) 通过；最低 Rust 版本更新至 1.85。
+- PR [#18](https://github.com/juezhong/p2p-sdk/pull/18) `fcb48d16`：**跨模块集成测试**两端正式 ICE nominated pair 后使用**完全相同 UDP Socket**完成独立 Control/Data Quinn TLS QUIC Stream Echo，CI [#37915984880](https://github.com/juezhong/p2p-sdk/actions/runs/37915984880) 通过。
+
+**绝不可误报**：
+- 上述仍是 Linux Actions 127.0.0.1 loopback 两端模拟，不是复杂 NAT 的真实公网直连成功率验证，也不是可用完整 SDK 产品。
+- 当前 ICE 流程针对单个 host/IPv4 或 IPv6 同族候选；未把 ICE 凭据/候选编码真正整合进手动 INVITE/REPLY v2。还缺主机多网卡发现、srflx/prflx 收集与加入 candidate pairs、持续 consent/freshness、ICE restart/恢复、IPv6 有状态防火墙验证以及 PCP/NAT-PMP/UPnP。
+- 当前 ICE/QUIC 实验测试中还需与正式的 mTLS 双向设备认证、确认状态和 HMAC VerifiedManualSession 统一组成不可绕过的完整用户配对 API；不能把独立模块通过分别的测试当成完整产品验收。
+- Quinn AsyncUdpSocket 的 ECN/多网卡源 IP/GSO 等实现及高负载控制优先级需要专门验证。
+- SDK 不实现上传下载、磁盘文件操作、Transfer 业务帧或 UI；这些只属于 p2p-transfer。
+
+**下一批优先任务**：
+1. 设计并实现不会让用户额外步骤的完整 Manual INVITE/REPLY v2：交换经过认证且大小有界的 ICE credentials/candidates，兼顾隐私/重放/过期；需要真实用户一次邀请一次回复完成配对和 ICE 启动。
+2. 从真正本机网卡收集 host + 多 STUN srflx 候选并加入 ICE candidate pairs；独立 IPv4/IPv6 UDP owner 路径。
+3. 保活、撤销、ICE restart 与双 QUIC 恢复；持续 Nomination 路径有效性验证。基于网络环境和性能数据补充可选 PCP/NAT-PMP/UPnP。
+4. 开发 SDK CLI 联机 Echo/诊断测试工具（不是 Transfer），实现真实两台机器 LAN/跨 NAT 测试，并按文档登记 Windows/macOS/Linux 手测结果；无直连路径必须 NoDirectPath，不允许中继。
