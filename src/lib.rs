@@ -8,6 +8,7 @@ pub mod channel;
 pub mod dual_quic;
 pub mod config;
 pub mod packet_demux;
+pub mod session_binding;
 pub mod state;
 pub mod stun;
 pub mod stun_client;

@@ -104,3 +104,10 @@
 - [PR #9](https://github.com/juezhong/p2p-sdk/pull/9) 正开发 Quinn loopback 双 QUIC 集成测试：同一客户端 Endpoint/UDP 端口两条连接、测试专用证书验证、先控制 RPC、关闭数据连接、后控制 RPC。
 - 本测试只验证 Quinn Connection 级隔离；不是 ICE/共享 STUN I/O、真实 NAT/IPv6、防火墙、身份 Session 绑定或 Data 重连测试。以 PR #9 GitHub Actions 最新结果为准，未通过不合并。
 - 下一任务：控制/数据连接的设备身份与会话 ID 绑定，然后 ICE/QUIC 共 UDP I/O Owner、真实双机连通性和数据故障重建。
+
+## M1 会话绑定开发（2026-10-09）
+
+- [SDK PR #9](https://github.com/juezhong/p2p-sdk/pull/9) 已通过完整 Rust CI 并合并，提交 `c5eecd4`：同一 Quinn Endpoint 两条独立 QUIC 连接，关闭数据连接后控制 RPC 仍能成功的 loopback 验证。
+- [SDK PR #10](https://github.com/juezhong/p2p-sdk/pull/10) 当前待验收：应用 Session ID + HMAC-SHA256 双向随机挑战、Control/Data 角色证明、共享有界 nonce replay guard；双连接组合需验证角色和 Session 一致。
+- **尚未完成**：真实设备公钥与两个 QUIC TLS 连接绑定、会话凭据发行/过期撤销、ICE/QUIC 共底层 Socket、NAT 测试、data lane 重连。因此不能认为 PR #10 是完整的认证 Session。
+- 下一步：PR #10 CI 通过并合并后，补齐真实双连接握手端到端测试、TLS 设备身份绑定及 ICE/Quinn I/O Owner。独立设计 PR SDK #2、Transfer #1 继续保持不合并。
