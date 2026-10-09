@@ -88,7 +88,9 @@ impl UdpOwnerHandle {
 pub struct UdpOwner {
     pub handle: UdpOwnerHandle,
     pub ice_packets: mpsc::Receiver<InboundDatagram>,
-    pub quic_packets: mpsc::Receiver<InboundDatagram>,
+    pub(crate) quic_packets: mpsc::Receiver<InboundDatagram>,
+    pub(crate) socket: Arc<UdpSocket>,
+    pub(crate) quic_adapter_taken: bool,
     task: JoinHandle<()>,
 }
 
@@ -104,6 +106,8 @@ impl UdpOwner {
             handle: UdpOwnerHandle { local_address: local, actions: actions_tx },
             ice_packets: ice_rx,
             quic_packets: quic_rx,
+            socket,
+            quic_adapter_taken: false,
             task,
         })
     }
