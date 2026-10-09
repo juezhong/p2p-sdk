@@ -384,3 +384,12 @@ mod quinn_integration_tests {
         }).await.expect("authentication loopback test timeout");
     }
 }
+
+#[cfg(test)]
+pub(crate) fn test_session_proof(
+    credentials: &SessionCredentials,
+    client_nonce: &[u8; 32],
+    server_nonce: &[u8; 32],
+) -> [u8; 32] {
+    proof(credentials, ChannelRole::Control, client_nonce, server_nonce, SERVER_PROOF)
+}
