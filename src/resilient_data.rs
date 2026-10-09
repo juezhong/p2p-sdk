@@ -10,10 +10,15 @@
 //! NOT claim to implement ICE restart, fresh candidate discovery, or the file
 //! transfer's chunk/ACK recovery protocol.
 
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    collections::HashSet,
+    net::SocketAddr,
+    sync::{atomic::{AtomicUsize, Ordering}, Arc},
+    time::Duration,
+};
 
-use quinn::{Connection, Endpoint};
-use tokio::sync::{watch, RwLock};
+use quinn::{Connection, Endpoint, RecvStream, SendStream};
+use tokio::{sync::{watch, RwLock}, task::JoinSet};
 
 use crate::{
     channel::ChannelRole,
@@ -36,6 +41,7 @@ pub enum LanePoolError {
     SessionMismatch,
     ShuttingDown,
     TimedOut,
+    Transport,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -50,6 +56,7 @@ struct LaneState {
     control: Connection,
     lanes: RwLock<Vec<Option<Connection>>>,
     changed: watch::Sender<DataLaneStatus>,
+    next_lane: AtomicUsize,
 }
 
 impl LaneState {
@@ -136,6 +143,7 @@ impl ResilientDataLanes {
                 control: session.control().clone(),
                 lanes: RwLock::new(slots),
                 changed,
+                next_lane: AtomicUsize::new(0),
             }),
             stop,
         };
@@ -195,6 +203,74 @@ impl ResilientDataLanes {
 
     pub fn subscribe(&self) -> watch::Receiver<DataLaneStatus> {
         self.state.changed.subscribe()
+    }
+
+    /// Open a new bulk-data stream on a live authenticated lane. A later
+    /// stream can use another lane even if the previous lane was disconnected.
+    /// Transfer remains responsible for retransmitting any unacknowledged
+    /// file bytes from streams broken during the fault.
+    pub async fn open_uni(&self, deadline: Duration)
+        -> Result<SendStream, LanePoolError>
+    {
+        let mut changed = self.subscribe();
+        tokio::time::timeout(deadline, async {
+            loop {
+                if self.state.control.close_reason().is_some() {
+                    return Err(LanePoolError::ShuttingDown);
+                }
+                let lanes = self.available().await;
+                if !lanes.is_empty() {
+                    let index = self.state.next_lane.fetch_add(1, Ordering::Relaxed) % lanes.len();
+                    for offset in 0..lanes.len() {
+                        let lane = &lanes[(index + offset) % lanes.len()];
+                        if let Ok(stream) = lane.open_uni().await {
+                            return Ok(stream);
+                        }
+                    }
+                }
+                changed.changed().await.map_err(|_| LanePoolError::ShuttingDown)?;
+            }
+        }).await.map_err(|_| LanePoolError::TimedOut)?
+    }
+
+    /// Receive one bulk-data stream from whichever independently authenticated
+    /// lane the peer selected. For now a Transfer session must have exactly
+    /// ONE centralized Data stream dispatcher; concurrent per-request callers
+    /// could race and consume a different request's stream.
+    pub async fn accept_uni(&self, deadline: Duration)
+        -> Result<RecvStream, LanePoolError>
+    {
+        tokio::time::timeout(deadline, async {
+            let mut changed = self.subscribe();
+            let mut observed = HashSet::new();
+            let mut accepts = JoinSet::new();
+            loop {
+                if self.state.control.close_reason().is_some() {
+                    return Err(LanePoolError::ShuttingDown);
+                }
+                for lane in self.available().await {
+                    let id = lane.stable_id();
+                    if observed.insert(id) {
+                        accepts.spawn(async move { (id, lane.accept_uni().await) });
+                    }
+                }
+                tokio::select! {
+                    biased;
+                    received = accepts.join_next(), if !accepts.is_empty() => {
+                        if let Some(Ok((id, result))) = received {
+                            observed.remove(&id);
+                            if let Ok(stream) = result { return Ok(stream); }
+                        }
+                    }
+                    result = changed.changed() => {
+                        result.map_err(|_| LanePoolError::ShuttingDown)?;
+                    }
+                    _ = self.state.control.closed() => {
+                        return Err(LanePoolError::ShuttingDown);
+                    }
+                }
+            }
+        }).await.map_err(|_| LanePoolError::TimedOut)?
     }
 
     /// Snapshot returns live connections, not just those last counted before
