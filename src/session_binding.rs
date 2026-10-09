@@ -356,13 +356,7 @@ mod quinn_integration_tests {
                     assert_eq!(link.role(), role);
                     assert_eq!(link.session_id(), [4; 16]);
                 }
-                // Keep the server endpoint alive until the client has
-                // successfully constructed and verified the connection pair.
-                let (_, rx) = tokio::sync::oneshot::channel::<()>();
-                // The client does not need the server to shut down to prove
-                // its connection state: this task can finish and drop the
-                // endpoint only after it receives the explicit completion.
-                drop(rx);
+                server.close(0u32.into(), b"test complete");
             });
 
             let control = client.connect(address, "localhost").unwrap().await.unwrap();
