@@ -17,7 +17,7 @@ use is::{
 };
 use tokio::time::{sleep, timeout};
 
-use crate::udp_owner::{UdpOwner, UdpOwnerError};
+use crate::udp_owner::UdpOwner;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IceCheckError {
