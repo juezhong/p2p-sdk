@@ -50,11 +50,17 @@ mod tests {
                 &server_owner.handle, &[], IceRole::Controlled, Duration::from_secs(1)
             ).await.unwrap().description;
 
-            let (pending, invite) =
-                manual_ice_v2::invite(100, 600, client_pin, &client_ice).unwrap();
-            let (reply, server_pairing, exchanged_client_ice) =
-                manual_ice_v2::respond(&invite, 101, server_pin, &server_ice).unwrap();
-            let (client_pairing, exchanged_server_ice) = pending.finish(&reply, 102).unwrap();
+            let (pending, invite) = manual_ice_v2::invite_with_certificate(
+                100, 600, client_cert.as_ref(), &client_ice,
+            ).unwrap();
+            let (reply, server_pairing, exchanged_client_ice, peer_client_cert) =
+                manual_ice_v2::respond_with_certificate(
+                    &invite, 101, server_cert.as_ref(), &server_ice,
+                ).unwrap();
+            let (client_pairing, exchanged_server_ice, peer_server_cert) =
+                pending.finish_with_certificate(&reply, 102).unwrap();
+            assert_eq!(client_pairing.remote_tls_cert_sha256, server_pin);
+            assert_eq!(server_pairing.remote_tls_cert_sha256, client_pin);
             assert_eq!(exchanged_client_ice, client_ice);
             assert_eq!(exchanged_server_ice, server_ice);
             assert_eq!(client_pairing.comparison_code, server_pairing.comparison_code);
@@ -85,9 +91,9 @@ mod tests {
             assert_eq!(server_path.unwrap().remote, client_ip_port);
 
             let mut client_roots = rustls::RootCertStore::empty();
-            client_roots.add(server_cert.clone()).unwrap();
+            client_roots.add(peer_server_cert.into()).unwrap();
             let mut server_roots = rustls::RootCertStore::empty();
-            server_roots.add(client_cert.clone()).unwrap();
+            server_roots.add(peer_client_cert.into()).unwrap();
 
             let server_cfg = authenticated_server_config(
                 vec![server_cert],
