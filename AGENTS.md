@@ -32,3 +32,7 @@
 ## 首个里程碑
 
 先用最小测试程序验证：两端交换候选 -> ICE 通过 -> Quinn 经同一有效 UDP 映射完成身份验证和双向 Stream echo。原型不通过，不扩展成多应用框架。
+
+## 新会话接续入口
+
+**必须先阅读** [`docs/WORKFLOW.md`](docs/WORKFLOW.md) 和 [`docs/STATUS.md`](docs/STATUS.md)，检查当前分支和所有打开的 PR，核对已实现/未实现的状态。设计记录 [SDK PR #2](https://github.com/juezhong/p2p-sdk/pull/2) 与 [Transfer PR #1](https://github.com/juezhong/p2p-transfer/pull/1) 按用户要求保持未合并；功能开发另开 PR。新增开发 PR 的编号、测试证据与下一步均应同步记录到 `docs/STATUS.md`。
