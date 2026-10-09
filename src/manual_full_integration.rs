@@ -14,6 +14,7 @@ mod tests {
         peer_pin::{ManualConfirmation, PeerCertificatePin},
         quinn_socket::{demux_endpoint_config, QuinnUdpAdapter},
         session_binding::ReplayGuard,
+        resilient_data::ResilientDataLanes,
         tls_identity::{authenticated_client_config, authenticated_server_config},
         udp_owner::UdpOwner,
         verified_session::{establish_initiator, establish_responder},
@@ -21,7 +22,7 @@ mod tests {
 
     #[tokio::test]
     async fn manual_code_to_real_authenticated_dual_quic_stream_echo_on_same_ice_socket() {
-        tokio::time::timeout(Duration::from_secs(25), async {
+        tokio::time::timeout(Duration::from_secs(45), async {
             let client_identity =
                 rcgen::generate_simple_self_signed(vec!["client.local".into()]).unwrap();
             let server_identity =
@@ -129,12 +130,15 @@ mod tests {
             let server_task = tokio::spawn(async move {
                 let control = server.accept().await.unwrap().await.unwrap();
                 let data = server.accept().await.unwrap().await.unwrap();
-                let guard = ReplayGuard::new(8).unwrap();
+                let guard = Arc::new(ReplayGuard::new(128).unwrap());
                 let secure = establish_responder(
                     control, data, &server_pairing, &server_confirmation,
                     &guard, 103, Duration::from_secs(5),
                 ).await.expect("responder verified manual session");
                 assert_ne!(secure.control().stable_id(), secure.data().stable_id());
+                let pool = ResilientDataLanes::start_joiner(
+                    &secure, server.clone(), &server_pairing, Arc::clone(&guard), 4,
+                ).unwrap();
 
                 let (mut response, mut request) = secure.control().accept_bi().await.unwrap();
                 assert_eq!(request.read_to_end(64).await.unwrap(), b"control message");
@@ -146,8 +150,19 @@ mod tests {
                 response.write_all(b"data ack").await.unwrap();
                 response.finish().unwrap();
 
-                // Data QUIC may close while Control QUIC remains alive.
+                // All four independent Data QUICs have completed TLS and
+                // per-connection HMAC proof before the initial lane fails.
+                pool.wait_for_count(4, Duration::from_secs(8)).await.unwrap();
                 secure.data().closed().await;
+                let replacement = pool.wait_for_count(4, Duration::from_secs(8))
+                    .await.unwrap().into_iter()
+                    .find(|c| c.stable_id() != secure.data().stable_id())
+                    .unwrap();
+                let (mut response, mut request) = replacement.accept_bi().await.unwrap();
+                assert_eq!(request.read_to_end(64).await.unwrap(), b"repaired data");
+                response.write_all(b"repaired ack").await.unwrap();
+                response.finish().unwrap();
+
                 let (mut response, mut request) = secure.control().accept_bi().await.unwrap();
                 assert_eq!(request.read_to_end(64).await.unwrap(), b"control after data close");
                 response.write_all(b"still alive").await.unwrap();
@@ -167,6 +182,10 @@ mod tests {
                 103, Duration::from_secs(5),
             ).await.expect("initiator verified manual session");
             assert_ne!(secure.control().stable_id(), secure.data().stable_id());
+            let pool = ResilientDataLanes::start_creator(
+                &secure, client.clone(), server_ip_port, &client_pairing, 4,
+            ).unwrap();
+            assert_eq!(pool.wait_for_count(4, Duration::from_secs(8)).await.unwrap().len(), 4);
 
             async fn rpc(conn: &quinn::Connection, payload: &[u8], expected: &[u8]) {
                 let (mut send, mut receive) = conn.open_bi().await.unwrap();
@@ -183,7 +202,12 @@ mod tests {
                 Some(crate::verified_session::SessionLinkEvent::DataDisconnected),
             );
             secure.data().closed().await;
-            // A failed DATA lane must not be reported as Control failure.
+            // Pool must replace the exact dead lane, not merely count stale
+            // connections, without disturbing control or other Data lanes.
+            let recovered = pool.wait_for_count(4, Duration::from_secs(8))
+                .await.unwrap();
+            assert!(!recovered.iter().any(|c| c.stable_id() == secure.data().stable_id()));
+            rpc(&recovered[0], b"repaired data", b"repaired ack").await;
             assert!(monitor.try_recv().is_err());
             rpc(secure.control(), b"control after data close", b"still alive").await;
             assert!(secure.control().close_reason().is_none());
