@@ -132,3 +132,10 @@
 - CI 覆盖双方派生结果一致、配对码过期、跨会话回复、坏版本、无效公钥及篡改拒绝。
 - **安全尚未完成**：实际 Quinn TLS 证书与连接码声明的指纹绑定、独立人工比较码确认门禁、身份/信任管理、会话撤销以及 ICE 候选的 OFFER/ANSWER 信令交换。因此不能把 PR #11 称为“完整手动直连可用”。
 - 下一步优先：TLS 对端证书指纹核验 + 两条 QUIC 设备身份一致性；为手动配对加入 ICE 候选与完整的交换码，并进行 LAN 双机加密连接验证。
+
+## 本轮安全基础开发（2026-10-09）
+
+- [SDK PR #12](https://github.com/juezhong/p2p-sdk/pull/12) 已通过完整 GitHub Actions 并合并至 main（`60af368f`）。新增 `src/peer_pin.rs`，通过 Quinn 实际 `peer_identity` 证书链比对叶证书 SHA-256、拒绝缺失/错误指纹；还有独立 ManualConfirmation 状态与真实 TLS loopback 测试。
+- **尚未与正式 P2P Session 流程强制连接**：低层 `authenticate_initiator/responder` 仍可独立调用，用户确认状态未作为完整 Session 构造门槛。QUIC 服务端默认仍无客户端证书，缺少可靠双方设备身份；不可视为生产安全配对。
+- [长期 SDK 设计 PR #2 的服务器讨论评论](https://github.com/juezhong/p2p-sdk/pull/2#issuecomment-6078101303) 记录可选公网 Rust signaling server：密码验证、在线设备登记、可选持久连接与自动配对信令，**仅待讨论、不实施业务中继**。
+- 下一阶段优先做 TLS 双向设备身份、ManualConfirmation 不可绕过地绑定完整 Session 构造，再将 ICE candidate/密码加入手动 INVITE/REPLY，推进共享 UDP Socket 的 Quinn 直连原型。
