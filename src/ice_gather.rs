@@ -56,8 +56,10 @@ pub async fn gather(
     let mapping = if servers.is_empty() {
         None
     } else {
-        let report = query_via_owner(owner, servers, stun_deadline)
-            .await.map_err(CandidateGatherError::Stun)?;
+        // STUN is an optional enhancement: unavailable public servers must
+        // never disable a valid local Host candidate or offline LAN pairing.
+        let report = query_via_owner(owner, servers, stun_deadline).await.ok();
+        if let Some(report) = report {
         // Multiple STUN servers can show different external endpoints,
         // especially on endpoint-dependent mappings: preserve observations.
         let mut seen: HashSet<SocketAddr> = HashSet::from([local]);
@@ -77,6 +79,9 @@ pub async fn gather(
             }
         }
         Some(report)
+        } else {
+            None
+        }
     };
     let description = IceDescription {
         role,
@@ -148,6 +153,22 @@ mod tests {
         assert_eq!(result.description.candidates.len(), 1);
         assert_eq!(result.description.candidates[0].address, owner.handle.local_address());
         assert_eq!(result.description.candidates[0].kind, IceCandidateType::Host);
+        result.description.validate().unwrap();
+    }
+
+    #[tokio::test]
+    async fn unreachable_stun_does_not_break_offline_lan() {
+        let owner = UdpOwner::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        // A loopback UDP destination with no STUN server gives a deterministic
+        // short timeout; Host is still valid when optional discovery fails.
+        let unreachable: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let result = gather(&owner.handle, &[unreachable], IceRole::Controlling,
+            Duration::from_millis(100)).await.unwrap();
+        assert!(result.mapping.is_none());
+        assert_eq!(result.description.candidates.len(), 1);
+        assert_eq!(result.description.candidates[0].kind, IceCandidateType::Host);
+        assert_eq!(result.description.candidates[0].address,
+            owner.handle.local_address());
         result.description.validate().unwrap();
     }
 
