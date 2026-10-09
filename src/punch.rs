@@ -4,7 +4,7 @@
 //! probes are never usable until the standard ICE checker verifies them.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     net::SocketAddr,
     sync::Mutex,
     time::{SystemTime, UNIX_EPOCH},
@@ -13,7 +13,7 @@ use std::{
 use crate::{
     ice_signaling::{IceDescription, IceRole},
     session_binding::SessionCredentials,
-    udp_owner::{UdpOwnerError, UdpOwnerHandle},
+    udp_owner::{UdpOwner, UdpOwnerError, UdpOwnerHandle},
 };
 
 pub const PUNCH_MAGIC: &[u8; 4] = b"P2PP";
@@ -131,6 +131,53 @@ impl AuthenticatedPunch {
         }
         Ok(sent)
     }
+}
+
+/// Collect bounded, session-authenticated dynamic remote UDP endpoints.
+///
+/// Caller must supply an ICE description authenticated by the pairing. These
+/// addresses remain *potential* peer-reflexive candidates; they must be
+/// checked with authenticated ICE before opening any QUIC connection.
+/// This function uses the same socket as ICE and Quinn, including on NATs.
+pub async fn discover_peer_reflexive(
+    owner: &mut UdpOwner,
+    peer: &AuthenticatedPunch,
+    remote: &IceDescription,
+    budget: std::time::Duration,
+    cadence: std::time::Duration,
+) -> Result<Vec<SocketAddr>, UdpOwnerError> {
+    if budget.is_zero() || budget > std::time::Duration::from_secs(30)
+        || cadence < std::time::Duration::from_millis(50)
+        || remote.validate().is_err() || remote.role != opposite(peer.role)
+    {
+        return Err(UdpOwnerError::Io);
+    }
+    let until = tokio::time::Instant::now() + budget;
+    let mut interval = tokio::time::interval(cadence);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut seen = HashSet::new();
+    while tokio::time::Instant::now() < until {
+        tokio::select! {
+            _ = tokio::time::sleep_until(until) => break,
+            _ = interval.tick() => {
+                peer.send_to_candidates(&owner.handle, remote).await?;
+            }
+            received = owner.punch_packets.recv() => {
+                let Some(packet) = received else { return Err(UdpOwnerError::Closed) };
+                if let Ok(now) = unix_seconds() {
+                    if let Ok(addr) = peer.authenticate(&packet.bytes, packet.source, now) {
+                        if addr.is_ipv4() == owner.handle.local_address().is_ipv4() {
+                            seen.insert(addr);
+                        }
+                    }
+                }
+            }
+        }
+        if seen.len() >= crate::ice_signaling::MAX_CANDIDATES { break; }
+    }
+    let mut endpoints = seen.into_iter().collect::<Vec<_>>();
+    endpoints.sort();
+    Ok(endpoints)
 }
 
 pub fn unix_seconds() -> Result<u64, PunchError> {
