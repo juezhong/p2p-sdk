@@ -217,8 +217,8 @@ impl ResilientDataLanes {
             } else {
                 let tls = tls.clone();
                 tokio::spawn(async move {
-                    maintain_independent_creator_lane(state, stopped, local_ip,
-                        remote, credentials, remote_pin, tls, index).await;
+                    maintain_independent_creator_lane(state, stopped,
+                        (local_ip, remote), credentials, remote_pin, tls, index).await;
                 });
             }
         }
@@ -476,13 +476,13 @@ async fn maintain_creator_lane(
 async fn maintain_independent_creator_lane(
     state: Arc<LaneState>,
     mut stopped: watch::Receiver<bool>,
-    local_ip: std::net::IpAddr,
-    remote: SocketAddr,
+    addresses: (std::net::IpAddr, SocketAddr),
     credentials: SessionCredentials,
     pin: [u8; 32],
     tls: quinn::ClientConfig,
     index: usize,
 ) {
+    let (local_ip, remote) = addresses;
     let mut delay = RETRY_INITIAL;
     loop {
         if *stopped.borrow() || state.control.close_reason().is_some() {
