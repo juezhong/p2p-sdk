@@ -223,8 +223,23 @@ impl ResilientDataLanes {
                     let index = self.state.next_lane.fetch_add(1, Ordering::Relaxed) % lanes.len();
                     for offset in 0..lanes.len() {
                         let lane = &lanes[(index + offset) % lanes.len()];
-                        if let Ok(stream) = lane.open_uni().await {
-                            return Ok(stream);
+                        // Control failure invalidates this authenticated session.
+                        // A stalled Data open must not hide it until the caller's
+                        // whole deadline expires. A lane replacement also wakes
+                        // us to reconsider the currently usable connections.
+                        tokio::select! {
+                            result = lane.open_uni() => {
+                                if let Ok(stream) = result {
+                                    return Ok(stream);
+                                }
+                            }
+                            _ = self.state.control.closed() => {
+                                return Err(LanePoolError::ShuttingDown);
+                            }
+                            update = changed.changed() => {
+                                update.map_err(|_| LanePoolError::ShuttingDown)?;
+                                continue;
+                            }
                         }
                     }
                 }
@@ -295,7 +310,14 @@ impl ResilientDataLanes {
                 if self.state.control.close_reason().is_some() {
                     return Err(LanePoolError::ShuttingDown);
                 }
-                status.changed().await.map_err(|_| LanePoolError::ShuttingDown)?;
+                tokio::select! {
+                    update = status.changed() => {
+                        update.map_err(|_| LanePoolError::ShuttingDown)?;
+                    }
+                    _ = self.state.control.closed() => {
+                        return Err(LanePoolError::ShuttingDown);
+                    }
+                }
             }
         }).await.map_err(|_| LanePoolError::TimedOut)?
     }
