@@ -24,9 +24,9 @@ pub enum DualQuicError {
 
 #[allow(dead_code)]
 impl DualQuic {
-    /// Both links must have completed QUIC/TLS authentication and matching
-    /// session-bound proofs. Peer device identity is a separate future layer.
-    pub fn from_authenticated_links(control: AuthenticatedLink, data: AuthenticatedLink) -> Result<Self, DualQuicError> {
+    /// Internal transport assembly only. The public VerifiedManualSession
+    /// additionally enforces peer certificate pins and manual confirmation.
+    pub(crate) fn from_authenticated_links(control: AuthenticatedLink, data: AuthenticatedLink) -> Result<Self, DualQuicError> {
         if control.role() != ChannelRole::Control || data.role() != ChannelRole::Data {
             return Err(DualQuicError::InvalidRole);
         }
