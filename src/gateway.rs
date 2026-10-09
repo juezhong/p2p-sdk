@@ -5,7 +5,7 @@
 //! When the bound address is not on the OS-selected default interface, refuse
 //! port mapping instead of silently routing a different interface's port.
 
-use std::{net::{Ipv4Addr, SocketAddr, SocketAddrV4}, time::Duration};
+use std::{net::{SocketAddr, SocketAddrV4}, time::Duration};
 use tokio::sync::watch;
 
 use crate::{
