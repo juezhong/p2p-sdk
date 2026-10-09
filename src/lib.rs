@@ -14,6 +14,7 @@ pub mod session_binding;
 pub mod state;
 pub mod stun;
 pub mod stun_client;
+pub mod tls_identity;
 
 pub use candidate::{Candidate, CandidateKind, Family, TransportProtocol};
 pub use config::{Config, ConfigError};

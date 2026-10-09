@@ -139,3 +139,9 @@
 - **尚未与正式 P2P Session 流程强制连接**：低层 `authenticate_initiator/responder` 仍可独立调用，用户确认状态未作为完整 Session 构造门槛。QUIC 服务端默认仍无客户端证书，缺少可靠双方设备身份；不可视为生产安全配对。
 - [长期 SDK 设计 PR #2 的服务器讨论评论](https://github.com/juezhong/p2p-sdk/pull/2#issuecomment-6078101303) 记录可选公网 Rust signaling server：密码验证、在线设备登记、可选持久连接与自动配对信令，**仅待讨论、不实施业务中继**。
 - 下一阶段优先做 TLS 双向设备身份、ManualConfirmation 不可绕过地绑定完整 Session 构造，再将 ICE candidate/密码加入手动 INVITE/REPLY，推进共享 UDP Socket 的 Quinn 直连原型。
+
+## M1 双向 TLS 认证开发（2026-10-09）
+
+- 新开发分支 `feat/m1-mutual-tls-verified-session`：新增 `tls_identity.rs`，在 Quinn 服务端强制客户端证书，在客户端强制服务器证书验证，并增加两条连接的 loopback 双向证书检查与无证书客户端拒绝测试。
+- 注意：当前只实现双向 TLS 配置基础，仍未将 ManualConfirmation/证书 Pin 与应用 Session 构造接口统一为不可绕过的高层 API；未实现 ICE/Quinn 同 UDP I/O Owner、真实 NAT 穿透、密钥撤销。CI 完整通过之前不合并。
+- 下一任务：将手工配对的明确确认、两条 QUIC 的双向 TLS 身份和 Session Secret 证明组合成不可绕过的 Session 构造状态机，然后开展真实双机 ICE/Quinn 验证。
