@@ -14,7 +14,8 @@ use tokio::time::{sleep, timeout};
 
 use crate::{
     ice_agent::{credentials_from_description, IceCheckError, NominatedPath},
-    ice_signaling::{IceCandidateType, IceDescription, IceRole},
+    ice_signaling::{IceCandidate, IceCandidateType, IceDescription, IceRole, MAX_CANDIDATES},
+    punch::{discover_peer_reflexive, AuthenticatedPunch},
     udp_owner::UdpOwner,
 };
 
@@ -135,6 +136,43 @@ pub async fn nominate_direct_candidates(
     };
     let remain = limit.saturating_sub(start.elapsed());
     timeout(remain, result).await.unwrap_or(Err(IceCheckError::NoDirectPath))
+}
+
+/// Probe candidates with a session-authenticated HMAC before running the
+/// normal RFC 8445 ICE checker. Addresses learned from packets are only
+/// offered to ICE; they cannot be nominated without STUN integrity checks.
+///
+/// This additive entry point never bypasses verified ICE nomination, TLS or
+/// authenticated pairing. The caller keeps the owner alive for subsequent
+/// Quinn traffic on the same source address and UDP port.
+pub async fn nominate_with_authenticated_punch(
+    owner: &mut UdpOwner,
+    local: &IceDescription,
+    remote: &IceDescription,
+    punch: &AuthenticatedPunch,
+    budget: Duration,
+) -> Result<NominatedPath, IceCheckError> {
+    if budget <= Duration::from_millis(200) {
+        return Err(IceCheckError::InvalidCredentials);
+    }
+    let probe = budget.min(Duration::from_millis(600));
+    let learned = discover_peer_reflexive(
+        owner, punch, remote, probe, Duration::from_millis(100),
+    ).await.map_err(|_| IceCheckError::UdpOwnerClosed)?;
+    let mut augmented = remote.clone();
+    for observed in learned {
+        if augmented.candidates.len() >= MAX_CANDIDATES { break; }
+        if augmented.candidates.iter().any(|c| c.address == observed) { continue; }
+        // The ICE checker internally represents verified remote UDP
+        // destinations as Host candidates. The original type is prflx,
+        // but no peer-supplied address is trusted without HMAC + ICE proof.
+        augmented.candidates.push(IceCandidate {
+            address: observed,
+            kind: IceCandidateType::Host,
+            priority: 100,
+        });
+    }
+    nominate_direct_candidates(owner, local, &augmented, budget - probe).await
 }
 
 #[cfg(test)]
