@@ -68,6 +68,30 @@ impl SessionCredentials {
     pub fn session_id(&self) -> [u8; 16] {
         self.session_id
     }
+
+    /// Domain-separated authentication of ICE metadata. This does NOT hide
+    /// candidate IPs or the ICE password; do not log the resulting packet.
+    pub(crate) fn ice_signal_tag(&self, role: u8, payload: &[u8]) -> [u8; 32] {
+        let mut mac = HmacSha256::new_from_slice(&self.secret).expect("fixed key");
+        mac.update(b"p2p-sdk/ice-signaling/v1");
+        mac.update(&self.session_id);
+        mac.update(&[role]);
+        mac.update(payload);
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&mac.finalize().into_bytes());
+        out
+    }
+
+    pub(crate) fn verify_ice_signal(
+        &self, role: u8, payload: &[u8], tag: &[u8],
+    ) -> bool {
+        let mut mac = HmacSha256::new_from_slice(&self.secret).expect("fixed key");
+        mac.update(b"p2p-sdk/ice-signaling/v1");
+        mac.update(&self.session_id);
+        mac.update(&[role]);
+        mac.update(payload);
+        mac.verify_slice(tag).is_ok()
+    }
 }
 
 /// Keeps the nonces of *successfully authenticated* peer connections for
