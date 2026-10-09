@@ -152,7 +152,12 @@ mod tests {
 
     #[tokio::test]
     async fn idle_control_and_data_connections_survive_default_thirty_second_timeout() {
-        tokio::time::timeout(Duration::from_secs(55), async {
+        // Default CI takes 38s; opt in to real endurance tests up to 24h.
+        // Keepalive is continuous, not a one-shot extension of max idle.
+        let soak_secs = std::env::var("P2P_SDK_QUIC_SOAK_SECS")
+            .ok().and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(38).clamp(38, 86_400);
+        tokio::time::timeout(Duration::from_secs(soak_secs + 17), async {
             let server_identity = identity("localhost");
             let client_identity = identity("client.local");
             let server_config = authenticated_server_config(
@@ -169,7 +174,7 @@ mod tests {
                 for _ in 0..2 {
                     links.push(server.accept().await.unwrap().await.unwrap());
                 }
-                tokio::time::sleep(Duration::from_secs(38)).await;
+                tokio::time::sleep(Duration::from_secs(soak_secs)).await;
                 assert!(links.iter().all(|link| link.close_reason().is_none()),
                     "idle server connections must still be alive");
                 let _ = finished_tx.send(());
@@ -185,7 +190,7 @@ mod tests {
             client.set_default_client_config(config);
             let control = client.connect(address, "localhost").unwrap().await.unwrap();
             let data = client.connect(address, "localhost").unwrap().await.unwrap();
-            tokio::time::sleep(Duration::from_secs(36)).await;
+            tokio::time::sleep(Duration::from_secs(soak_secs - 2)).await;
             assert!(control.close_reason().is_none(), "Control QUIC timed out during idle");
             assert!(data.close_reason().is_none(), "Data QUIC timed out during idle");
             finished_rx.await.unwrap();
