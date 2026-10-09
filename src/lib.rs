@@ -41,3 +41,4 @@ mod manual_full_integration;
 pub mod local_network;
 
 pub mod nat_pmp;
+pub mod pcp;
