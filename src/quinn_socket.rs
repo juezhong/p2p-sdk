@@ -56,12 +56,16 @@ struct Writable {
 }
 
 impl UdpPoller for Writable {
-    fn poll_writable(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn poll_writable(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         self.socket.poll_send_ready(cx)
     }
 }
 
 impl AsyncUdpSocket for QuinnUdpAdapter {
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.socket.local_addr()
+    }
+
     fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn UdpPoller>> {
         Box::pin(Writable { socket: Arc::clone(&self.socket) })
     }
@@ -160,7 +164,7 @@ mod tests {
             assert!(QuinnUdpAdapter::from_owner(&mut server_owner).is_err());
             let server = quinn::Endpoint::new_with_abstract_socket(
                 demux_endpoint_config(), Some(server_config),
-                Box::new(server_adapter), quinn::default_runtime().unwrap(),
+                Arc::new(server_adapter), quinn::default_runtime().unwrap(),
             ).unwrap();
 
             let mut client_owner = UdpOwner::bind(
@@ -170,7 +174,7 @@ mod tests {
             let client_adapter = QuinnUdpAdapter::from_owner(&mut client_owner).unwrap();
             let mut client = quinn::Endpoint::new_with_abstract_socket(
                 demux_endpoint_config(), None,
-                Box::new(client_adapter), quinn::default_runtime().unwrap(),
+                Arc::new(client_adapter), quinn::default_runtime().unwrap(),
             ).unwrap();
             let mut roots = rustls::RootCertStore::empty();
             roots.add(cert).unwrap();
