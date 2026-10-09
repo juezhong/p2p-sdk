@@ -345,6 +345,7 @@ mod quinn_integration_tests {
 
             let credentials = SessionCredentials::new([4; 16], [5; 32]).unwrap();
             let server_creds = credentials.clone();
+            let (complete_tx, complete_rx) = tokio::sync::oneshot::channel::<()>();
             let server_task = tokio::spawn(async move {
                 let guard = ReplayGuard::new(4).unwrap();
                 for role in [ChannelRole::Control, ChannelRole::Data] {
@@ -356,6 +357,7 @@ mod quinn_integration_tests {
                     assert_eq!(link.role(), role);
                     assert_eq!(link.session_id(), [4; 16]);
                 }
+                complete_rx.await.expect("client completed both handshakes");
                 server.close(0u32.into(), b"test complete");
             });
 
@@ -371,6 +373,7 @@ mod quinn_integration_tests {
             let pair = crate::dual_quic::DualQuic::from_authenticated_links(control, data)
                 .expect("same verified application session");
             assert_ne!(pair.control().stable_id(), pair.data().stable_id());
+            complete_tx.send(()).expect("signal successful role pairing");
             server_task.await.unwrap();
             client.close(0u32.into(), b"test complete");
         }).await.expect("authentication loopback test timeout");
