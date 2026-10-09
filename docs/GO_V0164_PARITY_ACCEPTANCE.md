@@ -51,7 +51,7 @@ Discovering -> Checking -> Authenticated -> Healthy
 
 每一项必须保留对应 commit / CI、测试平台、内核、网络拓扑和失败阶段。真实 NAT 场景由用户在 [Transfer NAT_FIELD_TEST_RESULTS.md](https://github.com/juezhong/p2p-transfer/blob/main/docs/NAT_FIELD_TEST_RESULTS.md) 脱敏反馈。双方配对的完整 INVITE/REPLY 绝不能写入公开日志。
 
-- 2h/24h 静置与连续 status/远端目录：控制连接保活；
+- 2h/24h 静置与连续 status/远端目录：控制连接保活（基础双 QUIC SOAK 本地执行命令：`P2P_SDK_QUIC_SOAK_SECS=86400 cargo test tls_identity::tests::idle_control_and_data_connections_survive_default_thirty_second_timeout -- --nocapture`；默认 CI 为 38s，**24h 尚未执行且不能把纯 localhost soak 当公网 NAT 测试**）；
 - 家庭 LAN、不同 NAT、手机热点/CGNAT、IPv6 Stateful firewall；
 - 拔网线/临时 UDP 封禁/路由器重启/切换 Wi-Fi/IPv4 地址变化；
 - 部分 Data lane 断开后续传与 SHA-256、一方主动退出、故障未能恢复的明确告警；
