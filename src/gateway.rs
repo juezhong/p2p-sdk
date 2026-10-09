@@ -13,6 +13,7 @@ use crate::{
     nat_pmp_lease::{NatPmpLease, NatPmpLeaseStatus},
     pcp::PcpError,
     pcp_lease::{PcpLease, PcpLeaseStatus},
+    upnp_lease::{UpnpError, UpnpLease, UpnpStatus},
 };
 
 const GATEWAY_MAP_PORT: u16 = 5351;
@@ -24,9 +25,10 @@ pub enum GatewayError {
     WrongInterface,
     NoOnLinkGateway,
     AmbiguousGateway,
-    NoMapping { pcp: PcpError, nat_pmp: PortMapError },
+    NoMapping { pcp: PcpError, nat_pmp: PortMapError, upnp: UpnpError },
     Pcp(PcpError),
     NatPmp(PortMapError),
+    Upnp(UpnpError),
 }
 
 fn gateway_on_interface(local: SocketAddrV4, iface: &netdev::Interface)
@@ -73,11 +75,13 @@ pub fn discover_gateway_for_socket(local: SocketAddrV4)
 pub enum GatewayLease {
     Pcp(PcpLease),
     NatPmp(NatPmpLease),
+    Upnp(UpnpLease),
 }
 
 pub enum GatewayLeaseUpdates {
     Pcp(watch::Receiver<PcpLeaseStatus>),
     NatPmp(watch::Receiver<NatPmpLeaseStatus>),
+    Upnp(watch::Receiver<UpnpStatus>),
 }
 
 impl GatewayLeaseUpdates {
@@ -86,6 +90,7 @@ impl GatewayLeaseUpdates {
             Self::Pcp(rx) => rx.borrow().mapping.map(|m| m.external_address),
             Self::NatPmp(rx) => rx.borrow().mapping
                 .map(|m| SocketAddr::V4(m.external_address)),
+            Self::Upnp(rx) => rx.borrow().external.map(SocketAddr::V4),
         }
     }
 
@@ -93,6 +98,7 @@ impl GatewayLeaseUpdates {
         match self {
             Self::Pcp(rx) => rx.changed().await,
             Self::NatPmp(rx) => rx.changed().await,
+            Self::Upnp(rx) => rx.changed().await,
         }
     }
 }
@@ -117,10 +123,14 @@ impl GatewayLease {
                 local, gateway, lifetime, request_budget,
             ).await {
                 Ok(lease) => Ok(Self::NatPmp(lease)),
-                Err(nat_pmp_error) => Err(GatewayError::NoMapping {
-                    pcp: pcp_error,
-                    nat_pmp: nat_pmp_error,
-                }),
+                Err(nat_pmp_error) => match UpnpLease::start(
+                    local, gateway, lifetime, request_budget,
+                ).await {
+                    Ok(lease) => Ok(Self::Upnp(lease)),
+                    Err(upnp_error) => Err(GatewayError::NoMapping {
+                        pcp: pcp_error, nat_pmp: nat_pmp_error, upnp: upnp_error,
+                    }),
+                },
             },
         }
     }
@@ -129,6 +139,7 @@ impl GatewayLease {
         match self {
             Self::Pcp(lease) => GatewayLeaseUpdates::Pcp(lease.subscribe()),
             Self::NatPmp(lease) => GatewayLeaseUpdates::NatPmp(lease.subscribe()),
+            Self::Upnp(lease) => GatewayLeaseUpdates::Upnp(lease.subscribe()),
         }
     }
 
@@ -136,6 +147,7 @@ impl GatewayLease {
         match self {
             Self::Pcp(lease) => lease.shutdown().await.map_err(GatewayError::Pcp),
             Self::NatPmp(lease) => lease.shutdown().await.map_err(GatewayError::NatPmp),
+            Self::Upnp(lease) => lease.shutdown().await.map_err(GatewayError::Upnp),
         }
     }
 }
