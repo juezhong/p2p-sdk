@@ -88,7 +88,9 @@ impl UdpOwnerHandle {
 pub struct UdpOwner {
     pub handle: UdpOwnerHandle,
     pub ice_packets: mpsc::Receiver<InboundDatagram>,
-    pub quic_packets: mpsc::Receiver<InboundDatagram>,
+    pub(crate) quic_packets: mpsc::Receiver<InboundDatagram>,
+    pub(crate) socket: Arc<UdpSocket>,
+    pub(crate) quic_adapter_taken: bool,
     task: JoinHandle<()>,
 }
 
@@ -99,11 +101,13 @@ impl UdpOwner {
         let (actions_tx, actions_rx) = mpsc::channel(QUEUE_CAPACITY);
         let (ice_tx, ice_rx) = mpsc::channel(QUEUE_CAPACITY);
         let (quic_tx, quic_rx) = mpsc::channel(QUEUE_CAPACITY);
-        let task = tokio::spawn(run_owner(socket, actions_rx, ice_tx, quic_tx));
+        let task = tokio::spawn(run_owner(Arc::clone(&socket), actions_rx, ice_tx, quic_tx));
         Ok(Self {
             handle: UdpOwnerHandle { local_address: local, actions: actions_tx },
             ice_packets: ice_rx,
             quic_packets: quic_rx,
+            socket,
+            quic_adapter_taken: false,
             task,
         })
     }
