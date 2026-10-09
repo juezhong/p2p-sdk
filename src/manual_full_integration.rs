@@ -159,7 +159,9 @@ mod tests {
                 let sources = active.iter().map(|conn| conn.remote_address())
                     .collect::<std::collections::HashSet<_>>();
                 assert_eq!(sources.len(), 4);
-                assert!(!sources.contains(&secure.control().remote_address()));
+                // Initial Data shares Control's validated UDP socket; three
+                // additional lanes use independent bound source ports.
+                assert!(sources.contains(&secure.control().remote_address()));
                 secure.data().closed().await;
                 let replacement = pool.wait_for_count(4, Duration::from_secs(8))
                     .await.unwrap().into_iter().next().unwrap();
