@@ -118,7 +118,7 @@ impl Drop for PcpLease {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    use std::net::{IpAddr, Ipv4Addr};
     use tokio::net::UdpSocket;
 
     #[tokio::test]
