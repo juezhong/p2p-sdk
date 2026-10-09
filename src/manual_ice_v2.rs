@@ -22,9 +22,11 @@ const INVITE_PREFIX: &str = "P2PR-INV2-";
 const REPLY_PREFIX: &str = "P2PR-REP2-";
 const INVITE_MAGIC: &[u8; 4] = b"P2I2";
 const REPLY_MAGIC: &[u8; 4] = b"P2R2";
-const MAX_BINARY: usize = MAX_ICE_SIGNAL_SIZE + 1024;
+const MAX_BINARY: usize = MAX_ICE_SIGNAL_SIZE + MAX_CERT_DER + 1024;
 const HASH_LENGTH: usize = 32;
 const PROOF_LENGTH: usize = 32;
+const MAX_CERT_DER: usize = 2048;
+const CERT_MAGIC: &[u8; 4] = b"CRT2";
 const CONTROLLED_ROLE: u8 = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -34,6 +36,7 @@ pub enum ManualIceError {
     InvalidRole,
     OfferMismatch,
     BadReplyProof,
+    InvalidCertificate,
     Manual(ManualError),
     Ice(IceSignalError),
 }
@@ -239,6 +242,162 @@ fn split_wire(bytes: &[u8]) -> Result<WireSections<'_>, ManualIceError> {
     Ok((old, ice, tail))
 }
 
+
+/// Manual codes can optionally carry the actual public X.509 certificate DER,
+/// not only its SHA-256 pin. This lets the peer configure strict rustls trust
+/// anchors BEFORE any QUIC handshake, without disabling TLS verification.
+/// The caller must still explicitly verify the pairing comparison code.
+pub fn invite_with_certificate(
+    now: u64,
+    lifetime_secs: u64,
+    local_certificate_der: &[u8],
+    controlling: &IceDescription,
+) -> Result<(ManualIceInvite, String), ManualIceError> {
+    if controlling.role != IceRole::Controlling {
+        return Err(ManualIceError::InvalidRole);
+    }
+    let certificate = certificate_block(local_certificate_der)?;
+    let (inner, v1) = ManualInviteState::create(
+        now, lifetime_secs, digest(local_certificate_der),
+    )?;
+    let packet = wrap(
+        INVITE_MAGIC, v1.as_bytes(), &controlling.encode()?, &certificate
+    )?;
+    let hash = digest(&packet);
+    Ok((ManualIceInvite { inner, offer_hash: hash },
+        format!("{INVITE_PREFIX}{}", URL_SAFE_NO_PAD.encode(packet))))
+}
+
+/// Return the exact peer public TLS certificate and its ICE description.
+/// The certificate is a trust anchor ONLY after the user has independently
+/// compared the pairing code and the full v2 reply is verified.
+pub fn inspect_invite_with_certificate(
+    code: &str, now: u64,
+) -> Result<(IceDescription, Vec<u8>), ManualIceError> {
+    let packet = decode_wire(code, INVITE_PREFIX, INVITE_MAGIC)?;
+    let (old, payload, tail) = split_wire(&packet)?;
+    let (certificate, remaining) = parse_certificate_block(tail)?;
+    if !remaining.is_empty() {
+        return Err(ManualIceError::InvalidCode);
+    }
+    let inner = std::str::from_utf8(old).map_err(|_| ManualIceError::InvalidCode)?;
+    let preview = crate::manual_pairing::preview_invite(inner, now)?;
+    if digest(certificate) != preview.remote_tls_cert_sha256 {
+        return Err(ManualIceError::InvalidCertificate);
+    }
+    let desc = IceDescription::decode(payload)?;
+    if desc.role != IceRole::Controlling {
+        return Err(ManualIceError::InvalidRole);
+    }
+    Ok((desc, certificate.to_vec()))
+}
+
+/// The RESPONDER also publishes its public certificate in the REPLY. Its
+/// certificate is bound to the exact original offer and to the shared X25519
+/// session secret via the responder HMAC over the entire v2 reply.
+pub fn respond_with_certificate(
+    invite_code: &str,
+    now: u64,
+    local_certificate_der: &[u8],
+    controlled: &IceDescription,
+) -> Result<(String, ManualPairing, IceDescription, Vec<u8>), ManualIceError> {
+    if controlled.role != IceRole::Controlled {
+        return Err(ManualIceError::InvalidRole);
+    }
+    let local_certificate = certificate_block(local_certificate_der)?;
+    let offer = decode_wire(invite_code, INVITE_PREFIX, INVITE_MAGIC)?;
+    let (old, candidate_bytes, tail) = split_wire(&offer)?;
+    let (remote_certificate, remaining) = parse_certificate_block(tail)?;
+    if !remaining.is_empty() {
+        return Err(ManualIceError::InvalidCode);
+    }
+    let inner = std::str::from_utf8(old).map_err(|_| ManualIceError::InvalidCode)?;
+    let preview = crate::manual_pairing::preview_invite(inner, now)?;
+    if digest(remote_certificate) != preview.remote_tls_cert_sha256 {
+        return Err(ManualIceError::InvalidCertificate);
+    }
+    let remote_desc = IceDescription::decode(candidate_bytes)?;
+    if remote_desc.role != IceRole::Controlling {
+        return Err(ManualIceError::InvalidRole);
+    }
+    let (v1_reply, pairing) = respond_v1(
+        inner, now, digest(local_certificate_der),
+    )?;
+    let hash = digest(&offer);
+    let mut suffix = local_certificate;
+    suffix.extend_from_slice(&hash);
+    let mut reply = wrap(REPLY_MAGIC, v1_reply.as_bytes(), &controlled.encode()?, &suffix)?;
+    let tag = pairing.credentials.ice_signal_tag(CONTROLLED_ROLE, &reply);
+    reply.extend_from_slice(&tag);
+    if reply.len() > MAX_BINARY {
+        return Err(ManualIceError::TooLarge);
+    }
+    Ok((
+        format!("{REPLY_PREFIX}{}", URL_SAFE_NO_PAD.encode(reply)),
+        pairing,
+        remote_desc,
+        remote_certificate.to_vec(),
+    ))
+}
+
+impl ManualIceInvite {
+    /// Finalize a v2 reply containing actual peer certificate DER. Only the
+    /// verified certificate bytes should be installed in the rustls RootStore;
+    /// do not use system roots to accept an arbitrary machine instead.
+    pub fn finish_with_certificate(
+        self, reply_code: &str, now: u64,
+    ) -> Result<(ManualPairing, IceDescription, Vec<u8>), ManualIceError> {
+        let reply = decode_wire(reply_code, REPLY_PREFIX, REPLY_MAGIC)?;
+        let (old, ice, tail) = split_wire(&reply)?;
+        let (certificate, remaining) = parse_certificate_block(tail)?;
+        if remaining.len() != HASH_LENGTH + PROOF_LENGTH {
+            return Err(ManualIceError::InvalidCode);
+        }
+        if remaining[..HASH_LENGTH] != self.offer_hash {
+            return Err(ManualIceError::OfferMismatch);
+        }
+        let inner = std::str::from_utf8(old).map_err(|_| ManualIceError::InvalidCode)?;
+        let pairing = self.inner.finish(inner, now)?;
+        if digest(certificate) != pairing.remote_tls_cert_sha256 {
+            return Err(ManualIceError::InvalidCertificate);
+        }
+        if !pairing.credentials.verify_ice_signal(
+            CONTROLLED_ROLE,
+            &reply[..reply.len() - PROOF_LENGTH],
+            &reply[reply.len() - PROOF_LENGTH..],
+        ) {
+            return Err(ManualIceError::BadReplyProof);
+        }
+        let description = IceDescription::decode(ice)?;
+        if description.role != IceRole::Controlled {
+            return Err(ManualIceError::InvalidRole);
+        }
+        Ok((pairing, description, certificate.to_vec()))
+    }
+}
+
+fn certificate_block(der: &[u8]) -> Result<Vec<u8>, ManualIceError> {
+    if der.is_empty() || der.len() > MAX_CERT_DER {
+        return Err(ManualIceError::InvalidCertificate);
+    }
+    let mut result = Vec::with_capacity(6 + der.len());
+    result.extend_from_slice(CERT_MAGIC);
+    result.extend_from_slice(&(der.len() as u16).to_be_bytes());
+    result.extend_from_slice(der);
+    Ok(result)
+}
+
+fn parse_certificate_block(bytes: &[u8]) -> Result<(&[u8], &[u8]), ManualIceError> {
+    if bytes.len() < 7 || &bytes[..4] != CERT_MAGIC {
+        return Err(ManualIceError::InvalidCertificate);
+    }
+    let len = u16::from_be_bytes([bytes[4], bytes[5]]) as usize;
+    if len == 0 || len > MAX_CERT_DER || bytes.len() < 6 + len {
+        return Err(ManualIceError::InvalidCertificate);
+    }
+    Ok((&bytes[6..6+len], &bytes[6+len..]))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -256,6 +415,60 @@ mod tests {
                 priority: 1,
             }],
         }
+    }
+
+    #[test]
+    fn full_certificate_der_exchange_matches_advertised_tls_pins() {
+        let a = rcgen::generate_simple_self_signed(vec!["client.local".into()]).unwrap();
+        let b = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let offer = desc(IceRole::Controlling, "127.0.0.1:1234");
+        let answer = desc(IceRole::Controlled, "127.0.0.1:5678");
+        let (state, code) = invite_with_certificate(
+            100, 600, a.cert.der().as_ref(), &offer
+        ).unwrap();
+        let (preview, from_a) = inspect_invite_with_certificate(&code, 101).unwrap();
+        assert_eq!(preview, offer);
+        assert_eq!(from_a.as_slice(), a.cert.der().as_ref());
+        let (reply, b_pairing, remote_offer, from_a_again) =
+            respond_with_certificate(&code, 102, b.cert.der().as_ref(), &answer).unwrap();
+        assert_eq!(remote_offer, offer);
+        assert_eq!(from_a_again.as_slice(), a.cert.der().as_ref());
+        let (a_pairing, remote_answer, from_b) =
+            state.finish_with_certificate(&reply, 103).unwrap();
+        assert_eq!(remote_answer, answer);
+        assert_eq!(from_b.as_slice(), b.cert.der().as_ref());
+        assert_eq!(a_pairing.comparison_code, b_pairing.comparison_code);
+        assert_eq!(digest(&from_b), a_pairing.remote_tls_cert_sha256);
+        assert_eq!(digest(&from_a), b_pairing.remote_tls_cert_sha256);
+    }
+
+    #[test]
+    fn malformed_or_modified_certificate_is_rejected() {
+        let a = rcgen::generate_simple_self_signed(vec!["client.local".into()]).unwrap();
+        let offer = desc(IceRole::Controlling, "127.0.0.1:1234");
+        let (state, code) = invite_with_certificate(
+            100, 600, a.cert.der().as_ref(), &offer
+        ).unwrap();
+        let mut packet = decode_wire(&code, INVITE_PREFIX, INVITE_MAGIC).unwrap();
+        let pos = packet.windows(4).position(|w| w == CERT_MAGIC).unwrap();
+        packet[pos + 6] ^= 1;
+        let forged = format!("{INVITE_PREFIX}{}", URL_SAFE_NO_PAD.encode(packet));
+        assert!(matches!(
+            inspect_invite_with_certificate(&forged, 101),
+            Err(ManualIceError::InvalidCertificate)
+        ));
+        assert!(matches!(
+            respond_with_certificate(
+                &forged, 101, a.cert.der().as_ref(),
+                &desc(IceRole::Controlled, "127.0.0.1:5678"),
+            ),
+            Err(ManualIceError::InvalidCertificate)
+        ));
+        let (reply, _, _, _) = respond_with_certificate(
+            &code, 102, a.cert.der().as_ref(),
+            &desc(IceRole::Controlled, "127.0.0.1:5678"),
+        ).unwrap();
+        assert!(state.finish_with_certificate(&reply, 103).is_ok());
     }
 
     #[test]
