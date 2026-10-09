@@ -1,0 +1,11 @@
+[package]
+name = "p2p-sdk"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+license = "GPL-2.0-only"
+description = "Direct-only P2P connectivity SDK (early development)"
+
+[lib]
+name = "p2p_sdk"
+path = "src/lib.rs"
