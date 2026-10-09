@@ -224,3 +224,10 @@
 - 测试覆盖 IPv4/IPv6 候选交换、会话一致、INVITE 候选替换检测、REPLY 候选篡改检测、过期与错误角色；待 CI 验证，不提前标记完成。
 - 仍没有真实两机用户 CLI、候选发现、身份确认 UI 与完整经 mTLS 的 Session 一体化；v2 会包含 ICE 短期密码/本地 IP，不能安全公开分享，终端与日志不应自动打印原始连接码。配对仍必须独立核对六位比较码。
 - 调整发布策略：SDK 仅作为库，正式跨平台用户测试/发布由 `p2p-transfer` 承担，SDK Debug PR #19 不合并。
+
+## M1 Host/srflx 候选收集与标准 ICE 多候选对检查（2026-10-09 开发中）
+
+- 新分支 `feat/m1-host-srflx-gather-and-ice-checks`：在原 UdpOwner 的同一真实端口收集 host 及 Multi-STUN server-reflexive 地址，区分诊断性映射与已提名直连路径；添加 LAN-only、本地绑定限制和候选安全边界测试。
+- 新增标准 ICE Agent 对多个 Host/ServerReflexive 候选检查、选中实际可达地址的逻辑；屏蔽 TURN relay，拒绝错误 ICE 角色和没有相同基础 UDP Socket 的描述。测试将包含两个 UDP Owner 加入不可达公网候选时仍通过可达 LAN host pair 提名。
+- **限制**：目前只允许绑定明确本机 IP 的 UDP Owner；对 `0.0.0.0`/`::` 的真实多网卡候选需要 pktinfo/源地址选择后再开放。srflx 仅由 STUN 观察，不代表公网成功。缺少真实跨 NAT、防火墙、持续 consent/ICE restart 和安全配对的一体化用户入口。
+- SDK 仍仅是网络库；最终用户可执行 Debug/Release 都通过 Transfer 提供。开发完成进展记录到两份长期文档 PR 评论。
