@@ -231,3 +231,9 @@
 - 新增标准 ICE Agent 对多个 Host/ServerReflexive 候选检查、选中实际可达地址的逻辑；屏蔽 TURN relay，拒绝错误 ICE 角色和没有相同基础 UDP Socket 的描述。测试将包含两个 UDP Owner 加入不可达公网候选时仍通过可达 LAN host pair 提名。
 - **限制**：目前只允许绑定明确本机 IP 的 UDP Owner；对 `0.0.0.0`/`::` 的真实多网卡候选需要 pktinfo/源地址选择后再开放。srflx 仅由 STUN 观察，不代表公网成功。缺少真实跨 NAT、防火墙、持续 consent/ICE restart 和安全配对的一体化用户入口。
 - SDK 仍仅是网络库；最终用户可执行 Debug/Release 都通过 Transfer 提供。开发完成进展记录到两份长期文档 PR 评论。
+
+## 手动 v2 → 标准 ICE → 双向 mTLS → 双 QUIC 安全会话完整环回门槛（2026-10-09 开发中）
+
+- 此分支新增 `manual_full_integration.rs`，模拟用户显式确认六位校验码：同一实际 UDP Owner Gather → v2 INVITE/REPLY 交换 ICE 描述并验证 → 双端标准 ICE nominated pair → 原 UDP Socket 上分别建立 Control/Data QUIC → 双向 TLS 证书验证、双连接 Session HMAC → Control/Data 双 Stream Echo → 单独关闭 Data 后 Control 继续 Echo。
+- 自动化测试在 localhost Linux 上运行；通过只表示完整模块链路本地可用，不等于真实双机跨 NAT 或证明自动用户确认 UI 安全。证书在测试中由代码生成和显式信任，真实使用需匹配配对安全信任与长期身份机制。
+- 下一阶段：候选端点/网卡发现、真实 Internet NAT 路径、STUN 暴露的地址是否可达、ICE consent/restart、Transfer CLI 全链路连接/文件传输及五平台用户验证。
