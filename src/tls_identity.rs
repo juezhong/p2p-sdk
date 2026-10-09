@@ -6,7 +6,7 @@
 //! persistent device identities or ICE. A post-handshake leaf pin check still
 //! binds the certificate to the INVITE/REPLY transcript.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use rustls::{
@@ -16,6 +16,16 @@ use rustls::{
 };
 
 const ALPN: &[u8] = b"p2p-sdk/1";
+
+/// Keep both independently authenticated Control and Data QUIC sessions alive
+/// when the user is reading help, browsing menus or leaving an idle shell.
+/// This is QUIC PATH keepalive, not ICE consent freshness or ICE restart.
+fn interactive_transport() -> Arc<quinn::TransportConfig> {
+    let mut config = quinn::TransportConfig::default();
+    config.max_idle_timeout(Some(quinn::VarInt::from_u32(120_000).into()));
+    config.keep_alive_interval(Some(Duration::from_secs(10)));
+    Arc::new(config)
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TlsConfigError {
@@ -53,7 +63,9 @@ pub fn authenticated_server_config(
     tls.max_early_data_size = 0; // Reject 0-RTT application data.
     let crypto = QuicServerConfig::try_from(tls)
         .map_err(|_| TlsConfigError::IncompatibleQuicTls)?;
-    Ok(quinn::ServerConfig::with_crypto(Arc::new(crypto)))
+    let mut config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
+    config.transport_config(interactive_transport());
+    Ok(config)
 }
 
 /// Present a client certificate to the remote endpoint, while verifying the
@@ -79,7 +91,9 @@ pub fn authenticated_client_config(
     tls.enable_early_data = false;
     let crypto = QuicClientConfig::try_from(tls)
         .map_err(|_| TlsConfigError::IncompatibleQuicTls)?;
-    Ok(quinn::ClientConfig::new(Arc::new(crypto)))
+    let mut config = quinn::ClientConfig::new(Arc::new(crypto));
+    config.transport_config(interactive_transport());
+    Ok(config)
 }
 
 #[cfg(test)]
