@@ -8,7 +8,7 @@ use p2p_sdk::{
     udp_owner::UdpOwner,
 };
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() {
     let mut args = std::env::args().skip(1);
     let result = match args.next().as_deref() {
