@@ -221,6 +221,42 @@ mod tests {
         assert_eq!(b.authenticate(&bytes, addr, 10_100), Err(PunchError::InvalidTime));
     }
 
+    #[tokio::test]
+    async fn active_probing_learns_only_authenticated_runtime_source() {
+        let mut owner = UdpOwner::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let peer_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let destination = peer_socket.local_addr().unwrap();
+        let creds = SessionCredentials::new([6; 16], [8; 32]).unwrap();
+        let caller = AuthenticatedPunch::new(creds.clone(), IceRole::Controlling);
+        let other = AuthenticatedPunch::new(creds, IceRole::Controlled);
+        let task = tokio::spawn(async move {
+            let mut packet = [0u8; 128];
+            let (size, source) = peer_socket.recv_from(&mut packet).await.unwrap();
+            assert_eq!(size, PACKET_BYTES);
+            other.authenticate(&packet[..size], source, unix_seconds().unwrap()).unwrap();
+            let reply = other.make_packet(unix_seconds().unwrap()).unwrap();
+            peer_socket.send_to(&reply, source).await.unwrap();
+        });
+        let remote = IceDescription {
+            role: IceRole::Controlled,
+            ufrag: "remote01".into(),
+            password: "abcdefghijklmnopqrstuv012345".into(),
+            candidates: vec![crate::ice_signaling::IceCandidate {
+                address: destination,
+                kind: crate::ice_signaling::IceCandidateType::Host,
+                priority: 100,
+            }],
+        };
+        let observed = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            discover_peer_reflexive(&mut owner, &caller, &remote,
+                std::time::Duration::from_millis(300),
+                std::time::Duration::from_millis(100)),
+        ).await.unwrap().unwrap();
+        assert_eq!(observed, vec![destination]);
+        task.await.unwrap();
+    }
+
     #[test]
     fn tampering_or_foreign_session_is_rejected_before_learning_ip() {
         let (a, b) = peers();
