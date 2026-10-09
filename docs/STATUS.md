@@ -190,3 +190,9 @@
 - **仍缺少**：标准 ICE agent 的短期 MESSAGE-INTEGRITY、双端 candidate-pair 检查/提名/consent、主机网卡候选收集、手动 INVITE/REPLY 中实际交换候选的 v2 协议、IPv6 防火墙及 PCP/NAT-PMP/UPnP、实际跨运营商/路由器的手工测试。
 - **下一批开发应优先**评估并接入 Sans-I/O 标准 ICE agent（可评估 `is` crate），由现有 UDP Owner 驱动收包、发送和定时器，实现真实双方认证的 pair nomination，再让 Quinn 仅使用该 nominated address 与相同 Socket。验证 Control QUIC/Data QUIC 独立，增加高负载背压和跨平台测试。
 - SDK 仍不包含文件上传、下载、文件协议、落盘或界面；这些全部属于 Transfer。两份记录型 PR 不合并，优先在 PR 评论中持续交接。
+
+## M1 标准 ICE 连通性检查（2026-10-09）
+
+- 新分支 `feat/m1-ice-agent-direct-checks` 引入第三方独立 Sans-I/O `is` ICE Agent（0.11.1，MSRV 1.85），通过原 UDP Owner 同端口进行真实 RFC 8445 检查；有 host↔host 双 Agent 授权提名的 localhost 测试，超时应为 NoDirectPath。
+- 此模块暂只针对一个 IPv4/IPv6 同族 host candidate；需要 CI 成功后才算验证。ICE 候选收集、srflx/prflx 映射整合、多网卡、真正跨 NAT、双 QUIC 控制/数据 Session 与 ICE nominated pair 一体化、consent 保活与 restart 仍未完成。
+- 继续保持 SDK 与 Transfer 业务独立，记录 PR #2/#1 不合并。

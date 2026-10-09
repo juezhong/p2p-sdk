@@ -49,9 +49,24 @@ struct Query {
 pub struct UdpOwnerHandle {
     local_address: SocketAddr,
     actions: mpsc::Sender<Query>,
+    ice_outbound: mpsc::Sender<(SocketAddr, Vec<u8>)>,
 }
 
 impl UdpOwnerHandle {
+    /// Send one bounded ICE STUN datagram on the SAME UDP port owned by
+    /// this receiver. Non-STUN packets must use the Quinn adapter instead.
+    pub async fn send_ice(&self, destination: SocketAddr, packet: &[u8]) -> Result<(), UdpOwnerError> {
+        if destination.port() == 0 || destination.ip().is_unspecified()
+            || destination.is_ipv4() != self.local_address.is_ipv4()
+            || packet.len() > MAX_DATAGRAM
+            || classify_datagram(packet) != PacketRoute::Stun
+        {
+            return Err(UdpOwnerError::Io);
+        }
+        self.ice_outbound.send((destination, packet.to_vec()))
+            .await.map_err(|_| UdpOwnerError::Closed)
+    }
+
     pub fn local_address(&self) -> SocketAddr {
         self.local_address
     }
@@ -99,11 +114,12 @@ impl UdpOwner {
         let socket = Arc::new(UdpSocket::bind(address).await?);
         let local = socket.local_addr()?;
         let (actions_tx, actions_rx) = mpsc::channel(QUEUE_CAPACITY);
+        let (ice_out_tx, ice_out_rx) = mpsc::channel(QUEUE_CAPACITY);
         let (ice_tx, ice_rx) = mpsc::channel(QUEUE_CAPACITY);
         let (quic_tx, quic_rx) = mpsc::channel(QUEUE_CAPACITY);
-        let task = tokio::spawn(run_owner(Arc::clone(&socket), actions_rx, ice_tx, quic_tx));
+        let task = tokio::spawn(run_owner(Arc::clone(&socket), actions_rx, ice_out_rx, ice_tx, quic_tx));
         Ok(Self {
-            handle: UdpOwnerHandle { local_address: local, actions: actions_tx },
+            handle: UdpOwnerHandle { local_address: local, actions: actions_tx, ice_outbound: ice_out_tx },
             ice_packets: ice_rx,
             quic_packets: quic_rx,
             socket,
@@ -122,6 +138,7 @@ impl Drop for UdpOwner {
 async fn run_owner(
     socket: Arc<UdpSocket>,
     mut actions: mpsc::Receiver<Query>,
+    mut ice_outbound: mpsc::Receiver<(SocketAddr, Vec<u8>)>,
     ice_tx: mpsc::Sender<InboundDatagram>,
     quic_tx: mpsc::Sender<InboundDatagram>,
 ) {
@@ -130,6 +147,11 @@ async fn run_owner(
     let mut sweep = tokio::time::interval(Duration::from_millis(100));
     loop {
         tokio::select! {
+            outgoing = ice_outbound.recv() => {
+                if let Some((destination, bytes)) = outgoing {
+                    let _ = socket.send_to(&bytes, destination).await;
+                }
+            }
             _ = sweep.tick() => {
                 let now = Instant::now();
                 // Query futures enforce their own timeout. Dropping an
