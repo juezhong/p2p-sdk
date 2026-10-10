@@ -681,15 +681,18 @@ async fn race_authenticated_control(
 /// 与会话 HMAC 认证。只有真正通过认证的 QUIC 才能成为当前连接。
 async fn authenticate_on_path(
     mut path: ManagedPath,
-    client_tls: quinn::ClientConfig,
-    server_tls: quinn::ServerConfig,
+    tls: (quinn::ClientConfig, quinn::ServerConfig),
     pairing: ManualPairing,
     advertised: IceDescription,
     role: IceRole,
     replay_guard: Arc<ReplayGuard>,
-    prebound_endpoint: Option<quinn::Endpoint>,
-    preauthenticated_control: Option<quinn::Connection>,
+    prebound: Option<(quinn::Endpoint, Option<quinn::Connection>)>,
 ) -> Result<(ManagedPath, quinn::Endpoint, quinn::Connection, bool), DirectPeerError> {
+    let (client_tls, server_tls) = tls;
+    let (prebound_endpoint, preauthenticated_control) = match prebound {
+        Some((endpoint, control)) => (Some(endpoint), control),
+        None => (None, None),
+    };
     let remote = path.nominated().remote;
     let mut endpoint = if let Some(endpoint) = prebound_endpoint {
         endpoint
@@ -704,9 +707,17 @@ async fn authenticate_on_path(
     endpoint.set_default_client_config(client_tls);
     // 被动阶段已经验证 mTLS 与会话 HMAC 的连接仍必须与本 UDP
     // Owner 的有效 ICE 提名绑定，不能仅凭早到 QUIC 绕过连通性检查。
-    let (control, outbound) = if let Some(connection) =
-        preauthenticated_control.filter(|c| c.close_reason().is_none())
-    {
+    // 被动 QUIC 的认证身份不足以替代特定 ICE candidate pair 的连通性验证。
+    // 早到连接若指向同一 socket 的其他 NAT 端口，必须走标准 ICE/QUIC 竞速。
+    let nominated_prebound = preauthenticated_control.and_then(|connection| {
+        if connection.close_reason().is_none() && connection.remote_address() == remote {
+            Some(connection)
+        } else {
+            connection.close(1u32.into(), b"passive QUIC does not match nominated ICE path");
+            None
+        }
+    });
+    let (control, outbound) = if let Some(connection) = nominated_prebound {
         (connection, false)
     } else {
         match race_authenticated_control(
@@ -912,8 +923,8 @@ async fn connect_authenticated_transport(
                         let offered = remote.clone();
                         in_flight.spawn(async move {
                             authenticate_on_path(
-                                path, cert, server, binding, offered, role, guard,
-                                prepared_endpoint, prepared_control,
+                                path, (cert, server), binding, offered, role, guard,
+                                prepared_endpoint.map(|endpoint| (endpoint, prepared_control)),
                             ).await
                         });
                     }
