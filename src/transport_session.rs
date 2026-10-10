@@ -5,7 +5,7 @@
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use quinn::{Connection, Endpoint};
-use tokio::time::{timeout_at, Instant};
+use tokio::{sync::watch, task::JoinHandle, time::{sleep, timeout_at, Instant}};
 use crate::{
     channel::ChannelRole,
     ice_signaling::{IceRole, IceCandidateType},
@@ -68,6 +68,60 @@ impl AuthenticatedDataLink {
     }
 }
 
+/// 通用连接监测只管理一条经认证的辅助 QUIC；业务决定创建多少个实例。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ManagedLinkPhase {
+    Connecting,
+    Connected,
+    Reconnecting,
+    ControlLost,
+    AuthenticationFailed,
+    Stopped,
+}
+
+#[derive(Clone, Debug)]
+pub struct ManagedLinkStatus {
+    pub phase: ManagedLinkPhase,
+    /// 仅在重新通过 TLS/会话 HMAC 后递增。
+    pub generation: u64,
+    pub connection: Option<Connection>,
+    pub last_error: Option<TransportError>,
+}
+
+/// 丢弃句柄会取消重拨；显式 shutdown 会等待底层 UDP/QUIC 释放。
+pub struct ManagedAuthenticatedLink {
+    changed: watch::Receiver<ManagedLinkStatus>,
+    stop: watch::Sender<bool>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl ManagedAuthenticatedLink {
+    pub fn subscribe(&self) -> watch::Receiver<ManagedLinkStatus> {
+        self.changed.clone()
+    }
+
+    /// 只返回当前存活、曾通过完整认证的 QUIC；业务自己决定 Stream 分配。
+    pub fn current(&self) -> Option<Connection> {
+        self.changed.borrow().connection.as_ref()
+            .filter(|connection| connection.close_reason().is_none())
+            .cloned()
+    }
+
+    pub async fn shutdown(mut self) {
+        self.stop.send_replace(true);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.await;
+        }
+    }
+}
+
+impl Drop for ManagedAuthenticatedLink {
+    fn drop(&mut self) {
+        // worker 收到停止信号后自己清理 Endpoint、UDP Owner 和活跃 QUIC。
+        self.stop.send_replace(true);
+    }
+}
+
 /// The generic SDK surface does not create any Data QUIC automatically.
 /// Applications may open any number of auxiliary connections using these
 /// methods, without importing the Transfer-specific four-lane policy.
@@ -88,6 +142,117 @@ pub struct ConnectedTransportPeer {
 }
 
 impl ConnectedTransportPeer {
+    /// 可选托管一条 Data QUIC；创建者重拨，加入者重新接受，每轮均做
+    /// mTLS PIN + Session HMAC。可以创建多个实例，不固定四条也不负责选流。
+    ///
+    /// 托管对象持有 Arc<Self>。先关闭托管对象，再结束整个 Control 会话；
+    /// Control 真正断开后不伪造 ICE Restart 或逻辑会话连续性。
+    pub fn manage_authenticated_data(self: &Arc<Self>) -> ManagedAuthenticatedLink {
+        let initial = ManagedLinkStatus {
+            phase: ManagedLinkPhase::Connecting, generation: 0,
+            connection: None, last_error: None,
+        };
+        let (updates, changed) = watch::channel(initial);
+        let (stop, mut stopping) = watch::channel(false);
+        let peer = Arc::clone(self);
+        let worker = tokio::spawn(async move {
+            let mut generation = 0_u64;
+            let mut backoff = Duration::from_millis(500);
+            let final_phase = loop {
+                if *stopping.borrow() { break ManagedLinkPhase::Stopped; }
+                if peer.control.close_reason().is_some() {
+                    break ManagedLinkPhase::ControlLost;
+                }
+                let result = tokio::select! {
+                    _ = stopping.changed() => break ManagedLinkPhase::Stopped,
+                    _ = peer.control.closed() => break ManagedLinkPhase::ControlLost,
+                    result = async {
+                        match peer.role {
+                            IceRole::Controlling =>
+                                peer.open_authenticated_data(Duration::from_secs(12)).await,
+                            IceRole::Controlled =>
+                                peer.accept_authenticated_data(Duration::from_secs(12)).await,
+                        }
+                    } => result,
+                };
+                match result {
+                    Ok(link) => {
+                        // 连接结果与 Control 关闭可能同时就绪，不能发布虚假的 Healthy。
+                        if peer.control.close_reason().is_some() {
+                            link.shutdown();
+                            break ManagedLinkPhase::ControlLost;
+                        }
+                        if link.connection.close_reason().is_some() {
+                            link.shutdown();
+                            updates.send_replace(ManagedLinkStatus {
+                                phase: ManagedLinkPhase::Reconnecting,
+                                generation, connection: None,
+                                last_error: Some(TransportError::QuicConnection),
+                            });
+                            continue;
+                        }
+                        generation = generation.wrapping_add(1);
+                        backoff = Duration::from_millis(500);
+                        updates.send_replace(ManagedLinkStatus {
+                            phase: ManagedLinkPhase::Connected,
+                            generation,
+                            connection: Some(link.connection.clone()),
+                            last_error: None,
+                        });
+                        let reason = tokio::select! {
+                            _ = stopping.changed() => ManagedLinkPhase::Stopped,
+                            _ = peer.control.closed() => ManagedLinkPhase::ControlLost,
+                            _ = link.connection.closed() => ManagedLinkPhase::Reconnecting,
+                        };
+                        link.shutdown();
+                        if reason != ManagedLinkPhase::Reconnecting {
+                            break reason;
+                        }
+                        // 旧连接已关闭，不能继续作为健康连接发布。
+                        updates.send_replace(ManagedLinkStatus {
+                            phase: ManagedLinkPhase::Reconnecting,
+                            generation, connection: None,
+                            last_error: Some(TransportError::QuicConnection),
+                        });
+                    }
+                    Err(TransportError::ControlDisconnected) => {
+                        break ManagedLinkPhase::ControlLost;
+                    }
+                    // 错误角色是本地 API 误用；来自网络的认证失败则
+                    // 必须拒绝当前连接，但不能让恶意探测永久杀死恢复循环。
+                    Err(TransportError::WrongRole) => {
+                        break ManagedLinkPhase::AuthenticationFailed;
+                    }
+                    Err(error) => {
+                        updates.send_replace(ManagedLinkStatus {
+                            phase: ManagedLinkPhase::Reconnecting,
+                            generation, connection: None, last_error: Some(error),
+                        });
+                    }
+                }
+                // 有界指数退避，停止与 Control 关闭不会被 sleep 阻塞。
+                tokio::select! {
+                    _ = stopping.changed() => break ManagedLinkPhase::Stopped,
+                    _ = peer.control.closed() => break ManagedLinkPhase::ControlLost,
+                    _ = sleep(backoff) => {}
+                }
+                backoff = backoff.saturating_mul(2).min(Duration::from_secs(5));
+            };
+            updates.send_replace(ManagedLinkStatus {
+                phase: final_phase, generation,
+                connection: None,
+                last_error: if final_phase == ManagedLinkPhase::ControlLost {
+                    Some(TransportError::ControlDisconnected)
+                } else if final_phase == ManagedLinkPhase::AuthenticationFailed {
+                    Some(TransportError::Authentication)
+                } else { None },
+            });
+        });
+        ManagedAuthenticatedLink {
+            changed, stop, worker: Some(worker),
+        }
+    }
+
     pub fn diagnostic(&self) -> TransportDiagnostic {
         let mut offered_host_candidates = self.offered_host_candidates.clone();
         offered_host_candidates.sort();

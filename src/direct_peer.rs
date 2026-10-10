@@ -713,6 +713,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn generic_managed_data_recovers_without_transfer_lane_scheduler() {
+        use crate::transport_session::{
+            ManagedAuthenticatedLink, ManagedLinkPhase,
+        };
+
+        async fn await_link(
+            manager: &ManagedAuthenticatedLink, minimum_generation: u64,
+        ) -> quinn::Connection {
+            let mut events = manager.subscribe();
+            loop {
+                let snapshot = events.borrow().clone();
+                if snapshot.phase == ManagedLinkPhase::Connected
+                    && snapshot.generation >= minimum_generation
+                {
+                    return snapshot.connection.unwrap();
+                }
+                assert_ne!(snapshot.phase, ManagedLinkPhase::AuthenticationFailed);
+                assert_ne!(snapshot.phase, ManagedLinkPhase::ControlLost);
+                events.changed().await.unwrap();
+            }
+        }
+
+        tokio::time::timeout(Duration::from_secs(65), async {
+            let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+            let now = 1_800_000_000;
+            let (pending, invite) = begin_creator(&[bind], &[], now, 1200).await.unwrap();
+            let (joiner, reply) = begin_joiner(&invite, &[bind], &[], now).await.unwrap();
+            let creator = pending.receive_reply(&reply, now).unwrap();
+            let mut cc = creator.confirmation().unwrap();
+            let mut jc = joiner.confirmation().unwrap();
+            cc.confirm(&creator.comparison_code()).unwrap();
+            jc.confirm(&joiner.comparison_code()).unwrap();
+            let (creator, joiner) = tokio::join!(
+                creator.connect_transport(&cc, now),
+                joiner.connect_transport(&jc, now),
+            );
+            let creator = Arc::new(creator.unwrap());
+            let joiner = Arc::new(joiner.unwrap());
+
+            // 两边都由应用选择创建一条托管 Data QUIC，不预建四条。
+            let outgoing = creator.manage_authenticated_data();
+            let incoming = joiner.manage_authenticated_data();
+            let (first, received) = tokio::join!(
+                await_link(&outgoing, 1), await_link(&incoming, 1),
+            );
+            let old_id = first.stable_id();
+            assert_eq!(outgoing.current().unwrap().stable_id(), old_id);
+
+            first.close(1u32.into(), b"inject data quic fault");
+            let (replaced, _accepted) = tokio::join!(
+                await_link(&outgoing, 2), await_link(&incoming, 2),
+            );
+            assert_ne!(replaced.stable_id(), old_id);
+            assert!(creator.diagnostic().control_connected);
+            assert!(joiner.diagnostic().control_connected);
+            assert!(received.close_reason().is_some());
+
+            // 真正的 Control 断线会终止重拨，不能伪报会话仍健康。
+            creator.control.close(0u32.into(), b"test control close");
+            tokio::time::timeout(Duration::from_secs(5), async {
+                let mut updates = outgoing.subscribe();
+                loop {
+                    if updates.borrow().phase == ManagedLinkPhase::ControlLost {
+                        break;
+                    }
+                    updates.changed().await.unwrap();
+                }
+            }).await.unwrap();
+            assert!(outgoing.current().is_none());
+            outgoing.shutdown().await;
+            incoming.shutdown().await;
+            Arc::try_unwrap(creator).ok().unwrap().shutdown().await;
+            Arc::try_unwrap(joiner).ok().unwrap().shutdown().await;
+        }).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn generic_sdk_control_only_and_on_demand_authenticated_quic() {
         tokio::time::timeout(Duration::from_secs(45), async {
             let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();

@@ -2,6 +2,17 @@
 
 > 状态应随每次开发 PR 更新。**本文件不是运行测试的证据。** 新 Agent 必须重新读取当前分支、打开的 PR 和实际源码。
 
+## 最新主线核查（2026-10-10）
+
+- `main` 已合并 SDK #47–#53；自动化 Linux/Windows/macOS/ARM64/musl 回归通过。行为对等 Go v0.16.4 的真实 NAT/IPv6/路由器/长时间测试**尚未全部验收**。
+- SDK 主入口是 `ReadyCreator/ReadyJoiner::connect_transport()` → 单认证 Control QUIC；另外的 QUIC 必须由应用按需申请。新的可选托管恢复接口在 [SDK #54](https://github.com/juezhong/p2p-sdk/pull/54) 中开发/验收，只有本 PR 完成合并与 CI 后才算主分支具备。
+- **Transfer 拥有四条 Data QUIC 的选择与 Data lane/文件调度**；SDK 只提供通用认证连接与状态/故障恢复。旧 `ResilientDataLanes` 暂时保留兼容，迁移后精简。
+- [SDK 长期文档 PR #2](https://github.com/juezhong/p2p-sdk/pull/2) 已增加职责边界与迁移决策。
+- 已确认仍不一致：Go 的双向 QUIC Dial/Accept 竞速与方向仲裁、并行 STUN/网关发现时序等；需要做真实多网卡、NAT、长时间与断网测试。
+- **下方 `M0/M1/M2...` 及“当前进度”是开发早期的时间线，不是最新代码状态。**
+
+## 历史开发记录（不可作为最新验收依据）
+
 ## 已确定需求
 
 - Rust + Tokio；ICE 直连（IPv6 优先、IPv4 回退、LAN 优先检查、可选网关端口映射），Quinn 为第一版默认安全传输后端。

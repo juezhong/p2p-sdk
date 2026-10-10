@@ -1,40 +1,38 @@
 # p2p-sdk
 
-面向 `p2p-transfer`、`p2p-tunnel`、`p2p-net` 的 Rust 点对点连通性与安全通信 SDK。
+Rust/Tokio 的通用 P2P 安全网络连接 SDK，供 Transfer、聊天、隧道等应用复用。使用 Quinn/QUIC、ICE、认证 UDP Punch、IPv4/IPv6、多网卡、Multi-STUN 和可选 PCP/NAT-PMP/UPnP。**无文件协议、UI、TURN、业务数据中继**。
 
-> **状态：架构规划中。** 目前仓库尚未提供可运行的 SDK、稳定 Rust API 或已验证的 ICE/QUIC 集成。本文档定义目标与约束，不代表功能已实现。
+> **当前状态（2026-10-10）**：SDK 统一连接入口、Control-only 认证 QUIC、应用按需辅助 QUIC、动态候选与诊断已有可运行代码并通过跨平台 CI。**尚未完成 Go `p2p-friend v0.16.4` 网络/会话全部行为对等验收**；不能把 localhost 与 GitHub Actions 通过视为真实 CGNAT、家庭路由器、防火墙的实测通过。
 
-## 目标
+## 推荐 SDK 使用流程
 
-- 选择可达的 **IPv6/IPv4 直连路径**；优先使用可用 IPv6，同时支持 IPv4/IPv6 局域网直连与 IPv4 NAT 打洞。
-- 通过 **ICE（RFC 8445）** 收集候选、执行基于 STUN 的连通性检查与选路；可选 PCP、NAT-PMP、UPnP 网关端口映射。
-- **严格 Direct-only：永不把业务数据转发到服务器；没有直连路径时明确失败。** ICE 不能保证任何两台机器一定直连。
-- 兼容两种信令方式：无需自建信令服务的手动邀请码/回传码，以及可选的纯信息交换 Rendezvous 服务器。
-- 业务数据端到端认证与加密；信令服务不得充当业务数据代理。
-- 传输层可插拔：QUIC 是第一版的候选后端，不把 ICE/NAT 核心设计成依赖 QUIC。
-- 内置可在所有应用中复用的网络诊断、状态快照与脱敏报告导出。
+1. 创建方 `begin_creator_auto()` 得到 INVITE；加入方 `begin_joiner_auto(invite)` 得到 REPLY。
+2. 创建方调用 `PendingCreator::receive_reply_now()`；两端分别验证配对码并显式完成 `ManualConfirmation`。
+3. 双方调用 `ReadyCreator::connect_transport_now()` / `ReadyJoiner::connect_transport_now()`，得到**一条经过认证的 Control QUIC**。所有 ICE/UDP Owner/证书与会话凭据由 SDK 管理。
+4. 应用需要额外连接时，可使用 `open_authenticated_data()` / `accept_authenticated_data()`，或使用 **可选** `manage_authenticated_data()` 为各条认证 QUIC 提供故障检测、重拨、退避及状态订阅。
+5. 应用自己管理每条 QUIC 上的 Stream、业务调度与协议；SDK 暴露真实连接故障与诊断，Control QUIC 真正丢失后终止当前会话，不伪造逻辑会话无缝续接。
 
-## 技术方向（待原型验证）
+## 应用边界
 
-- 语言：**Rust**；异步运行时：**Tokio**。
-- ICE：优先评估独立 Sans-I/O ICE 状态机（例如 `is`），备选其他成熟实现。
-- QUIC：优先评估 `quinn`；需通过 ICE/QUIC **同一有效 UDP 映射**与收包分发的集成验证。
-- 应用 UI：`p2p-transfer` / `p2p-tunnel` / `p2p-net` 各自必须提供 CLI、TUI、GUI；SDK 本身是无 UI 的库。
+- **SDK**：网卡、STUN、NAT、网关端口映射、ICE、认证 Punch、QUIC/mTLS、会话 HMAC、连接保活和恢复、诊断。
+- **Transfer**：是否建立四条 Data QUIC，以及应用的 Data lane 编号、Stream 调度、文件分片、ACK、重传、断点续传、访问控制和 UI。
+- **其他应用**：可只用 Control QUIC，无须创建四条数据连接。
+- `ResilientDataLanes` 是兼容旧 Transfer 的历史池，迁移完成后才删除；新项目不要依赖它。
 
-## 文档导航
+详细 API 与迁移见 [SDK / application boundary](docs/SDK_APPLICATION_BOUNDARY.md)，架构长期决策记录在 [SDK 文档 PR #2](https://github.com/juezhong/p2p-sdk/pull/2)。
 
-- [架构与模块边界](docs/ARCHITECTURE.md)
-- [ICE、IPv6/IPv4、NAT 穿透策略](docs/CONNECTIVITY.md)
-- [手动/服务器信令协议设计](docs/SIGNALING.md)
-- [安全模型与不使用中继的约束](docs/SECURITY.md)
-- [实施路线](docs/ROADMAP.md)
-- [测试与验收](docs/TESTING.md)
-- [AI 开发与贡献约束](AGENTS.md)
+## 尚未完成的 Go 对等门槛
 
-## 范围边界
+Go `quic_connect.go` 的同时 Dial/Accept 与候选竞速仲裁、STUN/网关并行采集及优先策略，仍需逐条核对并达到行为对等。多网卡、真实 NAT、IPv6 有状态防火墙、网关续租/失败撤销、UDP 阻断、长期运行及故障注入，仍需要真实设备验收。详情参见 [Go v0.16.4 对等验收](docs/GO_V0164_PARITY_ACCEPTANCE.md)。
 
-SDK **不实现**文件传输、远程 SSH 业务、虚拟网卡或 GUI；这些由独立应用仓库实现。可选纯信令服务器属于独立服务，不构成 SDK 离线手动连接模式的运行依赖。
+## 开发检查
 
-## 许可
+```sh
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-targets
+```
 
-仓库已有 `LICENSE`（GPL v2 文本）。在审查既有代码版权、依赖兼容性和再许可权利之前，不变更许可证。
+## License
+
+GPL-2.0-only。请按仓库 LICENSE 与依赖许可证条款使用。
