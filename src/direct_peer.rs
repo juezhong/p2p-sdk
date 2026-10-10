@@ -889,6 +889,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn overlapping_private_candidates_cannot_replace_verified_reachable_path() {
+        // 两个远端可能都公布 192.168.1.0/24，但该前缀不能作为
+        // 位于同一物理 LAN 的证据：虚假高优先级私网候选不允许阻塞有效路径。
+        tokio::time::timeout(Duration::from_secs(65), async {
+            let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+            let now = 1_800_000_000;
+            let (pending, invite) = begin_creator(&[bind], &[], now, 1200).await.unwrap();
+            let (joiner, reply) = begin_joiner(&invite, &[bind], &[], now).await.unwrap();
+            let mut creator = pending.receive_reply(&reply, now).unwrap();
+            let mut joiner = joiner;
+            creator.inner.remote.candidates.push(crate::ice_signaling::IceCandidate {
+                address: "192.168.1.200:57001".parse().unwrap(),
+                kind: IceCandidateType::Host,
+                priority: u32::MAX,
+            });
+            joiner.inner.remote.candidates.push(crate::ice_signaling::IceCandidate {
+                address: "192.168.1.100:57002".parse().unwrap(),
+                kind: IceCandidateType::Host,
+                priority: u32::MAX,
+            });
+            let mut cc = creator.confirmation().unwrap();
+            let mut jc = joiner.confirmation().unwrap();
+            cc.confirm(&creator.comparison_code()).unwrap();
+            jc.confirm(&joiner.comparison_code()).unwrap();
+            let (left, right) = tokio::join!(
+                creator.connect_transport(&cc, now),
+                joiner.connect_transport(&jc, now),
+            );
+            let left = left.unwrap();
+            let right = right.unwrap();
+            assert!(left.diagnostic().actual_remote_udp.ip().is_loopback());
+            assert!(right.diagnostic().actual_remote_udp.ip().is_loopback());
+            assert!(left.diagnostic().control_connected);
+            assert!(right.diagnostic().control_connected);
+            left.shutdown().await;
+            right.shutdown().await;
+        }).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn unreachable_ipv6_family_does_not_block_authenticated_ipv4_control() {
         tokio::time::timeout(Duration::from_secs(60), async {
             let v4: SocketAddr = "127.0.0.1:0".parse().unwrap();
