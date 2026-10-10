@@ -20,10 +20,19 @@ file-pipeline internals.
 
 ## Responsibilities of an SDK consumer
 
-- Decide whether to use one or multiple additional QUIC transport connections.
-  `ReadyCreator::connect()` and `ReadyJoiner::connect()` request **one**
-  initial Data connection by default. `connect_with_data_connections(..., n)`
-  opts into additional independent authenticated transports (currently 1..=4).
+- Start a generic network session with `ReadyCreator::connect_transport()`
+  or `ReadyJoiner::connect_transport()`: exactly one authenticated Control
+  QUIC is established. No Data QUIC is created by default.
+- The application may call `ConnectedTransportPeer::open_authenticated_data()`
+  on the creator and `accept_authenticated_data()` on the joiner for each
+  additional independently authenticated transport; there is no fixed four-lane
+  scheduler or file semantics in this API. The SDK tracks lifetime, connection
+  pin and session HMAC; applications select their message streams.
+- The earlier dual-QUIC convenience facade `connect()` remains available for
+  compatibility and starts one initial Data connection.
+  `connect_with_data_connections(..., n)` opts into a supervised connection
+  pool (currently 1..=4). New non-Transfer consumers should prefer the generic
+  transport-only facade.
 - Define application channel and stream semantics. In particular, Transfer owns
   the exact `4-lane` business strategy, file chunk assignment, ACK, ordering,
   cancellation and resumable transmission. The SDK must not transmit any file
