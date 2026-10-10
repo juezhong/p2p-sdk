@@ -9,15 +9,12 @@
 
 use std::{net::SocketAddr, time::Duration};
 
-use tokio::{task::JoinSet, time::{timeout_at, Instant}};
-
 use crate::{
     gateway::GatewayLease,
     ice_agent::NominatedPath,
-    ice_gather::add_portmapped_candidate,
-    ice_signaling::{IceDescription, IceRole, MAX_CANDIDATES},
+    ice_signaling::{IceDescription, IceRole},
     multi_interface::{
-        gather_interfaces, CandidateSet, MultiInterfaceError,
+        gather_interfaces_with_mapping, CandidateSet, MultiInterfaceError,
         SelectedDirectPath,
     },
 };
@@ -46,67 +43,10 @@ impl ManagedCandidates {
         discovery_budget: Duration,
         map_budget: Duration,
     ) -> Result<Self, MultiInterfaceError> {
-        let mut set = gather_interfaces(addresses, stun, role, discovery_budget).await?;
-        let mut leases = Vec::new();
-        if map_budget.is_zero() {
-            return Ok(Self { candidates: set, leases });
-        }
-        let expires = Instant::now() + map_budget;
-        let mut jobs = JoinSet::new();
-        for (index, iface) in set.interfaces.iter().enumerate() {
-            let local = iface.owner.handle.local_address();
-            if let SocketAddr::V4(v4) = local {
-                jobs.spawn(async move {
-                    let lease = GatewayLease::start_for_socket(
-                        v4, Duration::from_secs(3600),
-                        map_budget.min(Duration::from_millis(900)),
-                    ).await;
-                    (index, local, lease)
-                });
-            }
-        }
-        while !jobs.is_empty() {
-            let result = match timeout_at(expires, jobs.join_next()).await {
-                Ok(Some(Ok(result))) => result,
-                Ok(_) => continue,
-                Err(_) => break,
-            };
-            let (index, local, lease) = result;
-            let Ok(lease) = lease else { continue };
-            let external = lease.subscribe().mapped_address();
-            let can_advertise = external.is_some_and(|addr| {
-                set.combined.candidates.len() < MAX_CANDIDATES
-                    && set.interfaces[index].local.candidates.len() < MAX_CANDIDATES
-                    && addr.is_ipv4() == local.is_ipv4()
-            });
-            if can_advertise {
-                let addr = external.expect("checked");
-                // Both the individual ICE agent and the authenticated
-                // combined signal must describe identical real mappings.
-                if add_portmapped_candidate(
-                    &mut set.interfaces[index].local, local, addr,
-                ).is_ok()
-                    && add_portmapped_candidate(&mut set.combined, local, addr).is_ok()
-                {
-                    leases.push((local, lease));
-                    continue;
-                }
-            }
-            // An unadvertised successful mapping must not be left alive.
-            tokio::spawn(async move { let _ = lease.shutdown().await; });
-        }
-        // The global gather deadline is not permission to abort a gateway
-        // transaction after it has installed a mapping. Drain late replies
-        // separately, explicitly deleting all mappings too late to advertise.
-        if !jobs.is_empty() {
-            tokio::spawn(async move {
-                while let Some(result) = jobs.join_next().await {
-                    if let Ok((_, _, Ok(lease))) = result {
-                        let _ = lease.shutdown().await;
-                    }
-                }
-            });
-        }
+        let mut set = gather_interfaces_with_mapping(
+            addresses, stun, role, discovery_budget, map_budget,
+        ).await?;
+        let leases = std::mem::take(&mut set.mapping_leases);
         Ok(Self { candidates: set, leases })
     }
 
