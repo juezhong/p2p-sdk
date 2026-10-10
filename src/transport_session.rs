@@ -177,6 +177,20 @@ impl ConnectedTransportPeer {
                 };
                 match result {
                     Ok(link) => {
+                        // 连接结果与 Control 关闭可能同时就绪，不能发布虚假的 Healthy。
+                        if peer.control.close_reason().is_some() {
+                            link.shutdown();
+                            break ManagedLinkPhase::ControlLost;
+                        }
+                        if link.connection.close_reason().is_some() {
+                            link.shutdown();
+                            updates.send_replace(ManagedLinkStatus {
+                                phase: ManagedLinkPhase::Reconnecting,
+                                generation, connection: None,
+                                last_error: Some(TransportError::QuicConnection),
+                            });
+                            continue;
+                        }
                         generation = generation.wrapping_add(1);
                         backoff = Duration::from_millis(500);
                         updates.send_replace(ManagedLinkStatus {
@@ -197,7 +211,8 @@ impl ConnectedTransportPeer {
                         // 旧连接已关闭，不能继续作为健康连接发布。
                         updates.send_replace(ManagedLinkStatus {
                             phase: ManagedLinkPhase::Reconnecting,
-                            generation, connection: None, last_error: None,
+                            generation, connection: None,
+                            last_error: Some(TransportError::QuicConnection),
                         });
                     }
                     Err(TransportError::ControlDisconnected) => {
