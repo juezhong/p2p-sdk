@@ -170,11 +170,11 @@ impl ConnectedTransportPeer {
                     _ = stopping.changed() => break ManagedLinkPhase::Stopped,
                     _ = peer.control.closed() => break ManagedLinkPhase::ControlLost,
                     result = async {
-                        match peer.role {
-                            IceRole::Controlling =>
-                                peer.open_authenticated_data(Duration::from_secs(12)).await,
-                            IceRole::Controlled =>
-                                peer.accept_authenticated_data(Duration::from_secs(12)).await,
+                        // 控制连接真正的拨号方负责主动建立附属连接；
+                        // 邀请码创建/加入角色不代表网络方向。
+                        match peer.control_outbound {
+                            true => peer.open_authenticated_data(Duration::from_secs(12)).await,
+                            false => peer.accept_authenticated_data(Duration::from_secs(12)).await,
                         }
                     } => result,
                 };
@@ -290,7 +290,7 @@ impl ConnectedTransportPeer {
     pub async fn open_authenticated_data(
         &self, deadline: Duration,
     ) -> Result<AuthenticatedDataLink, TransportError> {
-        if self.role != IceRole::Controlling { return Err(TransportError::WrongRole); }
+        if !self.control_outbound { return Err(TransportError::WrongRole); }
         if self.control.close_reason().is_some() {
             return Err(TransportError::ControlDisconnected);
         }
@@ -322,12 +322,12 @@ impl ConnectedTransportPeer {
         Ok(self.supervise_data(connection, None, None))
     }
 
-    /// Joiner accepts an auxiliary connection on the authenticated primary
+    /// Control QUIC 的实际监听方接受附属连接，在认证的主 UDP 路径上完成。
     /// UDP endpoint, reusing the original session's non-resettable replay guard.
     pub async fn accept_authenticated_data(
         &self, deadline: Duration,
     ) -> Result<AuthenticatedDataLink, TransportError> {
-        if self.role != IceRole::Controlled { return Err(TransportError::WrongRole); }
+        if self.control_outbound { return Err(TransportError::WrongRole); }
         if self.control.close_reason().is_some() {
             return Err(TransportError::ControlDisconnected);
         }
