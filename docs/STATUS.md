@@ -5,6 +5,7 @@
 ## 最新主线核查（2026-10-10）
 
 - `main` 已合并 SDK #47–#53；自动化 Linux/Windows/macOS/ARM64/musl 回归通过。行为对等 Go v0.16.4 的真实 NAT/IPv6/路由器/长时间测试**尚未全部验收**。
+- **SDK #56、#57** 已通过全部七组 CI 并合并，新增双向 Control QUIC Dial/Accept 方向仲裁、STUN/网关并行采集。**SDK #58** 为物理删除历史四路 `resilient_data.rs` 和旧双 QUIC facade 的候选分支，必须待 Transfer #28 迁移完成并验收后才能合并。
 - SDK 主入口是 `ReadyCreator/ReadyJoiner::connect_transport()` → 单认证 Control QUIC；另外的 QUIC 由应用按需申请。[SDK #54](https://github.com/juezhong/p2p-sdk/pull/54) 已通过七组跨平台 CI 并合并（`361b535`），新增无需固定四路的 `manage_authenticated_data()`：单条 QUIC 失效后重新认证重拨，Control 断开停止重建并报告状态。
 - **Transfer 拥有四条 Data QUIC 的选择与 Data lane/文件调度**；SDK 只提供通用认证连接与状态/故障恢复。旧 `ResilientDataLanes` 暂时保留兼容，迁移后精简。
 - [SDK 长期文档 PR #2](https://github.com/juezhong/p2p-sdk/pull/2) 已增加职责边界与迁移决策。
