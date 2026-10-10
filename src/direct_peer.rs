@@ -1485,6 +1485,11 @@ mod tests {
                             valid.clone(), &left.credentials, ChannelRole::Control,
                             AUTH_DEADLINE,
                         ).await.unwrap();
+                        // 新 Control 协议只允许创建方明确选定的认证连接获胜。
+                        // 未发送 HMAC 的 stalled connection 绝不能阻塞这条选择消息。
+                        let mut choice = valid.open_uni().await.unwrap();
+                        choice.write_all(CONTROL_PATH_SELECTED).await.unwrap();
+                        choice.finish().unwrap();
                         (stalled, valid)
                     },
                 )
