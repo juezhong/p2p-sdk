@@ -38,6 +38,7 @@ const PUNCH_CADENCE: Duration = Duration::from_secs(2);
 const PASSIVE_POLL: Duration = Duration::from_millis(500);
 const PATH_PREFERENCE_GRACE: Duration = Duration::from_millis(600);
 const QUIC_DIRECTION_GRACE: Duration = Duration::from_millis(600);
+const LAN_QUIC_HEAD_START: Duration = Duration::from_millis(150);
 const MAX_PENDING_INBOUND_AUTH: usize = 16;
 const CONTROL_PATH_SELECTED: &[u8] = b"P2P-SDK-CONTROL-PATH-1";
 
@@ -447,6 +448,10 @@ async fn race_authenticated_control(
     let credentials = pairing.credentials.clone();
     let pin = pairing.remote_tls_cert_sha256;
     let dial_addrs = quic_candidate_destinations(remote, advertised);
+    // 疑似同网段只是一个短暂的选路提示，所有远端候选仍参与竞速。
+    let bound_local = outgoing.local_addr().ok();
+    let prefer_lan = bound_local.is_some_and(|local| dial_addrs.iter()
+        .any(|addr| same_local_interface_subnet(local.ip(), addr.ip())));
     workers.spawn(async move {
         let expires = Instant::now() + QUIC_ACCEPT;
         let mut backlog: VecDeque<_> = dial_addrs.iter().copied().collect();
@@ -456,7 +461,13 @@ async fn race_authenticated_control(
                 let Some(address) = backlog.pop_front() else { break };
                 let endpoint = outgoing.clone();
                 let credentials = credentials.clone();
+                let delay = if prefer_lan && !bound_local.is_some_and(|local| {
+                    same_local_interface_subnet(local.ip(), address.ip())
+                }) { LAN_QUIC_HEAD_START } else { Duration::ZERO };
                 attempts.spawn(async move {
+                    if !delay.is_zero() {
+                        tokio::time::sleep(delay).await;
+                    }
                     let connecting = endpoint.connect(address, "localhost")
                         .map_err(|_| DirectPeerError::QuicHandshake)?;
                     let connection = timeout(Duration::from_secs(3), connecting)
@@ -486,10 +497,23 @@ async fn race_authenticated_control(
             match tokio::time::timeout_at(expires, attempts.join_next()).await {
                 Ok(Some(Ok(Ok(authenticated)))) => {
                     attempts.abort_all();
+                    while let Some(result) = attempts.join_next().await {
+                        if let Ok(Ok((loser, _))) = result {
+                            loser.close(0u32.into(), b"outbound QUIC race loser");
+                        }
+                    }
                     return Ok(authenticated);
                 }
                 Ok(Some(_)) => {}
-                _ => return Err(DirectPeerError::QuicHandshake),
+                _ => {
+                    attempts.abort_all();
+                    while let Some(result) = attempts.join_next().await {
+                        if let Ok(Ok((loser, _))) = result {
+                            loser.close(0u32.into(), b"outbound QUIC attempt timed out");
+                        }
+                    }
+                    return Err(DirectPeerError::QuicHandshake);
+                }
             }
         }
     });
