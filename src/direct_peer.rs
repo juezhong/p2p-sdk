@@ -490,15 +490,17 @@ async fn authenticate_on_path(
 
 /// 仅对双方已经通过 ICE+mTLS+HMAC 的网络路径进行评分。
 /// 相同 192.168.x.x 前缀不能证明在同一个 LAN；没有实际认证绝不入选。
-fn authenticated_path_priority(path: &ManagedPath, remote: &IceDescription) -> u8 {
-    let local = path.nominated().local.ip();
-    let address = path.nominated().remote;
-    let kind = remote.candidates.iter()
-        .find(|candidate| candidate.address == address)
-        .map(|candidate| candidate.kind);
-    match (local, address.ip(), kind) {
+fn nominated_address_priority(
+    local: std::net::IpAddr, remote: std::net::IpAddr,
+    kind: Option<IceCandidateType>,
+) -> u8 {
+    match (local, remote, kind) {
         (std::net::IpAddr::V4(a), std::net::IpAddr::V4(b),
             Some(IceCandidateType::Host)) if a.is_private() && b.is_private() => 5,
+        (std::net::IpAddr::V6(a), std::net::IpAddr::V6(b),
+            Some(IceCandidateType::Host))
+            if (a.is_unique_local() && b.is_unique_local())
+                || (a.is_unicast_link_local() && b.is_unicast_link_local()) => 5,
         (std::net::IpAddr::V6(a), std::net::IpAddr::V6(b),
             Some(IceCandidateType::Host))
             if !a.is_unique_local() && !b.is_unique_local()
@@ -509,6 +511,14 @@ fn authenticated_path_priority(path: &ManagedPath, remote: &IceDescription) -> u
         (_, _, Some(IceCandidateType::PeerReflexive)) => 1,
         _ => 0,
     }
+}
+
+fn authenticated_path_priority(path: &ManagedPath, remote: &IceDescription) -> u8 {
+    let nominated = path.nominated();
+    let kind = remote.candidates.iter()
+        .find(|candidate| candidate.address == nominated.remote)
+        .map(|candidate| candidate.kind);
+    nominated_address_priority(nominated.local.ip(), nominated.remote.ip(), kind)
 }
 
 /// 多接口 ICE 和 QUIC 相互认证同时推进。首个 ICE 路径如果完成不了
@@ -696,6 +706,25 @@ impl ReadyJoiner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reachable_host_priority_prefers_lan_then_public_ipv6_over_nat_mapping() {
+        let lan_a = "192.168.1.100".parse().unwrap();
+        let lan_b = "192.168.1.200".parse().unwrap();
+        let ipv6_a = "2001:4860:1::1".parse().unwrap();
+        let ipv6_b = "2606:4700::1111".parse().unwrap();
+        assert_eq!(nominated_address_priority(
+            lan_a, lan_b, Some(IceCandidateType::Host),
+        ), 5);
+        assert_eq!(nominated_address_priority(
+            ipv6_a, ipv6_b, Some(IceCandidateType::Host),
+        ), 4);
+        assert_eq!(nominated_address_priority(
+            lan_a, lan_b, Some(IceCandidateType::PortMapped),
+        ), 2);
+        // 仅在 ICE 与 QUIC 都真实通过认证之后调用评分，
+        // 不能因不同城市的两端同为 192.168.1.x 就直接判定 LAN 可达。
+    }
 
     #[tokio::test]
     async fn quic_path_race_shutdown_releases_all_advertised_udp_ports() {
