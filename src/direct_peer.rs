@@ -629,13 +629,13 @@ async fn connect_authenticated_transport(
     let mut best: Option<(ManagedPath, quinn::Endpoint, quinn::Connection, bool)> = None;
     let mut best_score = 0_u8;
     let mut preference_deadline: Option<Instant> = None;
-    let winner = loop {
+    let result = loop {
         // 仅创建方选择路径；加入方必须等待选中 QUIC 内的认证后通知。
         if ice_exhausted && in_flight.is_empty() {
             if let Some(verified) = best.take() {
-                break verified;
+                break Ok(verified);
             }
-            return Err(last_failure);
+            break Err(last_failure);
         }
         tokio::select! {
             path = candidates.next(), if !ice_exhausted => {
@@ -664,7 +664,7 @@ async fn connect_authenticated_transport(
                 match result {
                     Some(Ok(Ok(authenticated))) => {
                         if role == IceRole::Controlled {
-                            break authenticated;
+                            break Ok(authenticated);
                         }
                         let score = authenticated_path_priority(&authenticated.0, &remote);
                         if score > best_score || best.is_none() {
@@ -678,7 +678,7 @@ async fn connect_authenticated_transport(
                             authenticated.1.close(0u32.into(), b"lower priority path");
                         }
                         if best_score >= 5 {
-                            break best.take().expect("authenticated path present");
+                            break Ok(best.take().expect("authenticated path present"));
                         }
                         preference_deadline.get_or_insert(
                             Instant::now() + PATH_PREFERENCE_GRACE,
@@ -691,36 +691,57 @@ async fn connect_authenticated_transport(
             _ = tokio::time::sleep_until(
                 preference_deadline.unwrap_or(limit)
             ), if preference_deadline.is_some() => {
-                break best.take().expect("a verified QUIC candidate started grace");
+                break Ok(best.take().expect("a verified QUIC candidate started grace"));
             }
             _ = tokio::time::sleep_until(limit) => {
                 if let Some(verified) = best.take() {
-                    break verified;
+                    break Ok(verified);
                 }
-                return Err(DirectPeerError::QuicHandshake);
+                break Err(DirectPeerError::QuicHandshake);
             }
         }
     };
-    if role == IceRole::Controlling {
-        let mut stream = winner.2.open_uni().await
-            .map_err(|_| DirectPeerError::QuicHandshake)?;
-        stream.write_all(CONTROL_PATH_SELECTED).await
-            .map_err(|_| DirectPeerError::QuicHandshake)?;
-        stream.finish().map_err(|_| DirectPeerError::QuicHandshake)?;
-    }
-    drop(candidates);
+    // 连接成功或失败均应等待 QUIC/ICE 任务取消完成，以及网关租约撤销。
     in_flight.abort_all();
+    while in_flight.join_next().await.is_some() {}
     drop(sender);
+    candidates.cleanup().await;
+    let winner = result?;
+    if role == IceRole::Controlling {
+        let selected = async {
+            let mut stream = winner.2.open_uni().await
+                .map_err(|_| DirectPeerError::QuicHandshake)?;
+            stream.write_all(CONTROL_PATH_SELECTED).await
+                .map_err(|_| DirectPeerError::QuicHandshake)?;
+            stream.finish().map_err(|_| DirectPeerError::QuicHandshake)?;
+            Ok::<(), DirectPeerError>(())
+        }.await;
+        if let Err(error) = selected {
+            let (mut path, endpoint, control, _) = winner;
+            control.close(1u32.into(), b"Control path select failed");
+            endpoint.close(1u32.into(), b"Control path select failed");
+            path.shutdown_gateway().await;
+            return Err(error);
+        }
+    }
     let (mut path, endpoint, control, control_outbound) = winner;
     let nominated = path.nominated();
     let remote_candidate_kind = remote.candidates.iter()
         .find(|candidate| candidate.address == nominated.remote)
         .map(|candidate| candidate.kind);
-    let punch = PunchLoop::start_for_control(
+    let punch = match PunchLoop::start_for_control(
         &mut path.selected.owner,
         AuthenticatedPunch::new(pairing.credentials.clone(), role),
         remote, PUNCH_CADENCE, control.clone(),
-    ).map_err(|_| DirectPeerError::LiveSession)?;
+    ) {
+        Ok(punch) => punch,
+        Err(_) => {
+            control.close(1u32.into(), b"Punch owner startup failed");
+            endpoint.close(1u32.into(), b"Punch owner startup failed");
+            path.shutdown_gateway().await;
+            return Err(DirectPeerError::LiveSession);
+        }
+    };
     Ok(ConnectedTransportPeer {
         endpoint, control, path, punch: Some(punch),
         credentials: pairing.credentials,
