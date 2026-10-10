@@ -8,7 +8,6 @@ use std::net::SocketAddr;
 use crate::{
     ice_signaling::{IceCandidateType, IceDescription},
     managed_candidates::ManagedPath,
-    punch_loop::PunchStatus,
     resilient_data::ResilientDataLanes,
     verified_session::VerifiedManualSession,
 };
@@ -45,7 +44,7 @@ pub async fn snapshot(
     local_description: &IceDescription,
     remote_description: &IceDescription,
     pool: Option<&ResilientDataLanes>,
-    punch: Option<&PunchStatus>,
+    authenticated_sources: &[SocketAddr],
 ) -> NetworkDiagnostic {
     let path = selected.selected.path;
     let control_connected = session.control().close_reason().is_none();
@@ -72,8 +71,7 @@ pub async fn snapshot(
     stun_mappings.dedup();
     let gateway_mapping = selected.mapping_lease.as_ref()
         .and_then(|lease| lease.subscribe().mapped_address());
-    let mut authenticated_peer_reflexive =
-        punch.map(|p| p.discovered.clone()).unwrap_or_default();
+    let mut authenticated_peer_reflexive = authenticated_sources.to_vec();
     authenticated_peer_reflexive.sort();
     authenticated_peer_reflexive.dedup();
     // The absence of data lanes is not treated as Control loss. The upper
