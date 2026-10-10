@@ -727,6 +727,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unreachable_ipv6_family_does_not_block_authenticated_ipv4_control() {
+        tokio::time::timeout(Duration::from_secs(60), async {
+            let v4: SocketAddr = "127.0.0.1:0".parse().unwrap();
+            let v6: SocketAddr = "[::1]:0".parse().unwrap();
+            let now = 1_800_000_000;
+            // 创建方拥有两个地址族；加入方只提供 IPv4，因此不允许
+            // 被创建方的 IPv6 地址拖住/失败而忽略真实可达的 IPv4。
+            let (pending, invite) =
+                begin_creator(&[v6, v4], &[], now, 1200).await.unwrap();
+            let (joiner, reply) =
+                begin_joiner(&invite, &[v4], &[], now).await.unwrap();
+            let creator = pending.receive_reply(&reply, now).unwrap();
+            let mut cc = creator.confirmation().unwrap();
+            let mut jc = joiner.confirmation().unwrap();
+            cc.confirm(&creator.comparison_code()).unwrap();
+            jc.confirm(&joiner.comparison_code()).unwrap();
+            let (a, b) = tokio::join!(
+                creator.connect_transport(&cc, now),
+                joiner.connect_transport(&jc, now),
+            );
+            let a = a.unwrap();
+            let b = b.unwrap();
+            assert!(a.diagnostic().actual_remote_udp.is_ipv4());
+            assert!(b.diagnostic().actual_remote_udp.is_ipv4());
+            a.shutdown().await;
+            b.shutdown().await;
+        }).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn quic_path_race_shutdown_releases_all_advertised_udp_ports() {
         tokio::time::timeout(Duration::from_secs(70), async {
             let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
