@@ -310,9 +310,23 @@ impl ReadyCreator {
         confirmation(&self.inner.pairing)
     }
 
+    /// Only one authenticated Data connection is created by default.
+    /// The application explicitly selects additional concurrent connections.
     pub async fn connect(
         self, confirmed: &ManualConfirmation, now: u64,
     ) -> Result<ConnectedDirectPeer, DirectPeerError> {
+        self.connect_with_data_connections(confirmed, now, 1).await
+    }
+
+    /// Choose transport connection concurrency; this is NOT a file lane
+    /// scheduler. The application owns message framing and stream allocation.
+    pub async fn connect_with_data_connections(
+        self, confirmed: &ManualConfirmation, now: u64,
+        desired_data_connections: usize,
+    ) -> Result<ConnectedDirectPeer, DirectPeerError> {
+        if !(1..=MAX_DATA_LANES).contains(&desired_data_connections) {
+            return Err(DirectPeerError::DataLanePool);
+        }
         let ReadyBase {
             identity, gathered, pairing, remote, remote_certificate,
         } = self.inner;
@@ -359,7 +373,7 @@ impl ReadyCreator {
         ).await.map_err(|_| DirectPeerError::VerifiedSession)?;
         let data_lanes = ResilientDataLanes::start_creator_with_independent_udp(
             &secure, endpoint.clone(), nominated.remote, &pairing,
-            client_config, MAX_DATA_LANES,
+            client_config, desired_data_connections,
         ).map_err(|_| DirectPeerError::DataLanePool)?;
         #[cfg(test)]
         eprintln!("DIRECT_TEST: establishing live session");
@@ -385,9 +399,23 @@ impl ReadyJoiner {
         confirmation(&self.inner.pairing)
     }
 
+    /// Only one authenticated Data connection is created by default.
+    /// The application explicitly selects additional concurrent connections.
     pub async fn connect(
         self, confirmed: &ManualConfirmation, now: u64,
     ) -> Result<ConnectedDirectPeer, DirectPeerError> {
+        self.connect_with_data_connections(confirmed, now, 1).await
+    }
+
+    /// Choose transport connection concurrency; this is NOT a file lane
+    /// scheduler. The application owns message framing and stream allocation.
+    pub async fn connect_with_data_connections(
+        self, confirmed: &ManualConfirmation, now: u64,
+        desired_data_connections: usize,
+    ) -> Result<ConnectedDirectPeer, DirectPeerError> {
+        if !(1..=MAX_DATA_LANES).contains(&desired_data_connections) {
+            return Err(DirectPeerError::DataLanePool);
+        }
         let ReadyBase {
             identity, gathered, pairing, remote, remote_certificate,
         } = self.inner;
@@ -436,7 +464,7 @@ impl ReadyJoiner {
             now, AUTH_DEADLINE,
         ).await.map_err(|_| DirectPeerError::VerifiedSession)?;
         let data_lanes = ResilientDataLanes::start_joiner(
-            &secure, endpoint.clone(), &pairing, guard, MAX_DATA_LANES,
+            &secure, endpoint.clone(), &pairing, guard, desired_data_connections,
         ).map_err(|_| DirectPeerError::DataLanePool)?;
         #[cfg(test)]
         eprintln!("DIRECT_TEST: establishing live session");
@@ -488,6 +516,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn application_can_request_four_links_and_recover_one_failed_data_quic() {
+        tokio::time::timeout(Duration::from_secs(50), async {
+            let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+            let now = 1_800_000_000;
+            let (pending, invite) = begin_creator(&[bind], &[], now, 1200).await.unwrap();
+            let (joiner, reply) = begin_joiner(&invite, &[bind], &[], now).await.unwrap();
+            let creator = pending.receive_reply(&reply, now).unwrap();
+            let mut cc = creator.confirmation().unwrap();
+            let mut jc = joiner.confirmation().unwrap();
+            cc.confirm(&creator.comparison_code()).unwrap();
+            jc.confirm(&joiner.comparison_code()).unwrap();
+            let (left, right) = tokio::join!(
+                creator.connect_with_data_connections(&cc, now, 4),
+                joiner.connect_with_data_connections(&jc, now, 4),
+            );
+            let left = left.unwrap();
+            let right = right.unwrap();
+            let initial = left.data_lanes.wait_for_count(4, Duration::from_secs(15))
+                .await.unwrap();
+            right.data_lanes.wait_for_count(4, Duration::from_secs(15))
+                .await.unwrap();
+            let failed = initial[1].clone();
+            let old_id = failed.stable_id();
+            failed.close(1u32.into(), b"test induced data failure");
+            tokio::time::timeout(Duration::from_secs(15), async {
+                loop {
+                    let active = left.data_lanes.available().await;
+                    if active.len() == 4 && active.iter().all(|c| c.stable_id() != old_id) {
+                        break;
+                    }
+                    assert!(left.session.verified().control().close_reason().is_none());
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }).await.unwrap();
+            left.shutdown().await;
+            right.shutdown().await;
+        }).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn complete_creator_joiner_pairing_and_control_roundtrip() {
         tokio::time::timeout(Duration::from_secs(60), async {
             let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -510,6 +578,8 @@ mod tests {
             eprintln!("DIRECT_TEST: both connected");
             let a = a.unwrap();
             let b = b.unwrap();
+            assert_eq!(a.data_lanes.subscribe().borrow().desired, 1);
+            assert_eq!(b.data_lanes.subscribe().borrow().desired, 1);
             let (mut tx, mut rx) =
                 a.session.verified().control().open_bi().await.unwrap();
             // QUIC does not notify the peer of a newly opened stream until

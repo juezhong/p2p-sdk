@@ -216,9 +216,10 @@ impl ResilientDataLanes {
                 });
             } else {
                 let tls = tls.clone();
+                let shared = endpoint.clone();
                 tokio::spawn(async move {
                     maintain_independent_creator_lane(state, stopped,
-                        (local_ip, remote), credentials, remote_pin, tls, index).await;
+                        (local_ip, remote), credentials, remote_pin, (tls, shared), index).await;
                 });
             }
         }
@@ -479,10 +480,11 @@ async fn maintain_independent_creator_lane(
     addresses: (std::net::IpAddr, SocketAddr),
     credentials: SessionCredentials,
     pin: [u8; 32],
-    tls: quinn::ClientConfig,
+    transport: (quinn::ClientConfig, Endpoint),
     index: usize,
 ) {
     let (local_ip, remote) = addresses;
+    let (tls, shared) = transport;
     let mut delay = RETRY_INITIAL;
     loop {
         if *stopped.borrow() || state.control.close_reason().is_some() {
@@ -537,6 +539,48 @@ async fn maintain_independent_creator_lane(
             if state.install(connection.clone(), Some(index)).await {
                 delay = RETRY_INITIAL;
                 // These values must stay alive for the entire QUIC lane.
+                tokio::select! {
+                    _ = stopped.changed() => break,
+                    _ = state.control.closed() => break,
+                    _ = connection.closed() => {}
+                }
+                state.clear(index, connection.stable_id()).await;
+                continue;
+            }
+            connection.close(1u32.into(), b"data lane not needed");
+        }
+
+        // Go falls back to the known-good Control UDP path when a fresh
+        // source port is blocked by NAT or a stateful firewall. The fallback
+        // is still a NEW QUIC connection with its own mTLS and HMAC proof.
+        // Never mark an unverified candidate or TLS-only link as available.
+        let shared_attempt = async {
+            let connection = shared.connect(remote, "localhost")
+                .map_err(|_| ())?.await.map_err(|_| ())?;
+            if PeerCertificatePin::new(pin).map_err(|_| ())?
+                .verify_connection(&connection).is_err()
+            {
+                connection.close(1u32.into(), b"wrong peer certificate");
+                return Err(());
+            }
+            let clone = connection.clone();
+            if authenticate_initiator(
+                connection, &credentials, ChannelRole::Data, HANDSHAKE_DEADLINE,
+            ).await.is_err() {
+                clone.close(1u32.into(), b"data session proof failed");
+                return Err(());
+            }
+            Ok::<Connection, ()>(clone)
+        };
+        let fallback = tokio::select! {
+            _ = stopped.changed() => break,
+            _ = state.control.closed() => break,
+            result = tokio::time::timeout(HANDSHAKE_DEADLINE, shared_attempt) =>
+                result.ok().and_then(Result::ok),
+        };
+        if let Some(connection) = fallback {
+            if state.install(connection.clone(), Some(index)).await {
+                delay = RETRY_INITIAL;
                 tokio::select! {
                     _ = stopped.changed() => break,
                     _ = state.control.closed() => break,
