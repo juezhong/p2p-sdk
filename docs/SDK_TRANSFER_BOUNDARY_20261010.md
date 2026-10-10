@@ -42,16 +42,20 @@ Transfer 自己决定是否使用 **四条 Data QUIC**，并定义其业务 `Dat
 - 内部认证、候选检查和套接字所有权不允许为了代码减少而降低安全约束。
 - 重复连接生命周期与遗留文档随迁移删除，不做与 Go 网络行为无关的增强。
 
-## 6. 代码实施记录（以 PR 当前状态为准）
+## 5. 最新代码实施记录（2026-10-10）
 
-- **#47–#53**：SDK 统一连接入口、Go 对照的动态 ICE、默认 Control-only、按需额外 QUIC、诊断、双栈与安全 API 已逐步合并；跨平台 CI 成功不代替公网 NAT/故障现场。
-- **[#54](https://github.com/juezhong/p2p-sdk/pull/54)**：七组跨平台 CI 全部通过，已合并（`361b535`）。新增 `ManagedAuthenticatedLink`，为**单条应用按需申请的 Data QUIC**提供监测、退避重拨、重新 mTLS/Session HMAC、可订阅的 `Connected/Reconnecting/ControlLost` 状态。可以创建多个实例，没有 SDK 四路调度或文件协议。
-- **Transfer**：仍锁定旧 SDK revision，文件传输逻辑尚未迁移到通用 API；不能把新 SDK 接口等同于 Transfer 已升级。只有 Transfer 单独完成迁移并验收后，才移除旧 `ResilientDataLanes` 兼容层。
+- SDK #47–#55、[#56](https://github.com/juezhong/p2p-sdk/pull/56)、[#57](https://github.com/juezhong/p2p-sdk/pull/57) 已合并，后两者 7/7 Actions 通过。Go 的**双方双向 QUIC Dial+Accept/方向仲裁**与**STUN + 网关映射同 socket 并行收集**现已有 Rust 代码。
+- SDK [#54](https://github.com/juezhong/p2p-sdk/pull/54) 已合并，通用 `ManagedAuthenticatedLink` 为每条连接负责断链探测、重新 mTLS/HMAC、重拨和真实状态，不包含固定四路调度。
+- Transfer [#28](https://github.com/juezhong/p2p-transfer/pull/28) **正在 CI 验证**：把文件四路调度搬进 `transfer-core::transport_lanes`，CLI 彻底改为 SDK `connect_transport` 统一入口，不再自己拼装 UDP/ICE/TLS/QUIC；当前尚未合并。
+- SDK [#58](https://github.com/juezhong/p2p-sdk/pull/58) 已在单独 PR **实际删除** `src/resilient_data.rs`、旧 `ConnectedDirectPeer` 四路高层入口及 `LiveSdkSession` 重复生命周期包装；须等 Transfer #28 回归成功并合并，才能安全合并 SDK #58。两条均未宣称稳定版本。
 
-## 5. 尚未宣称 Go 对等的硬条件
+## 6. Go v0.16.4 仍未证明完全对等的项目
 
-尽管 SDK #47–#53 改进统一入口、动态 prflx、双栈、公网映射、诊断、认证与超时，仍须继续对照 Go 的双向 QUIC 竞速、候选排序与动态更新、STUN/网关并行采集时序，并完成物理多网卡/NAT/IPv6 防火墙/映射变化和 2h/24h 保活及断网故障注入。
+1. **确认的功能差异**：Go 在多个候选/UDP socket 上持续尝试并竞速 QUIC；Rust 当前首先由 ICE 提名单条路径、丢弃其他 Owner，然后在这一条路径上进行双向 QUIC 竞速。若 ICE 首个提名路径随后 QUIC 失败，不能完整重试原来的其他路径。Go 对同网段 Host 候选提供短优先窗口，Rust 路径排序行为也未逐条证明一致。
+2. **发现时间行为差异**：Go 的 STUN/网关同时发现还具有 soft deadline 和 grace；Rust #57 完成并行，但候选的软截止动态预算尚未复刻。
+3. **未完成真实网络验收**：不同运营商、对称 NAT/CGNAT、多网卡 VPN、IPv6 有状态防火墙、真实路由器 PCP/NAT-PMP/UPnP 续租与回收、断网后真实状态/修复、长时间 2h/24h 持续连接。GitHub CI 仅能证明测试环境内的软件行为，不能代替这些场景。
+4. Go Control 断开也结束本逻辑会话，因此 ICE Restart/换网后原逻辑会话保持应列为**独立增强**，不是 Go 已有行为。
 
-绿色 GitHub Actions **仅证明对应代码在 CI 测试环境通过**，不能替代真实运营商和路由器验收，也不能把尚未运行的测试写成“已完成”。
+**禁止在 1–3 项完成代码对等与真实验收前宣传 Rust SDK 与 Go v0.16.4 完全一致；不以“基础已实现”“部分完成”作为验收状态。**
 
-> 相关代码：SDK `src/direct_peer.rs`, `src/transport_session.rs`；兼容层 `src/resilient_data.rs`；Go `quic_connect.go`, `quic_signal.go`, `resilient_data.go`, `portmap.go`。
+> 相关代码：SDK `src/direct_peer.rs`, `src/transport_session.rs`；SDK #58 删除中的历史 `src/resilient_data.rs`；Go `quic_connect.go`, `quic_signal.go`, `resilient_data.go`, `portmap.go`。
