@@ -201,8 +201,16 @@ mod tests {
             assert!(race.next().await.is_none());
             race.cleanup().await;
             for addr in occupied {
-                tokio::net::UdpSocket::bind(addr).await
-                    .expect("failed ICE owner must have been released");
+                // UDP Owner 的 recv task 可能需要一次 runtime 轮询处理 abort；
+                // 不允许永久占用端口，但不要依赖任务调度的纳秒级顺序。
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    loop {
+                        if tokio::net::UdpSocket::bind(addr).await.is_ok() {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                }).await.expect("failed ICE owner must have been released");
             }
         }).await.unwrap();
     }
