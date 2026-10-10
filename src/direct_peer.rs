@@ -297,7 +297,7 @@ fn verified_ice_wake_response(
     // 只有输出 Binding Success 才说明凭据检查真正通过。
     agent.add_remote_candidate(Candidate::host(incoming.source, Protocol::Udp).ok()?);
     let message = StunMessage::parse(&incoming.bytes).ok()?;
-    agent.handle_packet(Instant::now(), StunPacket {
+    agent.handle_packet(std::time::Instant::now(), StunPacket {
         proto: Protocol::Udp,
         source: incoming.source,
         destination: bound,
@@ -308,7 +308,7 @@ fn verified_ice_wake_response(
             && tx.destination == incoming.source
             && tx.contents.starts_with(&[0x01, 0x01])
         {
-            return Some(tx.contents);
+            return Some(tx.contents.to_vec());
         }
     }
     None
@@ -1126,9 +1126,9 @@ mod tests {
         ).unwrap());
         let mut request = None;
         for attempt in 0..8 {
-            agent.handle_timeout(Instant::now() + Duration::from_millis(attempt * 50));
+            agent.handle_timeout(std::time::Instant::now() + Duration::from_millis(attempt * 50));
             if let Some(tx) = agent.poll_transmit() {
-                request = Some(tx.contents);
+                request = Some(tx.contents.to_vec());
                 break;
             }
         }
