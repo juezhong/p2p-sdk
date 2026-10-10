@@ -653,6 +653,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn generic_sdk_control_only_and_on_demand_authenticated_quic() {
+        tokio::time::timeout(Duration::from_secs(45), async {
+            let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+            let now = 1_800_000_000;
+            let (pending, invite) = begin_creator(&[bind], &[], now, 1200).await.unwrap();
+            let (joiner, reply) = begin_joiner(&invite, &[bind], &[], now).await.unwrap();
+            let creator = pending.receive_reply(&reply, now).unwrap();
+            let mut cc = creator.confirmation().unwrap();
+            let mut jc = joiner.confirmation().unwrap();
+            cc.confirm(&creator.comparison_code()).unwrap();
+            jc.confirm(&joiner.comparison_code()).unwrap();
+            let (creator, joiner) = tokio::join!(
+                creator.connect_transport(&cc, now),
+                joiner.connect_transport(&jc, now),
+            );
+            let creator = creator.unwrap();
+            let joiner = joiner.unwrap();
+            assert!(creator.diagnostic().control_connected);
+            assert!(joiner.diagnostic().control_connected);
+            let (mut tx, _) = creator.control.open_bi().await.unwrap();
+            tx.write_all(b"generic control").await.unwrap();
+            tx.finish().unwrap();
+            let (_, mut rx) = joiner.control.accept_bi().await.unwrap();
+            assert_eq!(rx.read_to_end(64).await.unwrap(), b"generic control");
+
+            // No Data QUIC was created until this explicit application call.
+            let (outgoing, incoming) = tokio::join!(
+                creator.open_authenticated_data(Duration::from_secs(12)),
+                joiner.accept_authenticated_data(Duration::from_secs(12)),
+            );
+            let outgoing = outgoing.unwrap();
+            let incoming = incoming.unwrap();
+            let mut out = outgoing.connection.open_uni().await.unwrap();
+            out.write_all(b"generic data").await.unwrap();
+            out.finish().unwrap();
+            let mut input = incoming.connection.accept_uni().await.unwrap();
+            assert_eq!(input.read_to_end(64).await.unwrap(), b"generic data");
+            creator.control.close(0u32.into(), b"test control disconnected");
+            tokio::time::timeout(Duration::from_secs(5), outgoing.connection.closed())
+                .await.unwrap();
+            assert!(!creator.diagnostic().control_connected);
+            outgoing.shutdown();
+            incoming.shutdown();
+            creator.shutdown().await;
+            joiner.shutdown().await;
+        }).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn application_can_request_four_links_and_recover_one_failed_data_quic() {
         tokio::time::timeout(Duration::from_secs(50), async {
             let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
