@@ -17,7 +17,9 @@ use tokio::task::JoinSet;
 
 use crate::{
     ice_agent::NominatedPath,
-    ice_gather::{gather, CandidateGatherError},
+    ice_gather::{gather, add_portmapped_candidate, CandidateGatherError},
+    gateway::GatewayLease,
+    ice_signaling::IceCandidateType,
     ice_multi::{nominate_direct_candidates, nominate_with_authenticated_punch},
     multi_stun::MappingReport,
     ice_signaling::{IceDescription, IceRole, MAX_CANDIDATES},
@@ -52,6 +54,8 @@ pub struct CandidateSet {
     /// Single authenticated signaling object for manual or rendezvous mode.
     pub combined: IceDescription,
     pub interfaces: Vec<InterfaceOwner>,
+    /// 网关租约随已公布候选保留给 ManagedCandidates；未公布的立即清理。
+    pub mapping_leases: Vec<(SocketAddr, GatewayLease)>,
 }
 
 pub struct SelectedDirectPath {
@@ -70,6 +74,18 @@ pub async fn gather_interfaces(
     role: IceRole,
     timeout: Duration,
 ) -> Result<CandidateSet, MultiInterfaceError> {
+    gather_interfaces_with_mapping(addresses, stun, role, timeout, Duration::ZERO).await
+}
+
+/// 与 Go gatherCandidates 相同：先绑定真实 Owner，再让 STUN 与网关
+/// PCP/NAT-PMP/UPnP 在同一个采集阶段并发竞争，而不是两轮串行等待。
+pub async fn gather_interfaces_with_mapping(
+    addresses: &[SocketAddr],
+    stun: &[SocketAddr],
+    role: IceRole,
+    timeout: Duration,
+    mapping_budget: Duration,
+) -> Result<CandidateSet, MultiInterfaceError> {
     if addresses.is_empty() { return Err(MultiInterfaceError::Empty); }
     if addresses.len() > MAX_ACTIVE_INTERFACES || timeout.is_zero() {
         return Err(MultiInterfaceError::TooMany);
@@ -87,13 +103,48 @@ pub async fn gather_interfaces(
             .collect::<Vec<_>>();
         jobs.spawn(async move {
             let owner = UdpOwner::bind(address).await.map_err(|_| MultiInterfaceError::Bind)?;
-            let discovered = gather(&owner.handle, &stun, role, timeout)
-                .await.map_err(MultiInterfaceError::Candidate)?;
+            let local = owner.handle.local_address();
+            let mapping = async {
+                if let SocketAddr::V4(v4) = local {
+                    if !mapping_budget.is_zero() {
+                        return GatewayLease::start_for_socket(
+                            v4, Duration::from_secs(3600), mapping_budget,
+                        ).await.ok();
+                    }
+                }
+                None
+            };
+            let (discovered, mut lease) = tokio::join!(
+                gather(&owner.handle, &stun, role, timeout), mapping,
+            );
+            let discovered = match discovered {
+                Ok(value) => value,
+                Err(error) => {
+                    if let Some(mapping) = lease.take() {
+                        let _ = mapping.shutdown().await;
+                    }
+                    return Err(MultiInterfaceError::Candidate(error));
+                }
+            };
+            let mut local_description = discovered.description;
+            if let Some(mapping) = lease.as_ref() {
+                if let Some(external) = mapping.subscribe().mapped_address() {
+                    if !add_portmapped_candidate(
+                        &mut local_description, local, external,
+                    ).unwrap_or(false) {
+                        if let Some(mapping) = lease.take() {
+                            tokio::spawn(async move { let _ = mapping.shutdown().await; });
+                        }
+                    }
+                } else if let Some(mapping) = lease.take() {
+                    tokio::spawn(async move { let _ = mapping.shutdown().await; });
+                }
+            }
             Ok::<_, MultiInterfaceError>((index, InterfaceOwner {
                 owner,
-                local: discovered.description,
+                local: local_description,
                 stun_mapping: discovered.mapping,
-            }))
+            }, lease))
         });
     }
 
@@ -112,12 +163,20 @@ pub async fn gather_interfaces(
     );
     let mut advertised = Vec::new();
     let mut owners = Vec::new();
-    for (_, mut item) in obtained {
+    let mut mapping_leases = Vec::new();
+    for (_, mut item, mut lease) in obtained {
         if advertised.len() >= MAX_CANDIDATES { break; }
         item.local.ufrag = first_ufrag.clone();
         item.local.password = first_password.clone();
         let room = MAX_CANDIDATES - advertised.len();
         item.local.candidates.truncate(room);
+        if let Some(mapping) = lease.take() {
+            if item.local.candidates.iter().any(|c| c.kind == IceCandidateType::PortMapped) {
+                mapping_leases.push((item.owner.handle.local_address(), mapping));
+            } else {
+                tokio::spawn(async move { let _ = mapping.shutdown().await; });
+            }
+        }
         advertised.extend(item.local.candidates.iter().cloned());
         owners.push(item);
     }
@@ -126,7 +185,7 @@ pub async fn gather_interfaces(
         password: first_password, candidates: advertised,
     };
     combined.validate().map_err(|_| MultiInterfaceError::InvalidAddress)?;
-    Ok(CandidateSet { combined, interfaces: owners })
+    Ok(CandidateSet { combined, interfaces: owners, mapping_leases })
 }
 
 impl CandidateSet {
