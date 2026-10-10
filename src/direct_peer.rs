@@ -321,10 +321,62 @@ async fn wait_for_authenticated_creator(
     gathered: &mut ManagedCandidates,
     pairing: &ManualPairing,
     remote: &IceDescription,
-) -> Result<(), DirectPeerError> {
+    endpoints: &std::collections::HashMap<SocketAddr, quinn::Endpoint>,
+    replay_guard: Arc<ReplayGuard>,
+) -> Result<Option<(SocketAddr, quinn::Connection)>, DirectPeerError> {
     let proofs = gathered.candidates.interfaces.iter().map(|interface| {
         AuthenticatedPunch::new(pairing.credentials.clone(), interface.local.role)
     }).collect::<Vec<_>>();
+    // JOIN 在等待用户人工传递 REPLY 的整个阶段保持 QUIC listener
+    // 运行；只有 mTLS PIN + 会话 HMAC 全部成功才允许网络活动唤醒。
+    let mut listeners = JoinSet::new();
+    for (&local, endpoint) in endpoints {
+        let endpoint = endpoint.clone();
+        let credentials = pairing.credentials.clone();
+        let pin = pairing.remote_tls_cert_sha256;
+        let guard = Arc::clone(&replay_guard);
+        listeners.spawn(async move {
+            let mut pending = JoinSet::new();
+            loop {
+                tokio::select! {
+                    accepted = endpoint.accept(), if pending.len() < MAX_PENDING_INBOUND_AUTH => {
+                        let Some(incoming) = accepted else { break };
+                        let credentials = credentials.clone();
+                        let guard = Arc::clone(&guard);
+                        pending.spawn(async move {
+                            let Ok(Ok(connection)) = timeout(AUTH_DEADLINE, incoming).await else {
+                                return None;
+                            };
+                            let verified = PeerCertificatePin::new(pin)
+                                .ok().is_some_and(|p| p.verify_connection(&connection).is_ok());
+                            if verified && authenticate_responder(
+                                connection.clone(), &credentials, ChannelRole::Control,
+                                &guard, AUTH_DEADLINE,
+                            ).await.is_ok() {
+                                Some(connection)
+                            } else {
+                                connection.close(1u32.into(), b"passive Control identity rejected");
+                                None
+                            }
+                        });
+                    }
+                    completed = pending.join_next(), if !pending.is_empty() => {
+                        if let Some(Ok(Some(connection))) = completed {
+                            pending.abort_all();
+                            while let Some(result) = pending.join_next().await {
+                                if let Ok(Some(loser)) = result {
+                                    loser.close(0u32.into(), b"passive Control loser");
+                                }
+                            }
+                            return Some((local, connection));
+                        }
+                    }
+                }
+            }
+            pending.abort_all();
+            None
+        });
+    }
     loop {
         for (interface, proof) in gathered.candidates.interfaces.iter_mut().zip(&proofs) {
             let handle = interface.owner.handle.clone();
@@ -342,7 +394,7 @@ async fn wait_for_authenticated_creator(
                 ) {
                     handle.send_ice(packet.source, &answer).await
                         .map_err(|_| DirectPeerError::IceCheck)?;
-                    return Ok(());
+                    return Ok(None);
                 }
             }
             let Some(packet) = (match interface.owner.punch_packets.try_recv() {
@@ -362,13 +414,20 @@ async fn wait_for_authenticated_creator(
             let reply = proof.make_packet(now).map_err(|_| DirectPeerError::IceCheck)?;
             handle.send_punch(packet.source, &reply).await
                 .map_err(|_| DirectPeerError::IceCheck)?;
-            return Ok(());
+            return Ok(None);
         }
         // Passive NAT keepalive does not turn unverified probes into ICE paths.
         for (interface, proof) in gathered.candidates.interfaces.iter().zip(&proofs) {
             let _ = proof.send_to_candidates(&interface.owner.handle, remote).await;
         }
-        tokio::time::sleep(PASSIVE_POLL).await;
+        tokio::select! {
+            received = listeners.join_next(), if !listeners.is_empty() => {
+                if let Some(Ok(Some(authenticated))) = received {
+                    return Ok(Some(authenticated));
+                }
+            }
+            _ = tokio::time::sleep(PASSIVE_POLL) => {}
+        }
     }
 }
 
@@ -622,24 +681,55 @@ async fn race_authenticated_control(
 /// 与会话 HMAC 认证。只有真正通过认证的 QUIC 才能成为当前连接。
 async fn authenticate_on_path(
     mut path: ManagedPath,
-    client_tls: quinn::ClientConfig,
-    server_tls: quinn::ServerConfig,
+    tls: (quinn::ClientConfig, quinn::ServerConfig),
     pairing: ManualPairing,
     advertised: IceDescription,
     role: IceRole,
     replay_guard: Arc<ReplayGuard>,
+    prebound: Option<(quinn::Endpoint, Option<quinn::Connection>)>,
 ) -> Result<(ManagedPath, quinn::Endpoint, quinn::Connection, bool), DirectPeerError> {
+    let (client_tls, server_tls) = tls;
+    let (prebound_endpoint, preauthenticated_control) = match prebound {
+        Some((endpoint, control)) => (Some(endpoint), control),
+        None => (None, None),
+    };
     let remote = path.nominated().remote;
-    let adapter = QuinnUdpAdapter::from_owner(&mut path.selected.owner)
-        .map_err(|_| DirectPeerError::UdpAdapter)?;
-    let mut endpoint = quinn::Endpoint::new_with_abstract_socket(
-        demux_endpoint_config(), Some(server_tls), Arc::new(adapter),
-        quinn::default_runtime().ok_or(DirectPeerError::QuicEndpoint)?,
-    ).map_err(|_| DirectPeerError::QuicEndpoint)?;
+    let mut endpoint = if let Some(endpoint) = prebound_endpoint {
+        endpoint
+    } else {
+        let adapter = QuinnUdpAdapter::from_owner(&mut path.selected.owner)
+            .map_err(|_| DirectPeerError::UdpAdapter)?;
+        quinn::Endpoint::new_with_abstract_socket(
+            demux_endpoint_config(), Some(server_tls), Arc::new(adapter),
+            quinn::default_runtime().ok_or(DirectPeerError::QuicEndpoint)?,
+        ).map_err(|_| DirectPeerError::QuicEndpoint)?
+    };
     endpoint.set_default_client_config(client_tls);
-    let (control, outbound) = race_authenticated_control(
-        &endpoint, remote, &advertised, &pairing, role, replay_guard,
-    ).await?;
+    // 被动阶段已经验证 mTLS 与会话 HMAC 的连接仍必须与本 UDP
+    // Owner 的有效 ICE 提名绑定，不能仅凭早到 QUIC 绕过连通性检查。
+    // 被动 QUIC 的认证身份不足以替代特定 ICE candidate pair 的连通性验证。
+    // 早到连接若指向同一 socket 的其他 NAT 端口，必须走标准 ICE/QUIC 竞速。
+    let nominated_prebound = preauthenticated_control.and_then(|connection| {
+        if connection.close_reason().is_none() && connection.remote_address() == remote {
+            Some(connection)
+        } else {
+            connection.close(1u32.into(), b"passive QUIC does not match nominated ICE path");
+            None
+        }
+    });
+    let (control, outbound) = if let Some(connection) = nominated_prebound {
+        (connection, false)
+    } else {
+        match race_authenticated_control(
+            &endpoint, remote, &advertised, &pairing, role, replay_guard,
+        ).await {
+            Ok(result) => result,
+            Err(error) => {
+                endpoint.close(1u32.into(), b"Control authentication failed");
+                return Err(error);
+            }
+        }
+    };
     let actual_remote = control.remote_address();
     if outbound && actual_remote != remote
         && !advertised.candidates.iter().any(|candidate| candidate.address == actual_remote)
@@ -748,18 +838,6 @@ async fn connect_authenticated_transport(
     let offered_host_candidates = gathered.candidates.combined.candidates.iter()
         .filter(|candidate| candidate.kind == IceCandidateType::Host)
         .map(|candidate| candidate.address).collect::<Vec<_>>();
-    if role == IceRole::Controlled {
-        wait_for_authenticated_creator(&mut gathered, &pairing, &remote).await?;
-    }
-    let sender = if role == IceRole::Controlling {
-        Some(ConnectPunchSender::start(&gathered, &pairing, &remote))
-    } else {
-        None
-    };
-    let mut candidates = gathered.start_authenticated_path_race(
-        &remote, pairing.credentials.clone(), ICE_CHECK,
-    ).map_err(|_| DirectPeerError::IceCheck)?;
-
     let trusted = trusted_certificate(remote_certificate)?;
     let cert = vec![identity.cert.der().clone()];
     let private_key = || rustls::pki_types::PrivateKeyDer::Pkcs8(
@@ -773,6 +851,38 @@ async fn connect_authenticated_transport(
     ).map_err(|_| DirectPeerError::TlsConfig)?;
     let replay_guard = Arc::new(ReplayGuard::new(4096)
         .map_err(|_| DirectPeerError::VerifiedSession)?);
+
+    // JOIN 在人工等待阶段就绑定与 ICE 共用的 Quinn UDP endpoint。
+    // 后续该 UDP Owner 一旦通过 ICE 提名，必须复用同一个 endpoint，
+    // 禁止重新绑定导致公网 NAT 映射或早到认证连接丢失。
+    let mut prebound_endpoints = std::collections::HashMap::new();
+    let mut early_control = None;
+    if role == IceRole::Controlled {
+        for interface in &mut gathered.candidates.interfaces {
+            let local = interface.owner.handle.local_address();
+            let adapter = QuinnUdpAdapter::from_owner(&mut interface.owner)
+                .map_err(|_| DirectPeerError::UdpAdapter)?;
+            let mut endpoint = quinn::Endpoint::new_with_abstract_socket(
+                demux_endpoint_config(), Some(server_tls.clone()), Arc::new(adapter),
+                quinn::default_runtime().ok_or(DirectPeerError::QuicEndpoint)?,
+            ).map_err(|_| DirectPeerError::QuicEndpoint)?;
+            endpoint.set_default_client_config(client_tls.clone());
+            prebound_endpoints.insert(local, endpoint);
+        }
+        early_control = wait_for_authenticated_creator(
+            &mut gathered, &pairing, &remote,
+            &prebound_endpoints, Arc::clone(&replay_guard),
+        ).await?;
+    }
+    let sender = if role == IceRole::Controlling {
+        Some(ConnectPunchSender::start(&gathered, &pairing, &remote))
+    } else {
+        None
+    };
+    let mut candidates = gathered.start_authenticated_path_race(
+        &remote, pairing.credentials.clone(), ICE_CHECK,
+    ).map_err(|_| DirectPeerError::IceCheck)?;
+
     let mut in_flight = JoinSet::new();
     let mut ice_exhausted = false;
     let limit = Instant::now() + ICE_CHECK + QUIC_ACCEPT;
@@ -792,6 +902,15 @@ async fn connect_authenticated_transport(
             path = candidates.next(), if !ice_exhausted => {
                 match path {
                     Some(path) => {
+                        let bound = path.selected.owner.handle.local_address();
+                        let prepared_endpoint = prebound_endpoints.remove(&bound);
+                        let prepared_control = if early_control.as_ref()
+                            .is_some_and(|(local, _)| *local == bound)
+                        {
+                            early_control.take().map(|(_, connection)| connection)
+                        } else {
+                            None
+                        };
                         let cert = client_tls.clone();
                         let server = server_tls.clone();
                         let binding = ManualPairing {
@@ -804,7 +923,8 @@ async fn connect_authenticated_transport(
                         let offered = remote.clone();
                         in_flight.spawn(async move {
                             authenticate_on_path(
-                                path, cert, server, binding, offered, role, guard,
+                                path, (cert, server), binding, offered, role, guard,
+                                prepared_endpoint.map(|endpoint| (endpoint, prepared_control)),
                             ).await
                         });
                     }
@@ -854,8 +974,19 @@ async fn connect_authenticated_transport(
     };
     // 连接成功或失败均应等待 QUIC/ICE 任务取消完成，以及网关租约撤销。
     in_flight.abort_all();
-    while in_flight.join_next().await.is_some() {}
+    while let Some(result) = in_flight.join_next().await {
+        if let Ok(Ok((_, endpoint, loser, _))) = result {
+            loser.close(0u32.into(), b"late Control race loser");
+            endpoint.close(0u32.into(), b"late Control race loser");
+        }
+    }
     drop(sender);
+    for endpoint in prebound_endpoints.into_values() {
+        endpoint.close(0u32.into(), b"unused passive listener");
+    }
+    if let Some((_, unused)) = early_control.take() {
+        unused.close(0u32.into(), b"unused passive Control");
+    }
     candidates.cleanup().await;
     let winner = result?;
     if role == IceRole::Controlling {
@@ -1316,6 +1447,83 @@ mod tests {
         assert!(verified_ice_wake_response(
             &joined, &creator, owner.handle.local_address(), &fake,
         ).is_none());
+    }
+
+    #[tokio::test]
+    async fn passive_join_accepts_authenticated_quic_before_punch_or_ice() {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+            let now = 1_800_000_000;
+            let (pending, invite) = begin_creator(&[bind], &[], now, 1200).await.unwrap();
+            let (mut joiner, reply) = begin_joiner(&invite, &[bind], &[], now).await.unwrap();
+            let mut creator = pending.receive_reply(&reply, now).unwrap();
+
+            let joiner_cert = vec![joiner.inner.identity.cert.der().clone()];
+            let joiner_key = rustls::pki_types::PrivateKeyDer::Pkcs8(
+                joiner.inner.identity.signing_key.serialize_der().into(),
+            );
+            let joiner_server = authenticated_server_config(
+                joiner_cert, joiner_key,
+                trusted_certificate(joiner.inner.remote_certificate.clone()).unwrap(),
+            ).unwrap();
+            let joiner_owner = &mut joiner.inner.gathered.candidates.interfaces[0].owner;
+            let destination = joiner_owner.handle.local_address();
+            let joiner_adapter = QuinnUdpAdapter::from_owner(joiner_owner).unwrap();
+            let joiner_endpoint = quinn::Endpoint::new_with_abstract_socket(
+                demux_endpoint_config(), Some(joiner_server),
+                Arc::new(joiner_adapter), quinn::default_runtime().unwrap(),
+            ).unwrap();
+            let mut passive_endpoints = std::collections::HashMap::new();
+            passive_endpoints.insert(destination, joiner_endpoint);
+
+            let creator_cert = vec![creator.inner.identity.cert.der().clone()];
+            let creator_key = rustls::pki_types::PrivateKeyDer::Pkcs8(
+                creator.inner.identity.signing_key.serialize_der().into(),
+            );
+            let client_tls = authenticated_client_config(
+                creator_cert, creator_key,
+                trusted_certificate(creator.inner.remote_certificate.clone()).unwrap(),
+            ).unwrap();
+            let creator_adapter = QuinnUdpAdapter::from_owner(
+                &mut creator.inner.gathered.candidates.interfaces[0].owner,
+            ).unwrap();
+            let mut creator_endpoint = quinn::Endpoint::new_with_abstract_socket(
+                demux_endpoint_config(), None, Arc::new(creator_adapter),
+                quinn::default_runtime().unwrap(),
+            ).unwrap();
+            creator_endpoint.set_default_client_config(client_tls);
+            let creds = creator.inner.pairing.credentials.clone();
+
+            // 没有 ICE/Punch 唤醒的情况下，合法 Control QUIC 必须直接
+            // 通过被动 listener 完成 TLS + Session HMAC 并解除等待。
+            let (woken, initiated) = tokio::join!(
+                wait_for_authenticated_creator(
+                    &mut joiner.inner.gathered,
+                    &joiner.inner.pairing, &joiner.inner.remote,
+                    &passive_endpoints, Arc::new(ReplayGuard::new(4096).unwrap()),
+                ),
+                async {
+                    tokio::time::sleep(Duration::from_millis(80)).await;
+                    let connection = creator_endpoint.connect(destination, "localhost")
+                        .unwrap().await.unwrap();
+                    authenticate_initiator(
+                        connection.clone(), &creds, ChannelRole::Control,
+                        AUTH_DEADLINE,
+                    ).await.unwrap();
+                    connection
+                },
+            );
+            let (bound, accepted) = woken.unwrap()
+                .expect("valid authenticated QUIC must wake passive JOIN");
+            assert_eq!(bound, destination);
+            assert!(accepted.close_reason().is_none());
+            initiated.close(0u32.into(), b"test complete");
+            accepted.close(0u32.into(), b"test complete");
+            creator_endpoint.close(0u32.into(), b"test complete");
+            for endpoint in passive_endpoints.into_values() {
+                endpoint.close(0u32.into(), b"test complete");
+            }
+        }).await.unwrap();
     }
 
     #[tokio::test]
