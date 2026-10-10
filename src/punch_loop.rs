@@ -107,3 +107,79 @@ impl PunchLoop {
 impl Drop for PunchLoop {
     fn drop(&mut self) { self.stop.send_replace(true); }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        ice_signaling::{IceRole, IceCandidate, IceCandidateType},
+        session_binding::SessionCredentials,
+    };
+
+    fn description(role: IceRole, addr: SocketAddr) -> IceDescription {
+        IceDescription {
+            role, ufrag: "Abcd1234".into(),
+            password: "abcdefghijklmnopqrstuv012345".into(),
+            candidates: vec![IceCandidate {
+                address: addr, kind: IceCandidateType::Host, priority: 100,
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn live_udp_owners_discover_each_other_without_relay() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut a = UdpOwner::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+            let mut b = UdpOwner::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+            let la = a.handle.local_address();
+            let lb = b.handle.local_address();
+            let creds = SessionCredentials::new([5; 16], [9; 32]).unwrap();
+            let left = PunchLoop::start(
+                &mut a, AuthenticatedPunch::new(creds.clone(), IceRole::Controlling),
+                description(IceRole::Controlled, lb), Duration::from_millis(100),
+            ).unwrap();
+            let right = PunchLoop::start(
+                &mut b, AuthenticatedPunch::new(creds, IceRole::Controlled),
+                description(IceRole::Controlling, la), Duration::from_millis(100),
+            ).unwrap();
+            let mut lrx = left.subscribe();
+            let mut rrx = right.subscribe();
+            loop {
+                let ready = lrx.borrow().discovered.contains(&lb)
+                    && rrx.borrow().discovered.contains(&la);
+                if ready { break; }
+                tokio::select! {
+                    changed = lrx.changed() => { changed.unwrap(); }
+                    changed = rrx.changed() => { changed.unwrap(); }
+                }
+            }
+            left.shutdown().await;
+            right.shutdown().await;
+        }).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn different_session_keys_do_not_learn_peer_candidates() {
+        let mut a = UdpOwner::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let mut b = UdpOwner::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let la = a.handle.local_address();
+        let lb = b.handle.local_address();
+        let left = PunchLoop::start(
+            &mut a, AuthenticatedPunch::new(
+                SessionCredentials::new([5;16],[8;32]).unwrap(),
+                IceRole::Controlling,
+            ), description(IceRole::Controlled, lb), Duration::from_millis(100),
+        ).unwrap();
+        let right = PunchLoop::start(
+            &mut b, AuthenticatedPunch::new(
+                SessionCredentials::new([5;16],[7;32]).unwrap(),
+                IceRole::Controlled,
+            ), description(IceRole::Controlling, la), Duration::from_millis(100),
+        ).unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(left.subscribe().borrow().discovered.is_empty());
+        assert!(right.subscribe().borrow().discovered.is_empty());
+        left.shutdown().await;
+        right.shutdown().await;
+    }
+}
