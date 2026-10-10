@@ -277,3 +277,8 @@
 - 开发分支 `feat/m2-nat-pmp-portmapping` 同批实现 RFC 6886 NAT-PMP / RFC 6887 PCP MAP 的 UDP 网关事务、严格 gateway/nonce/端口关联、防伪装回复和模拟网关测试；实现只有匹配当前真实 ICE/Quinn UDP Owner 端口时才允许添加 port-mapped ICE candidate。见 `docs/GATEWAY_PORTMAP.md`。
 - 仍没实现 UPnP、网关自动发现、映射 lease 续期/删除、真实路由器/跨 NAT 测试；API 仅为显式网关的低层组件，暂不在 Transfer UI 默认启用。最新 Actions 未成功前不能标已验收。
 - 完整 Transfer 发行继续以 CLI Go 行为对照和五架构 CI + 用户两台机器实际 NAT 穿透验证为门槛；SDK 不开发文件业务。
+
+
+## 2026-10-10：补齐 Go 网络对等的动态 ICE 复验（待 CI）
+
+基于已合并的 SDK #68/#69，新增连接竞速期间的动态 prflx 源端点 ICE 复验与 QUIC 重试：HMAC 发现→原 UDP Owner 上 ICE Agent 提名→QUIC mTLS + Session HMAC，保留有界地址集、绝对截止时间和方向仲裁。新增真实 UDP Owner 正向/负向测试，拒绝 #70 的未经 ICE 提名直接拨号方案。本代码 PR 的 CI、实际 CGNAT/IPv6 防火墙/网关及长时稳定性仍需分别验收；不修改 Transfer 文件传输。 

@@ -4,12 +4,12 @@
 //! ICE nomination, mutual TLS, authenticated Control/Data, and Data repair.
 //! User confirmation of the pairing remains a mandatory explicit gate.
 
-use std::{collections::VecDeque, net::SocketAddr, sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}};
+use std::{collections::{HashSet, VecDeque}, net::SocketAddr, sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}};
 use tokio::{task::JoinSet, time::{timeout, Instant}};
 use is::{stun::{StunMessage, StunPacket}, Candidate, IceAgent, Protocol};
 
 use crate::{
-    ice_signaling::{IceDescription, IceRole, IceCandidateType},
+    ice_signaling::{IceDescription, IceRole, IceCandidate, IceCandidateType, MAX_CANDIDATES},
     ice_agent::credentials_from_description,
     udp_owner::InboundDatagram,
     local_network::local_addresses,
@@ -501,7 +501,32 @@ async fn race_authenticated_control(
     pairing: &ManualPairing,
     role: IceRole,
     replay_guard: Arc<ReplayGuard>,
+    dynamic_path: Option<(
+        &mut crate::udp_owner::UdpOwner,
+        &IceDescription,
+        Arc<std::sync::Mutex<HashSet<SocketAddr>>>,
+    )>,
 ) -> Result<(quinn::Connection, bool), DirectPeerError> {
+    let (verified_tx, mut verified_rx) =
+        tokio::sync::mpsc::channel::<SocketAddr>(MAX_CANDIDATES);
+    let late_whitelist = dynamic_path.as_ref().map(|(_, _, whitelist)|
+        Arc::clone(whitelist)
+    );
+    let mut checking_active = dynamic_path.is_some();
+    let dynamic_ice = async {
+        match dynamic_path {
+            Some((owner, local, _)) => {
+                let proof = AuthenticatedPunch::new(
+                    pairing.credentials.clone(), role,
+                );
+                let _ = crate::ice_multi::verify_dynamic_peer_reflexive(
+                    owner, local, advertised, &proof, verified_tx, QUIC_ACCEPT,
+                ).await;
+            }
+            None => std::future::pending::<()>().await,
+        }
+    };
+    tokio::pin!(dynamic_ice);
     let mut workers = JoinSet::new();
     let outgoing = endpoint.clone();
     let credentials = pairing.credentials.clone();
@@ -514,6 +539,9 @@ async fn race_authenticated_control(
     workers.spawn(async move {
         let expires = Instant::now() + QUIC_ACCEPT;
         let mut backlog: VecDeque<_> = dial_addrs.iter().copied().collect();
+        let mut scheduled = dial_addrs.iter().copied().collect::<HashSet<_>>();
+        let mut verified_late = Vec::new();
+        let mut verified_open = true;
         let mut attempts = JoinSet::new();
         loop {
             while attempts.len() < 4 {
@@ -545,26 +573,42 @@ async fn race_authenticated_control(
                     }
                 });
             }
-            if attempts.is_empty() && backlog.is_empty() {
-                if Instant::now() >= expires {
-                    return Err(DirectPeerError::QuicHandshake);
-                }
-                tokio::time::sleep(Duration::from_millis(180)).await;
-                backlog.extend(dial_addrs.iter().copied());
-                continue;
-            }
-            match tokio::time::timeout_at(expires, attempts.join_next()).await {
-                Ok(Some(Ok(Ok(authenticated)))) => {
-                    attempts.abort_all();
-                    while let Some(result) = attempts.join_next().await {
-                        if let Ok(Ok((loser, _))) = result {
-                            loser.close(0u32.into(), b"outbound QUIC race loser");
+            tokio::select! {
+                verified = verified_rx.recv(), if verified_open => {
+                    match verified {
+                        Some(address) if address.is_ipv4() == remote.is_ipv4()
+                            && verified_late.len() < MAX_CANDIDATES
+                            && scheduled.insert(address) => {
+                            // 只有 ICE nominated event 才会发送到这个通道。
+                            if let Some(whitelist) = late_whitelist.as_ref() {
+                                if let Ok(mut verified) = whitelist.lock() {
+                                    verified.insert(address);
+                                }
+                            }
+                            verified_late.push(address);
+                            backlog.push_back(address);
                         }
+                        Some(_) => {}
+                        None => verified_open = false,
                     }
-                    return Ok(authenticated);
                 }
-                Ok(Some(_)) => {}
-                _ => {
+                result = attempts.join_next(), if !attempts.is_empty() => {
+                    if let Some(Ok(Ok(authenticated))) = result {
+                        attempts.abort_all();
+                        while let Some(result) = attempts.join_next().await {
+                            if let Ok(Ok((loser, _))) = result {
+                                loser.close(0u32.into(), b"outbound QUIC race loser");
+                            }
+                        }
+                        return Ok(authenticated);
+                    }
+                }
+                _ = tokio::time::sleep(Duration::from_millis(180)),
+                    if attempts.is_empty() && backlog.is_empty() => {
+                    backlog.extend(dial_addrs.iter().copied());
+                    backlog.extend(verified_late.iter().copied());
+                }
+                _ = tokio::time::sleep_until(expires) => {
                     attempts.abort_all();
                     while let Some(result) = attempts.join_next().await {
                         if let Ok(Ok((loser, _))) = result {
@@ -638,6 +682,10 @@ async fn race_authenticated_control(
         let mut fallback_deadline: Option<Instant> = None;
         loop {
             tokio::select! {
+                _ = &mut dynamic_ice, if checking_active => {
+                    // 即使没有新路径或 ICE 复验失败，也继续既有 QUIC 路径。
+                    checking_active = false;
+                }
                 result = workers.join_next() => {
                     match result {
                         Some(Ok(Ok((connection, outbound)))) => {
@@ -683,12 +731,19 @@ async fn authenticate_on_path(
     mut path: ManagedPath,
     tls: (quinn::ClientConfig, quinn::ServerConfig),
     pairing: ManualPairing,
-    advertised: IceDescription,
+    descriptions: (IceDescription, IceDescription),
     role: IceRole,
     replay_guard: Arc<ReplayGuard>,
     prebound: Option<(quinn::Endpoint, Option<quinn::Connection>)>,
 ) -> Result<(ManagedPath, quinn::Endpoint, quinn::Connection, bool), DirectPeerError> {
     let (client_tls, server_tls) = tls;
+    let (mut local_ice, advertised) = descriptions;
+    // ICE 新候选必须关联当前真实 UDP Owner，不能借用其它 NIC 的 host。
+    local_ice.candidates = vec![IceCandidate {
+        address: path.selected.owner.handle.local_address(),
+        kind: IceCandidateType::Host,
+        priority: 100,
+    }];
     let (prebound_endpoint, preauthenticated_control) = match prebound {
         Some((endpoint, control)) => (Some(endpoint), control),
         None => (None, None),
@@ -717,11 +772,16 @@ async fn authenticate_on_path(
             None
         }
     });
+    let dynamic_verified = Arc::new(std::sync::Mutex::new(HashSet::new()));
     let (control, outbound) = if let Some(connection) = nominated_prebound {
         (connection, false)
     } else {
         match race_authenticated_control(
             &endpoint, remote, &advertised, &pairing, role, replay_guard,
+            Some((
+                &mut path.selected.owner, &local_ice,
+                Arc::clone(&dynamic_verified),
+            )),
         ).await {
             Ok(result) => result,
             Err(error) => {
@@ -731,8 +791,12 @@ async fn authenticate_on_path(
         }
     };
     let actual_remote = control.remote_address();
-    if outbound && actual_remote != remote
+    let nominated_late = dynamic_verified.lock().is_ok_and(|verified|
+        verified.contains(&actual_remote)
+    );
+    if actual_remote != remote
         && !advertised.candidates.iter().any(|candidate| candidate.address == actual_remote)
+        && !nominated_late
     {
         control.close(1u32.into(), b"unadvertised remote address");
         return Err(DirectPeerError::LiveSession);
@@ -879,6 +943,7 @@ async fn connect_authenticated_transport(
     } else {
         None
     };
+    let shared_local_ice = gathered.candidates.combined.clone();
     let mut candidates = gathered.start_authenticated_path_race(
         &remote, pairing.credentials.clone(), ICE_CHECK,
     ).map_err(|_| DirectPeerError::IceCheck)?;
@@ -921,9 +986,11 @@ async fn connect_authenticated_transport(
                         };
                         let guard = Arc::clone(&replay_guard);
                         let offered = remote.clone();
+                        let local_ice = shared_local_ice.clone();
                         in_flight.spawn(async move {
                             authenticate_on_path(
-                                path, (cert, server), binding, offered, role, guard,
+                                path, (cert, server), binding,
+                                (local_ice, offered), role, guard,
                                 prepared_endpoint.map(|endpoint| (endpoint, prepared_control)),
                             ).await
                         });
@@ -1160,6 +1227,7 @@ mod tests {
                     &a.endpoint, invalid, &offer, &binding,
                     IceRole::Controlling,
                     Arc::new(ReplayGuard::new(4096).unwrap()),
+                    None,
                 ),
                 async {
                     let connection = b.endpoint.accept().await.unwrap().await.unwrap();
@@ -1220,6 +1288,7 @@ mod tests {
                         &right.endpoint, "127.0.0.1:9".parse().unwrap(),
                         &no_remote_candidates, &pairing, IceRole::Controlled,
                         Arc::new(ReplayGuard::new(4096).unwrap()),
+                        None,
                     ),
                     async {
                         tokio::time::sleep(Duration::from_millis(60)).await;

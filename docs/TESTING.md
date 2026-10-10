@@ -53,3 +53,11 @@
 ```
 
 这是结构示意，真正的报告应包含结构化错误、时间戳、观测来源与隐私分级。
+
+
+## 2026-10-10：动态候选重新 ICE 验证回归（SDK 新 PR）
+
+- `post_nomination_nat_change_requires_new_ice_proof`：旧信令端口不可达，两个真实 UDP Owner 继续 Punch，只有 ICE 再次提名后才能发布真实端口。
+- `valid_hmac_without_ice_nomination_never_reaches_quic`：正确 HMAC 但没有对端 ICE 响应时不得产生 QUIC 可拨地址。
+- `forged_punch_cannot_nominate_dynamic_quic_address`：错误会话密钥不能将远端加入 ICE 提名输出。
+- 既有双向 Control、JOIN 提前监听、NAT 回退、IPv6→IPv4、端口回收和跨平台回归继续运行。CI 绿灯不代替真实双机复杂 NAT 与长期运行验证。
