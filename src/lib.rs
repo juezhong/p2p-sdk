@@ -47,6 +47,7 @@ pub mod nat_pmp;
 pub mod nat_pmp_lease;
 pub mod gateway;
 pub mod managed_candidates;
+pub mod network_diagnostics;
 pub mod upnp_lease;
 pub mod pcp;
 pub mod pcp_lease;
