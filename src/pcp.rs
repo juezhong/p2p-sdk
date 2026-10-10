@@ -169,6 +169,8 @@ async fn transact_map(
                         mapping_nonce: nonce,
                     });
                 }
+                // A failed UDP path is not permanent socket termination.
+                Ok(Err(e)) if crate::udp_errors::is_transient_unreachable(&e) => continue,
                 Ok(Err(e)) => return Err(PcpError::Io(e)),
                 Err(_) => break,
             }
