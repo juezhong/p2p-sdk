@@ -219,7 +219,7 @@ impl ResilientDataLanes {
                 let shared = endpoint.clone();
                 tokio::spawn(async move {
                     maintain_independent_creator_lane(state, stopped,
-                        (local_ip, remote), credentials, remote_pin, tls, shared, index).await;
+                        (local_ip, remote), credentials, remote_pin, (tls, shared), index).await;
                 });
             }
         }
@@ -480,11 +480,11 @@ async fn maintain_independent_creator_lane(
     addresses: (std::net::IpAddr, SocketAddr),
     credentials: SessionCredentials,
     pin: [u8; 32],
-    tls: quinn::ClientConfig,
-    shared: Endpoint,
+    transport: (quinn::ClientConfig, Endpoint),
     index: usize,
 ) {
     let (local_ip, remote) = addresses;
+    let (tls, shared) = transport;
     let mut delay = RETRY_INITIAL;
     loop {
         if *stopped.borrow() || state.control.close_reason().is_some() {
