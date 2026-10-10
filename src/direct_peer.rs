@@ -138,12 +138,14 @@ pub async fn discover_default_stun() -> Vec<SocketAddr> {
     {
         return Vec::new();
     }
-    let (first, second) = tokio::join!(
+    // 提供商冗余：避免仅依赖 Google，且默认值不影响离线 LAN 模式。
+    let (cloudflare, google, google_backup) = tokio::join!(
+        resolve_stun("stun.cloudflare.com:3478"),
         resolve_stun("stun.l.google.com:19302"),
         resolve_stun("stun1.l.google.com:19302"),
     );
     let mut unique = Vec::new();
-    for addr in first.into_iter().chain(second) {
+    for addr in cloudflare.into_iter().chain(google).chain(google_backup) {
         if !unique.contains(&addr) { unique.push(addr); }
     }
     unique
