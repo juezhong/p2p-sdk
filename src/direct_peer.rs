@@ -904,6 +904,9 @@ mod tests {
             let joiner = joiner.unwrap();
             assert!(creator.diagnostic().control_connected);
             assert!(joiner.diagnostic().control_connected);
+            // Go v0.16.4：创建方偏向入站，加入方偏向出站。
+            assert!(!creator.diagnostic().control_outbound);
+            assert!(joiner.diagnostic().control_outbound);
             // API 不接受零预算，且不能在未认证前返回附属 QUIC。
             assert!(matches!(
                 creator.open_authenticated_data(Duration::ZERO).await,
