@@ -48,3 +48,9 @@
 - 不为了代码/依赖数量上的漂亮数字牺牲 mTLS、安全 nonce/replay 防护、NAT 回退和整体穿透成功率。
 
 状态记录以代码 PR、最新 commit 与实际 CI 结果为准，不能混用历史“基础已实现/部分完成”描述。
+
+## 七、对应代码交付进度（2026-10-10）
+
+- [SDK PR #60](https://github.com/juezhong/p2p-sdk/pull/60)：默认人工邀请码无自动过期（可单独指定有限 TTL）、Cloudflare + Google 默认 STUN、额外 QUIC 使用 Control 真实 outbound 方向。**七组 CI 通过并已合并**，提交 `cad81b6`。
+- [SDK PR #61](https://github.com/juezhong/p2p-sdk/pull/61)：STUN 首个有效候选触发短等待、异步网关映射任务后到清理、避免慢响应拖长邀请码生成。**当前尚在 CI 验收，未合并**。
+- 仍待做：跨 ICE/QUIC 候选失败回退（B3/B6）、LAN 优先但不同私网不误判（A5/B4）、全球 IPv6 优先与单侧 IPv6 防火墙（B5/B8）、JOIN 没有 Punch 但已出现安全入站 QUIC 的补充流程（A12）、网关动态变化和真实资源清理/长时间测试（D7/D9/D11/D12）。
