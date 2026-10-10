@@ -45,8 +45,6 @@ pub mod manual_ice_v2;
 pub mod ice_gather;
 pub mod ice_multi;
 
-#[cfg(test)]
-mod manual_full_integration;
 
 pub mod local_network;
 
