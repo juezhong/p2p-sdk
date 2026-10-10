@@ -42,6 +42,12 @@ Transfer 自己决定是否使用 **四条 Data QUIC**，并定义其业务 `Dat
 - 内部认证、候选检查和套接字所有权不允许为了代码减少而降低安全约束。
 - 重复连接生命周期与遗留文档随迁移删除，不做与 Go 网络行为无关的增强。
 
+## 6. 代码实施记录（以 PR 当前状态为准）
+
+- **#47–#53**：SDK 统一连接入口、Go 对照的动态 ICE、默认 Control-only、按需额外 QUIC、诊断、双栈与安全 API 已逐步合并；跨平台 CI 成功不代替公网 NAT/故障现场。
+- **[#54](https://github.com/juezhong/p2p-sdk/pull/54)**：新增 `ManagedAuthenticatedLink`，为**单条应用按需申请的 Data QUIC**提供监测、退避重拨、重新 mTLS/Session HMAC、可订阅的 `Connected/Reconnecting/ControlLost` 状态。可以创建多个实例，没有 SDK 四路调度或文件协议。**是否已进入 main 以该 PR 的最新 CI / merge 状态为准。**
+- **Transfer**：仍锁定旧 SDK revision，文件传输逻辑尚未迁移到通用 API；不能把新 SDK 接口等同于 Transfer 已升级。只有 Transfer 单独完成迁移并验收后，才移除旧 `ResilientDataLanes` 兼容层。
+
 ## 5. 尚未宣称 Go 对等的硬条件
 
 尽管 SDK #47–#53 改进统一入口、动态 prflx、双栈、公网映射、诊断、认证与超时，仍须继续对照 Go 的双向 QUIC 竞速、候选排序与动态更新、STUN/网关并行采集时序，并完成物理多网卡/NAT/IPv6 防火墙/映射变化和 2h/24h 保活及断网故障注入。
