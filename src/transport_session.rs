@@ -30,7 +30,7 @@ pub enum TransportError {
     Timeout,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TransportDiagnostic {
     pub actual_local_udp: SocketAddr,
     pub actual_remote_udp: SocketAddr,
