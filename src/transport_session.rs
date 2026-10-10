@@ -95,24 +95,7 @@ impl ConnectedTransportPeer {
         }
         if deadline.is_zero() { return Err(TransportError::Timeout); }
         let remote = self.path.selected.path.remote;
-        let mut dedicated = None;
-        if let Some(tls) = self.client_tls.clone() {
-            if let Ok(mut owner) = UdpOwner::bind(SocketAddr::new(
-                self.path.selected.path.local.ip(), 0,
-            )).await {
-                if let Ok(adapter) = QuinnUdpAdapter::from_owner(&mut owner) {
-                    if let Some(runtime) = quinn::default_runtime() {
-                        if let Ok(mut endpoint) = Endpoint::new_with_abstract_socket(
-                            demux_endpoint_config(), None, Arc::new(adapter), runtime,
-                        ) {
-                            endpoint.set_default_client_config(tls);
-                            dedicated = Some((owner, endpoint));
-                        }
-                    }
-                }
-            }
-        }
-        if let Some((owner, endpoint)) = dedicated {
+        if let Some((owner, endpoint)) = self.try_dedicated_endpoint().await {
             let attempt = self.authenticated_dial(&endpoint, remote);
             let result = tokio::select! {
                 _ = self.control.closed() => return Err(TransportError::ControlDisconnected),
@@ -156,6 +139,20 @@ impl ConnectedTransportPeer {
             ChannelRole::Data, &self.replay_guard, deadline).await
             .map_err(|_| TransportError::Authentication)?;
         Ok(self.supervise_data(connection, None, None))
+    }
+
+    async fn try_dedicated_endpoint(&self) -> Option<(UdpOwner, Endpoint)> {
+        let tls = self.client_tls.clone()?;
+        let mut owner = UdpOwner::bind(SocketAddr::new(
+            self.path.selected.path.local.ip(), 0,
+        )).await.ok()?;
+        let adapter = QuinnUdpAdapter::from_owner(&mut owner).ok()?;
+        let runtime = quinn::default_runtime()?;
+        let mut endpoint = Endpoint::new_with_abstract_socket(
+            demux_endpoint_config(), None, Arc::new(adapter), runtime,
+        ).ok()?;
+        endpoint.set_default_client_config(tls);
+        Some((owner, endpoint))
     }
 
     async fn authenticated_dial(
