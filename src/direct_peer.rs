@@ -356,9 +356,7 @@ async fn wait_for_authenticated_creator(
         let guard = Arc::clone(replay_guard);
         listeners.spawn(async move {
             loop {
-                let Some(connecting) = endpoint.accept().await else {
-                    return None;
-                };
+                let connecting = endpoint.accept().await?;
                 let Ok(Ok(connection)) = timeout(AUTH_DEADLINE, connecting).await else {
                     continue;
                 };
@@ -1192,7 +1190,7 @@ mod tests {
                 source: actual,
                 bytes: AuthenticatedPunch::new(
                     right.credentials.clone(), IceRole::Controlled
-                ).make_packet(unix_seconds().unwrap()).unwrap(),
+                ).make_packet(unix_seconds().unwrap()).unwrap().to_vec(),
             };
             let recv_proof = right.credentials.clone();
             let recv_pin = right.remote_pin;
