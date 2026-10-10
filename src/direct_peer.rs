@@ -723,6 +723,11 @@ async fn race_authenticated_control(
             loser.close(0u32.into(), b"Control race loser");
         }
     }
+    #[cfg(test)]
+    if !matches!(result, Ok(Ok(_))) {
+        eprintln!("sdk-quic-race: role={role:?} socket={:?} remote={remote} result={:?}",
+            endpoint.local_addr(), result.as_ref().map(|inner| inner.as_ref().map(|_| "connected")));
+    }
     result.unwrap_or(Err(DirectPeerError::QuicHandshake))
 }
 
@@ -787,6 +792,8 @@ async fn authenticate_on_path(
         ).await {
             Ok(result) => result,
             Err(error) => {
+                #[cfg(test)]
+                eprintln!("sdk-quic-race: role={role:?} failed nominated={remote}: {error:?}");
                 endpoint.close(1u32.into(), b"Control authentication failed");
                 return Err(error);
             }
@@ -969,6 +976,9 @@ async fn connect_authenticated_transport(
             path = candidates.next(), if !ice_exhausted => {
                 match path {
                     Some(path) => {
+                        #[cfg(test)]
+                        eprintln!("sdk-quic-race: role={role:?} ICE nominated owner={} remote={}",
+                            path.selected.owner.handle.local_address(), path.nominated().remote);
                         let bound = path.selected.owner.handle.local_address();
                         let prepared_endpoint = prebound_endpoints.remove(&bound);
                         let prepared_control = if early_control.as_ref()
@@ -1003,6 +1013,11 @@ async fn connect_authenticated_transport(
             result = in_flight.join_next(), if !in_flight.is_empty() => {
                 match result {
                     Some(Ok(Ok(authenticated))) => {
+                        #[cfg(test)]
+                        eprintln!("sdk-quic-race: role={role:?} QUIC authenticated owner={} nominated={} connected={} outbound={}",
+                            authenticated.0.selected.owner.handle.local_address(),
+                            authenticated.0.nominated().remote,
+                            authenticated.2.remote_address(), authenticated.3);
                         if role == IceRole::Controlled {
                             break Ok(authenticated);
                         }
@@ -1024,8 +1039,16 @@ async fn connect_authenticated_transport(
                             Instant::now() + PATH_PREFERENCE_GRACE,
                         );
                     }
-                    Some(Ok(Err(error))) => last_failure = error,
-                    _ => last_failure = DirectPeerError::QuicHandshake,
+                    Some(Ok(Err(error))) => {
+                        #[cfg(test)]
+                        eprintln!("sdk-quic-race: role={role:?} QUIC candidate failed: {error:?}");
+                        last_failure = error;
+                    }
+                    unexpected => {
+                        #[cfg(test)]
+                        eprintln!("sdk-quic-race: role={role:?} candidate task ended: {unexpected:?}");
+                        last_failure = DirectPeerError::QuicHandshake;
+                    },
                 }
             }
             _ = tokio::time::sleep_until(
