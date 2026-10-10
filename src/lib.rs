@@ -45,8 +45,6 @@ pub mod manual_ice_v2;
 pub mod ice_gather;
 pub mod ice_multi;
 
-#[cfg(test)]
-mod manual_full_integration;
 
 pub mod local_network;
 
@@ -78,9 +76,5 @@ pub mod upnp_lease;
 pub mod pcp;
 pub mod pcp_lease;
 
-/// 为尚未迁移的 Transfer 调用者保留的旧连接池接口。
-/// 新 SDK 应用应使用 transport_session 中的通用认证连接 API。
-#[doc(hidden)]
-pub mod resilient_data;
 pub mod punch;
 pub mod punch_loop;
