@@ -13,15 +13,15 @@
 
 use std::{collections::HashSet, net::SocketAddr, time::Duration};
 
-use tokio::task::JoinSet;
+use tokio::{task::JoinSet, time::{Instant, sleep_until}};
 
 use crate::{
     ice_agent::NominatedPath,
-    ice_gather::{gather, add_portmapped_candidate, CandidateGatherError},
+    ice_gather::{gather, add_portmapped_candidate, append_stun_observations, CandidateGatherError},
     gateway::GatewayLease,
     ice_signaling::IceCandidateType,
     ice_multi::{nominate_direct_candidates, nominate_with_authenticated_punch},
-    multi_stun::MappingReport,
+    multi_stun::{query_via_owner, MappingReport, MappingConsistency},
     ice_signaling::{IceDescription, IceRole, MAX_CANDIDATES},
     punch::AuthenticatedPunch,
     session_binding::SessionCredentials,
@@ -104,28 +104,78 @@ pub async fn gather_interfaces_with_mapping(
         jobs.spawn(async move {
             let owner = UdpOwner::bind(address).await.map_err(|_| MultiInterfaceError::Bind)?;
             let local = owner.handle.local_address();
-            let mapping = async {
-                if let SocketAddr::V4(v4) = local {
-                    if !mapping_budget.is_zero() {
-                        return GatewayLease::start_for_socket(
+            // 首先创建 Host 候选和 ICE 凭据，STUN 与网关从同一 UDP Owner
+            // 并发收集。不能因慢服务端阻塞已经可用的候选。
+            let mut discovered = gather(&owner.handle, &[], role, timeout).await
+                .map_err(MultiInterfaceError::Candidate)?;
+            let stun_budget = timeout.min(Duration::from_millis(1200));
+            let mut stun_query = Box::pin(async {
+                if stun.is_empty() { None }
+                else { query_via_owner(&owner.handle, &stun, stun_budget).await.ok() }
+            });
+            // 不取消可能已在路由器建立规则的端口映射任务。
+            // 如果窗口结束后结果才回来，由 worker 主动释放，避免泄漏。
+            let (map_tx, map_rx) = tokio::sync::oneshot::channel();
+            if let SocketAddr::V4(v4) = local {
+                if !mapping_budget.is_zero() {
+                    tokio::spawn(async move {
+                        let lease = GatewayLease::start_for_socket(
                             v4, Duration::from_secs(3600), mapping_budget,
                         ).await.ok();
-                    }
+                        if let Err(Some(late)) = map_tx.send(lease) {
+                            let _ = late.shutdown().await;
+                        }
+                    });
                 }
-                None
-            };
-            let (discovered, mut lease) = tokio::join!(
-                gather(&owner.handle, &stun, role, timeout), mapping,
-            );
-            let discovered = match discovered {
-                Ok(value) => value,
-                Err(error) => {
-                    if let Some(mapping) = lease.take() {
-                        let _ = mapping.shutdown().await;
+            }
+            // 对无网关映射的地址，仅需要收集 STUN/Host。
+            let mapping_enabled = local.is_ipv4() && !mapping_budget.is_zero();
+            let mut map_query = Box::pin(async {
+                if mapping_enabled { map_rx.await.ok().flatten() }
+                else { None }
+            });
+            let mut stun_done = false;
+            let mut map_done = false;
+            let mut lease = None;
+            let hard_deadline = Instant::now() + timeout.max(mapping_budget);
+            let mut soft_deadline: Option<Instant> = None;
+            loop {
+                if stun_done && map_done { break; }
+                tokio::select! {
+                    report = &mut stun_query, if !stun_done => {
+                        stun_done = true;
+                        if let Some(report) = report {
+                            if !report.observations.is_empty() {
+                                append_stun_observations(
+                                    &mut discovered.description.candidates, local, &report,
+                                );
+                                let grace = if report.consistency() == MappingConsistency::Different {
+                                    Duration::from_millis(420)
+                                } else {
+                                    Duration::from_millis(180)
+                                };
+                                discovered.mapping = Some(report);
+                                soft_deadline.get_or_insert(Instant::now() + grace);
+                            }
+                        }
                     }
-                    return Err(MultiInterfaceError::Candidate(error));
+                    result = &mut map_query, if !map_done => {
+                        map_done = true;
+                        if let Some(result) = result {
+                            lease = Some(result);
+                            soft_deadline.get_or_insert(
+                                Instant::now() + Duration::from_millis(180)
+                            );
+                        }
+                    }
+                    _ = sleep_until(soft_deadline.unwrap_or(hard_deadline)),
+                        if soft_deadline.is_some() => { break; }
+                    _ = sleep_until(hard_deadline) => { break; }
                 }
-            };
+            }
+            // 终止尚未完成的 STUN 查询；未接收的网关成功租约会在后台清理。
+            drop(stun_query);
+            drop(map_query);
             let mut local_description = discovered.description;
             if let Some(mapping) = lease.as_ref() {
                 if let Some(external) = mapping.subscribe().mapped_address() {
