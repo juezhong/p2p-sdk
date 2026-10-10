@@ -60,6 +60,16 @@ jobs:
             sdk-source-${{ runner.os }}-${{ runner.arch }}-
       - name: Compile and test SDK on native OS / CPU
         run: cargo test --all-targets
+      # 多 UDP socket QUIC 竞速在 Apple Silicon 曾偶发失败。
+      # 重复运行真实连接/释放测试，不禁用测试、不延长程序超时。
+      - name: Stress multi-owner QUIC race and socket release (macOS ARM64)
+        if: matrix.os == 'macos-latest'
+        shell: bash
+        run: |
+          for run in 1 2 3 4 5 6 7 8; do
+            echo "QUIC race / socket-release stress iteration ${run}/8"
+            cargo test --lib direct_peer::tests::quic_path_race_shutdown_releases_all_advertised_udp_ports -- --exact
+          done
 
   musl:
     name: SDK static musl compile (${{ matrix.target }})
