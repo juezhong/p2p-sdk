@@ -5,7 +5,6 @@ mod tests {
     use std::{net::SocketAddr, sync::Arc, time::Duration};
 
     use crate::{begin_creator, begin_joiner};
-    use tokio::io::AsyncWriteExt;
 
     #[tokio::test]
     async fn confirmed_manual_pairing_builds_one_control_and_optional_authenticated_data() {
