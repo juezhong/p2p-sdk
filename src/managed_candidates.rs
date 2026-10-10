@@ -59,7 +59,7 @@ impl ManagedCandidates {
                 jobs.spawn(async move {
                     let lease = GatewayLease::start_for_socket(
                         v4, Duration::from_secs(3600),
-                        map_budget.min(Duration::from_millis(350)),
+                        map_budget.min(Duration::from_millis(900)),
                     ).await;
                     (index, local, lease)
                 });
@@ -94,6 +94,18 @@ impl ManagedCandidates {
             }
             // An unadvertised successful mapping must not be left alive.
             tokio::spawn(async move { let _ = lease.shutdown().await; });
+        }
+        // The global gather deadline is not permission to abort a gateway
+        // transaction after it has installed a mapping. Drain late replies
+        // separately, explicitly deleting all mappings too late to advertise.
+        if !jobs.is_empty() {
+            tokio::spawn(async move {
+                while let Some(result) = jobs.join_next().await {
+                    if let Ok((_, _, Ok(lease))) = result {
+                        let _ = lease.shutdown().await;
+                    }
+                }
+            });
         }
         Ok(Self { candidates: set, leases })
     }
