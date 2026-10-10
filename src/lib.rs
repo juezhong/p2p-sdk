@@ -59,8 +59,6 @@ pub mod gateway;
 mod udp_errors;
 pub mod managed_candidates;
 pub mod network_diagnostics;
-#[doc(hidden)]
-pub mod live_session;
 pub mod direct_peer;
 /// Generic Control-only network session with opt-in authenticated QUIC links.
 pub mod transport_session;
