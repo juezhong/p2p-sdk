@@ -4,12 +4,12 @@
 //! ICE nomination, mutual TLS, authenticated Control/Data, and Data repair.
 //! User confirmation of the pairing remains a mandatory explicit gate.
 
-use std::{collections::VecDeque, net::SocketAddr, sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}};
+use std::{collections::{HashSet, VecDeque}, net::SocketAddr, sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}};
 use tokio::{task::JoinSet, time::{timeout, Instant}};
 use is::{stun::{StunMessage, StunPacket}, Candidate, IceAgent, Protocol};
 
 use crate::{
-    ice_signaling::{IceDescription, IceRole, IceCandidateType},
+    ice_signaling::{IceDescription, IceRole, IceCandidate, IceCandidateType, MAX_CANDIDATES},
     ice_agent::credentials_from_description,
     udp_owner::InboundDatagram,
     local_network::local_addresses,
@@ -494,6 +494,13 @@ fn quic_candidate_destinations(
     destinations
 }
 
+/// 同一 UDP Owner 上的动态 ICE 复验状态；只有提名成功的地址进入白名单。
+struct DynamicIcePath<'a> {
+    owner: &'a mut crate::udp_owner::UdpOwner,
+    local: &'a IceDescription,
+    verified: Arc<std::sync::Mutex<HashSet<SocketAddr>>>,
+}
+
 async fn race_authenticated_control(
     endpoint: &quinn::Endpoint,
     remote: SocketAddr,
@@ -501,7 +508,181 @@ async fn race_authenticated_control(
     pairing: &ManualPairing,
     role: IceRole,
     replay_guard: Arc<ReplayGuard>,
+    dynamic_path: Option<DynamicIcePath<'_>>,
 ) -> Result<(quinn::Connection, bool), DirectPeerError> {
+    let (verified_tx, mut verified_rx) =
+        tokio::sync::mpsc::channel::<SocketAddr>(MAX_CANDIDATES);
+    let late_whitelist = dynamic_path.as_ref().map(|path| Arc::clone(&path.verified));
+    let mut checking_active = dynamic_path.is_some();
+    let dynamic_ice = async {
+        match dynamic_path {
+            Some(path) => {
+                let proof = AuthenticatedPunch::new(
+                    pairing.credentials.clone(), role,
+                );
+                let _ = crate::ice_multi::verify_dynamic_peer_reflexive(
+                    path.owner, path.local, advertised, &proof, verified_tx, QUIC_ACCEPT,
+                ).await;
+            }
+            None => std::future::pending::<()>().await,
+        }
+    };
+    tokio::pin!(dynamic_ice);
+    if role == IceRole::Controlled {
+        // JOIN 不得在 Creator 完成全局路径竞速前选定第一条已认证 QUIC。
+        // 同一 UDP Owner 可能同时与多个远端端口成功认证，只有在其中
+        // 一条连接收到 Creator 的 CONTROL_PATH_SELECTED 后才能对外宣告。
+        let expires = Instant::now() + QUIC_ACCEPT;
+        let destinations = quic_candidate_destinations(remote, advertised);
+        let mut backlog: VecDeque<_> = destinations.iter().copied().collect();
+        let mut allowed = destinations.iter().copied().collect::<HashSet<_>>();
+        let mut validated_late = Vec::new();
+        let mut verified_open = true;
+        let mut dialing = JoinSet::new();
+        let mut accepting = JoinSet::new();
+        let mut selected = JoinSet::new();
+        let mut active = Vec::<(usize, quinn::Connection)>::new();
+        let mut next_id = 0usize;
+        let mut periodic = tokio::time::interval(Duration::from_millis(180));
+        periodic.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut chosen = None;
+        loop {
+            while dialing.len() < 4 {
+                let Some(address) = backlog.pop_front() else { break };
+                let ep = endpoint.clone();
+                let credentials = pairing.credentials.clone();
+                let pin = pairing.remote_tls_cert_sha256;
+                dialing.spawn(async move {
+                    let conn = timeout(Duration::from_secs(3), async {
+                        ep.connect(address, "localhost")
+                            .map_err(|_| DirectPeerError::QuicHandshake)?
+                            .await.map_err(|_| DirectPeerError::QuicHandshake)
+                    }).await.ok()?.ok()?;
+                    let verified = PeerCertificatePin::new(pin).ok()
+                        .is_some_and(|p| p.verify_connection(&conn).is_ok());
+                    if verified && authenticate_initiator(
+                        conn.clone(), &credentials, ChannelRole::Control, AUTH_DEADLINE,
+                    ).await.is_ok() {
+                        Some((conn, true))
+                    } else {
+                        conn.close(1u32.into(), b"untrusted outbound Control");
+                        None
+                    }
+                });
+            }
+            tokio::select! {
+                _ = &mut dynamic_ice, if checking_active => {
+                    checking_active = false;
+                }
+                verified = verified_rx.recv(), if verified_open => {
+                    match verified {
+                        Some(address) if address.is_ipv4() == remote.is_ipv4()
+                            && validated_late.len() < MAX_CANDIDATES
+                            && allowed.insert(address) => {
+                            if let Some(whitelist) = late_whitelist.as_ref() {
+                                if let Ok(mut set) = whitelist.lock() {
+                                    set.insert(address);
+                                }
+                            }
+                            validated_late.push(address);
+                            backlog.push_back(address);
+                        }
+                        Some(_) => {}
+                        None => verified_open = false,
+                    }
+                }
+                result = dialing.join_next(), if !dialing.is_empty() => {
+                    if let Some(Ok(Some((connection, outbound)))) = result {
+                        next_id += 1;
+                        let id = next_id;
+                        active.push((id, connection.clone()));
+                        selected.spawn(async move {
+                            let selected = tokio::time::timeout_at(expires, async {
+                                let mut stream = connection.accept_uni().await.ok()?;
+                                let message = stream.read_to_end(48).await.ok()?;
+                                (message.as_slice() == CONTROL_PATH_SELECTED).then_some(())
+                            }).await;
+                            if matches!(selected, Ok(Some(()))) {
+                                Some((id, connection, outbound))
+                            } else {
+                                connection.close(1u32.into(), b"Control path not selected");
+                                None
+                            }
+                        });
+                    }
+                }
+                incoming = endpoint.accept(), if accepting.len() < MAX_PENDING_INBOUND_AUTH => {
+                    if let Some(incoming) = incoming {
+                        let credentials = pairing.credentials.clone();
+                        let guard = Arc::clone(&replay_guard);
+                        let pin = pairing.remote_tls_cert_sha256;
+                        accepting.spawn(async move {
+                            let Ok(Ok(connection)) = timeout(AUTH_DEADLINE, incoming).await
+                                else { return None };
+                            let verified = PeerCertificatePin::new(pin).ok()
+                                .is_some_and(|p| p.verify_connection(&connection).is_ok());
+                            if verified && authenticate_responder(
+                                connection.clone(), &credentials, ChannelRole::Control,
+                                &guard, AUTH_DEADLINE,
+                            ).await.is_ok() {
+                                Some((connection, false))
+                            } else {
+                                connection.close(1u32.into(), b"untrusted inbound Control");
+                                None
+                            }
+                        });
+                    }
+                }
+                result = accepting.join_next(), if !accepting.is_empty() => {
+                    if let Some(Ok(Some((connection, outbound)))) = result {
+                        next_id += 1;
+                        let id = next_id;
+                        active.push((id, connection.clone()));
+                        selected.spawn(async move {
+                            let selected = tokio::time::timeout_at(expires, async {
+                                let mut stream = connection.accept_uni().await.ok()?;
+                                let message = stream.read_to_end(48).await.ok()?;
+                                (message.as_slice() == CONTROL_PATH_SELECTED).then_some(())
+                            }).await;
+                            if matches!(selected, Ok(Some(()))) {
+                                Some((id, connection, outbound))
+                            } else {
+                                connection.close(1u32.into(), b"Control path not selected");
+                                None
+                            }
+                        });
+                    }
+                }
+                result = selected.join_next(), if !selected.is_empty() => {
+                    if let Some(Ok(Some(winner))) = result {
+                        chosen = Some(winner);
+                        break;
+                    }
+                }
+                _ = periodic.tick() => {
+                    if dialing.is_empty() && backlog.is_empty() {
+                        backlog.extend(destinations.iter().copied());
+                        backlog.extend(validated_late.iter().copied());
+                    }
+                }
+                _ = tokio::time::sleep_until(expires) => break,
+            }
+        }
+        dialing.abort_all();
+        accepting.abort_all();
+        selected.abort_all();
+        while dialing.join_next().await.is_some() {}
+        while accepting.join_next().await.is_some() {}
+        while selected.join_next().await.is_some() {}
+        let selected_id = chosen.as_ref().map(|(id, _, _)| *id);
+        for (id, connection) in active {
+            if Some(id) != selected_id {
+                connection.close(0u32.into(), b"unselected authenticated Control");
+            }
+        }
+        return chosen.map(|(_, connection, outbound)| (connection, outbound))
+            .ok_or(DirectPeerError::QuicHandshake);
+    }
     let mut workers = JoinSet::new();
     let outgoing = endpoint.clone();
     let credentials = pairing.credentials.clone();
@@ -514,6 +695,9 @@ async fn race_authenticated_control(
     workers.spawn(async move {
         let expires = Instant::now() + QUIC_ACCEPT;
         let mut backlog: VecDeque<_> = dial_addrs.iter().copied().collect();
+        let mut scheduled = dial_addrs.iter().copied().collect::<HashSet<_>>();
+        let mut verified_late = Vec::new();
+        let mut verified_open = true;
         let mut attempts = JoinSet::new();
         loop {
             while attempts.len() < 4 {
@@ -545,26 +729,42 @@ async fn race_authenticated_control(
                     }
                 });
             }
-            if attempts.is_empty() && backlog.is_empty() {
-                if Instant::now() >= expires {
-                    return Err(DirectPeerError::QuicHandshake);
-                }
-                tokio::time::sleep(Duration::from_millis(180)).await;
-                backlog.extend(dial_addrs.iter().copied());
-                continue;
-            }
-            match tokio::time::timeout_at(expires, attempts.join_next()).await {
-                Ok(Some(Ok(Ok(authenticated)))) => {
-                    attempts.abort_all();
-                    while let Some(result) = attempts.join_next().await {
-                        if let Ok(Ok((loser, _))) = result {
-                            loser.close(0u32.into(), b"outbound QUIC race loser");
+            tokio::select! {
+                verified = verified_rx.recv(), if verified_open => {
+                    match verified {
+                        Some(address) if address.is_ipv4() == remote.is_ipv4()
+                            && verified_late.len() < MAX_CANDIDATES
+                            && scheduled.insert(address) => {
+                            // 只有 ICE nominated event 才会发送到这个通道。
+                            if let Some(whitelist) = late_whitelist.as_ref() {
+                                if let Ok(mut verified) = whitelist.lock() {
+                                    verified.insert(address);
+                                }
+                            }
+                            verified_late.push(address);
+                            backlog.push_back(address);
                         }
+                        Some(_) => {}
+                        None => verified_open = false,
                     }
-                    return Ok(authenticated);
                 }
-                Ok(Some(_)) => {}
-                _ => {
+                result = attempts.join_next(), if !attempts.is_empty() => {
+                    if let Some(Ok(Ok(authenticated))) = result {
+                        attempts.abort_all();
+                        while let Some(result) = attempts.join_next().await {
+                            if let Ok(Ok((loser, _))) = result {
+                                loser.close(0u32.into(), b"outbound QUIC race loser");
+                            }
+                        }
+                        return Ok(authenticated);
+                    }
+                }
+                _ = tokio::time::sleep(Duration::from_millis(180)),
+                    if attempts.is_empty() && backlog.is_empty() => {
+                    backlog.extend(dial_addrs.iter().copied());
+                    backlog.extend(verified_late.iter().copied());
+                }
+                _ = tokio::time::sleep_until(expires) => {
                     attempts.abort_all();
                     while let Some(result) = attempts.join_next().await {
                         if let Ok(Ok((loser, _))) = result {
@@ -638,6 +838,10 @@ async fn race_authenticated_control(
         let mut fallback_deadline: Option<Instant> = None;
         loop {
             tokio::select! {
+                _ = &mut dynamic_ice, if checking_active => {
+                    // 即使没有新路径或 ICE 复验失败，也继续既有 QUIC 路径。
+                    checking_active = false;
+                }
                 result = workers.join_next() => {
                     match result {
                         Some(Ok(Ok((connection, outbound)))) => {
@@ -674,6 +878,11 @@ async fn race_authenticated_control(
             loser.close(0u32.into(), b"Control race loser");
         }
     }
+    #[cfg(test)]
+    if !matches!(result.as_ref(), Ok(Ok(_))) {
+        eprintln!("sdk-quic-race: role={role:?} socket={:?} remote={remote} result={:?}",
+            endpoint.local_addr(), result.as_ref().map(|inner| inner.as_ref().map(|_| "connected")));
+    }
     result.unwrap_or(Err(DirectPeerError::QuicHandshake))
 }
 
@@ -683,12 +892,19 @@ async fn authenticate_on_path(
     mut path: ManagedPath,
     tls: (quinn::ClientConfig, quinn::ServerConfig),
     pairing: ManualPairing,
-    advertised: IceDescription,
+    descriptions: (IceDescription, IceDescription),
     role: IceRole,
     replay_guard: Arc<ReplayGuard>,
     prebound: Option<(quinn::Endpoint, Option<quinn::Connection>)>,
 ) -> Result<(ManagedPath, quinn::Endpoint, quinn::Connection, bool), DirectPeerError> {
     let (client_tls, server_tls) = tls;
+    let (mut local_ice, advertised) = descriptions;
+    // ICE 新候选必须关联当前真实 UDP Owner，不能借用其它 NIC 的 host。
+    local_ice.candidates = vec![IceCandidate {
+        address: path.selected.owner.handle.local_address(),
+        kind: IceCandidateType::Host,
+        priority: 100,
+    }];
     let (prebound_endpoint, preauthenticated_control) = match prebound {
         Some((endpoint, control)) => (Some(endpoint), control),
         None => (None, None),
@@ -717,22 +933,36 @@ async fn authenticate_on_path(
             None
         }
     });
+    let dynamic_verified = Arc::new(std::sync::Mutex::new(HashSet::new()));
+    let selection_received_in_race = role == IceRole::Controlled
+        && nominated_prebound.is_none();
     let (control, outbound) = if let Some(connection) = nominated_prebound {
         (connection, false)
     } else {
         match race_authenticated_control(
             &endpoint, remote, &advertised, &pairing, role, replay_guard,
+            Some(DynamicIcePath {
+                owner: &mut path.selected.owner,
+                local: &local_ice,
+                verified: Arc::clone(&dynamic_verified),
+            }),
         ).await {
             Ok(result) => result,
             Err(error) => {
+                #[cfg(test)]
+                eprintln!("sdk-quic-race: role={role:?} failed nominated={remote}: {error:?}");
                 endpoint.close(1u32.into(), b"Control authentication failed");
                 return Err(error);
             }
         }
     };
     let actual_remote = control.remote_address();
-    if outbound && actual_remote != remote
+    let nominated_late = dynamic_verified.lock().is_ok_and(|verified|
+        verified.contains(&actual_remote)
+    );
+    if actual_remote != remote
         && !advertised.candidates.iter().any(|candidate| candidate.address == actual_remote)
+        && !nominated_late
     {
         control.close(1u32.into(), b"unadvertised remote address");
         return Err(DirectPeerError::LiveSession);
@@ -742,7 +972,7 @@ async fn authenticate_on_path(
     path.selected.path.remote = actual_remote;
     // 创建方最终决定使用哪条已认证路径；加入方只有收到该
     // QUIC 内的选择消息才返回同一条 Control，防止多路竞速两端各选一条。
-    if role == IceRole::Controlled {
+    if role == IceRole::Controlled && !selection_received_in_race {
         let selected = timeout(QUIC_ACCEPT, async {
             let mut stream = control.accept_uni().await
                 .map_err(|_| DirectPeerError::QuicHandshake)?;
@@ -879,6 +1109,7 @@ async fn connect_authenticated_transport(
     } else {
         None
     };
+    let shared_local_ice = gathered.candidates.combined.clone();
     let mut candidates = gathered.start_authenticated_path_race(
         &remote, pairing.credentials.clone(), ICE_CHECK,
     ).map_err(|_| DirectPeerError::IceCheck)?;
@@ -902,6 +1133,9 @@ async fn connect_authenticated_transport(
             path = candidates.next(), if !ice_exhausted => {
                 match path {
                     Some(path) => {
+                        #[cfg(test)]
+                        eprintln!("sdk-quic-race: role={role:?} ICE nominated owner={} remote={}",
+                            path.selected.owner.handle.local_address(), path.nominated().remote);
                         let bound = path.selected.owner.handle.local_address();
                         let prepared_endpoint = prebound_endpoints.remove(&bound);
                         let prepared_control = if early_control.as_ref()
@@ -921,9 +1155,11 @@ async fn connect_authenticated_transport(
                         };
                         let guard = Arc::clone(&replay_guard);
                         let offered = remote.clone();
+                        let local_ice = shared_local_ice.clone();
                         in_flight.spawn(async move {
                             authenticate_on_path(
-                                path, (cert, server), binding, offered, role, guard,
+                                path, (cert, server), binding,
+                                (local_ice, offered), role, guard,
                                 prepared_endpoint.map(|endpoint| (endpoint, prepared_control)),
                             ).await
                         });
@@ -934,6 +1170,11 @@ async fn connect_authenticated_transport(
             result = in_flight.join_next(), if !in_flight.is_empty() => {
                 match result {
                     Some(Ok(Ok(authenticated))) => {
+                        #[cfg(test)]
+                        eprintln!("sdk-quic-race: role={role:?} QUIC authenticated owner={} nominated={} connected={} outbound={}",
+                            authenticated.0.selected.owner.handle.local_address(),
+                            authenticated.0.nominated().remote,
+                            authenticated.2.remote_address(), authenticated.3);
                         if role == IceRole::Controlled {
                             break Ok(authenticated);
                         }
@@ -955,8 +1196,17 @@ async fn connect_authenticated_transport(
                             Instant::now() + PATH_PREFERENCE_GRACE,
                         );
                     }
-                    Some(Ok(Err(error))) => last_failure = error,
-                    _ => last_failure = DirectPeerError::QuicHandshake,
+                    Some(Ok(Err(error))) => {
+                        #[cfg(test)]
+                        eprintln!("sdk-quic-race: role={role:?} QUIC candidate failed: {error:?}");
+                        last_failure = error;
+                    }
+                    Some(Err(_error)) => {
+                        #[cfg(test)]
+                        eprintln!("sdk-quic-race: role={role:?} candidate join error: {_error:?}");
+                        last_failure = DirectPeerError::QuicHandshake;
+                    }
+                    None => last_failure = DirectPeerError::QuicHandshake,
                 }
             }
             _ = tokio::time::sleep_until(
@@ -1160,6 +1410,7 @@ mod tests {
                     &a.endpoint, invalid, &offer, &binding,
                     IceRole::Controlling,
                     Arc::new(ReplayGuard::new(4096).unwrap()),
+                    None,
                 ),
                 async {
                     let connection = b.endpoint.accept().await.unwrap().await.unwrap();
@@ -1220,6 +1471,7 @@ mod tests {
                         &right.endpoint, "127.0.0.1:9".parse().unwrap(),
                         &no_remote_candidates, &pairing, IceRole::Controlled,
                         Arc::new(ReplayGuard::new(4096).unwrap()),
+                        None,
                     ),
                     async {
                         tokio::time::sleep(Duration::from_millis(60)).await;
@@ -1233,6 +1485,11 @@ mod tests {
                             valid.clone(), &left.credentials, ChannelRole::Control,
                             AUTH_DEADLINE,
                         ).await.unwrap();
+                        // 新 Control 协议只允许创建方明确选定的认证连接获胜。
+                        // 未发送 HMAC 的 stalled connection 绝不能阻塞这条选择消息。
+                        let mut choice = valid.open_uni().await.unwrap();
+                        choice.write_all(CONTROL_PATH_SELECTED).await.unwrap();
+                        choice.finish().unwrap();
                         (stalled, valid)
                     },
                 )

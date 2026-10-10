@@ -44,3 +44,8 @@ STUN 是 ICE 使用的协议，既可通过服务器发现映射（srflx），�
 - RFC 8489 STUN: https://www.rfc-editor.org/rfc/rfc8489
 - RFC 8838 Trickle ICE: https://www.rfc-editor.org/rfc/rfc8838
 - RFC 8863 ICE PAC: https://www.rfc-editor.org/rfc/rfc8863
+
+
+## 2026-10-10：QUIC 竞速期间动态 NAT 端口的 ICE 复验
+
+初次 ICE 提名并不终止当前连接竞速的候选发现。被选中的实际 UDP Owner 在 QUIC Dial/Accept 期间继续处理会话认证 HMAC Punch 和 ICE Binding。后续新来源必须先通过 Punch HMAC/角色/时间窗/nonce 检查，再作为候选加入此 Owner 的 ICE Agent；只有 `NominatedSend` 提名才交给 QUIC 重试队列，随后仍需 mTLS PIN 与 Session HMAC。没有 ICE 提名的有效 HMAC 来源不能建立新 Control。全部工作共享有界超时和候选上限，不绑定新的源端口，不增加 Relay。
