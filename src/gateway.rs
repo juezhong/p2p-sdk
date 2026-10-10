@@ -104,35 +104,75 @@ impl GatewayLeaseUpdates {
 }
 
 impl GatewayLease {
-    /// Attempt PCP first, then NAT-PMP if PCP is denied or unavailable.
-    /// Both are bounded and use the OS-default gateway on the actual
-    /// nominated UDP Owner interface. A failure leaves Host/STUN ICE intact.
+    /// Launch PCP, NAT-PMP and UPnP discovery concurrently against the
+    /// validated gateway for this bound UDP Owner. The first successful lease
+    /// wins. Every later successful lease is explicitly released, rather than
+    /// canceling the task in mid-mapping and leaking an unused router rule.
+    ///
+    /// This matches Go's bounded concurrent discovery strategy. ICE must
+    /// independently authenticate and nominate the advertised endpoint.
     pub async fn start_for_socket(
         local: SocketAddrV4,
         lifetime: Duration,
         request_budget: Duration,
     ) -> Result<Self, GatewayError> {
-        let gateway = discover_gateway_for_socket(local)?;
-        let pcp = PcpLease::start(
-            SocketAddr::V4(local), SocketAddr::V4(gateway),
-            lifetime, request_budget,
-        ).await;
-        match pcp {
-            Ok(lease) => Ok(Self::Pcp(lease)),
-            Err(pcp_error) => match NatPmpLease::start(
-                local, gateway, lifetime, request_budget,
-            ).await {
-                Ok(lease) => Ok(Self::NatPmp(lease)),
-                Err(nat_pmp_error) => match UpnpLease::start(
-                    local, gateway, lifetime, request_budget,
-                ).await {
-                    Ok(lease) => Ok(Self::Upnp(lease)),
-                    Err(upnp_error) => Err(GatewayError::NoMapping {
-                        pcp: pcp_error, nat_pmp: nat_pmp_error, upnp: upnp_error,
-                    }),
-                },
-            },
+        if lifetime.is_zero() || request_budget.is_zero() {
+            return Err(GatewayError::InvalidLocalSocket);
         }
+        let gateway = discover_gateway_for_socket(local)?;
+        enum Attempt {
+            Success(GatewayLease),
+            Pcp(PcpError),
+            NatPmp(PortMapError),
+            Upnp(UpnpError),
+        }
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(async move {
+            match PcpLease::start(SocketAddr::V4(local), SocketAddr::V4(gateway),
+                lifetime, request_budget).await {
+                Ok(lease) => Attempt::Success(GatewayLease::Pcp(lease)),
+                Err(error) => Attempt::Pcp(error),
+            }
+        });
+        tasks.spawn(async move {
+            match NatPmpLease::start(local, gateway, lifetime, request_budget).await {
+                Ok(lease) => Attempt::Success(GatewayLease::NatPmp(lease)),
+                Err(error) => Attempt::NatPmp(error),
+            }
+        });
+        tasks.spawn(async move {
+            match UpnpLease::start(local, gateway, lifetime, request_budget).await {
+                Ok(lease) => Attempt::Success(GatewayLease::Upnp(lease)),
+                Err(error) => Attempt::Upnp(error),
+            }
+        });
+        let mut pcp_error = PcpError::Timeout;
+        let mut nat_pmp_error = PortMapError::Timeout;
+        let mut upnp_error = UpnpError::Discovery;
+        while let Some(outcome) = tasks.join_next().await {
+            match outcome {
+                Ok(Attempt::Success(winner)) => {
+                    // Let in-flight mapping operations finish instead of
+                    // aborting them after they created a router lease.
+                    // Any losing success is explicitly deleted.
+                    tokio::spawn(async move {
+                        while let Some(result) = tasks.join_next().await {
+                            if let Ok(Attempt::Success(loser)) = result {
+                                let _ = loser.shutdown().await;
+                            }
+                        }
+                    });
+                    return Ok(winner);
+                }
+                Ok(Attempt::Pcp(err)) => pcp_error = err,
+                Ok(Attempt::NatPmp(err)) => nat_pmp_error = err,
+                Ok(Attempt::Upnp(err)) => upnp_error = err,
+                Err(_) => {}
+            }
+        }
+        Err(GatewayError::NoMapping {
+            pcp: pcp_error, nat_pmp: nat_pmp_error, upnp: upnp_error,
+        })
     }
 
     pub fn subscribe(&self) -> GatewayLeaseUpdates {
