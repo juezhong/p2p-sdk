@@ -19,6 +19,7 @@ use crate::{
     ice_agent::NominatedPath,
     ice_gather::{gather, CandidateGatherError},
     ice_multi::{nominate_direct_candidates, nominate_with_authenticated_punch},
+    multi_stun::MappingReport,
     ice_signaling::{IceDescription, IceRole, MAX_CANDIDATES},
     punch::AuthenticatedPunch,
     session_binding::SessionCredentials,
@@ -41,6 +42,8 @@ pub struct InterfaceOwner {
     pub owner: UdpOwner,
     /// Candidates of this UDP owner only, with the *shared* credentials.
     pub local: IceDescription,
+    /// Preserve real STUN responses for network diagnostics.
+    pub stun_mapping: Option<MappingReport>,
 }
 
 pub struct CandidateSet {
@@ -52,6 +55,7 @@ pub struct CandidateSet {
 pub struct SelectedDirectPath {
     pub owner: UdpOwner,
     pub path: NominatedPath,
+    pub stun_mapping: Option<MappingReport>,
 }
 
 /// Bind one UDP owner per requested local address, concurrently gather Host
@@ -86,6 +90,7 @@ pub async fn gather_interfaces(
             Ok::<_, MultiInterfaceError>((index, InterfaceOwner {
                 owner,
                 local: discovered.description,
+                stun_mapping: discovered.mapping,
             }))
         });
     }
@@ -141,14 +146,14 @@ impl CandidateSet {
                 let result = nominate_direct_candidates(
                     &mut interface.owner, &interface.local, &remote, deadline,
                 ).await;
-                (interface.owner, result)
+                (interface.owner, interface.stun_mapping, result)
             });
         }
         let result = tokio::time::timeout(deadline, async {
             while let Some(joined) = tasks.join_next().await {
-                if let Ok((owner, Ok(path))) = joined {
+                if let Ok((owner, stun_mapping, Ok(path))) = joined {
                     tasks.abort_all();
-                    return Ok(SelectedDirectPath { owner, path });
+                    return Ok(SelectedDirectPath { owner, path, stun_mapping });
                 }
             }
             Err(MultiInterfaceError::NoDirectPath)
@@ -176,14 +181,14 @@ impl CandidateSet {
                 let result = nominate_with_authenticated_punch(
                     &mut interface.owner, &interface.local, &remote, &proof, deadline,
                 ).await;
-                (interface.owner, result)
+                (interface.owner, interface.stun_mapping, result)
             });
         }
         let result = tokio::time::timeout(deadline, async {
             while let Some(joined) = tasks.join_next().await {
-                if let Ok((owner, Ok(path))) = joined {
+                if let Ok((owner, stun_mapping, Ok(path))) = joined {
                     tasks.abort_all();
-                    return Ok(SelectedDirectPath { owner, path });
+                    return Ok(SelectedDirectPath { owner, path, stun_mapping });
                 }
             }
             Err(MultiInterfaceError::NoDirectPath)
