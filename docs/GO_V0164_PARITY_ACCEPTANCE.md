@@ -1,5 +1,18 @@
 # Go p2p-friend v0.16.4 → Rust SDK / Transfer 能力对等验收（阻塞稳定发布）
 
+> **最新核查（2026-10-10）**：下方旧表格保留早期开发历史，`当前状态` 一栏已过期，不得据此判定是否完成。
+> SDK main 在 #47–#52 合并后，已有单 Control QUIC 的通用 API 与认证 ICE / NAT Punch、按需认证 Data 连接、诊断。
+> 这仅表示代码已经合并且跨平台 CI 通过，**目前仍未完成 Go 网络/会话行为全量对等验收**。
+>
+> **确认的功能差异**：Go `connectQUIC`、`waitForPeerThenConnect` 同时发起主动 QUIC Dial 和接受入站 QUIC，并对方向/路径执行仲裁；Rust `connect_transport` 目前仍为创建方 Dial、加入方 Accept 的单向拓扑。
+> Go `gatherCandidates` 在同一预算中并发 STUN 与三种端口映射，Rust `ManagedCandidates::gather` 仍先 STUN 后映射。
+> Go 使用同网段候选的短暂优先窗口，Rust 现行统一入口尚未复刻同等路径排序；真实复杂 NAT / 双栈故障以及长时间运行也没有足够证据。
+>
+> **边界**：四路 Data QUIC 是 Transfer 的应用策略，SDK 只提供安全建连/恢复与诊断的通用能力。
+> `ResilientDataLanes` 是旧调用方兼容接口，不应定义为所有 SDK 使用者必需的连接模型。
+> Go 原版 Control QUIC 失效会结束当前逻辑会话；ICE Restart / 原会话无缝恢复应列为独立增强，而不能冒充 Go 现有行为。
+
+
 目标：实现与 [Go p2p-friend v0.16.4](https://github.com/juezhong/p2p-friend/blob/main/README.md) 一致的**用户可感知行为**，无需兼容 Go 线协议，也不要求 Rust 完全采用 Go 网络算法。支持离线双机手动配对，不使用 TURN/文件中继。不能用本机环回 CI 代替真实网络验收。
 
 ## 三层边界
