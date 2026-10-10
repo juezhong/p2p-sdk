@@ -6,9 +6,12 @@
 
 use std::{collections::VecDeque, net::SocketAddr, sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}};
 use tokio::{task::JoinSet, time::{timeout, Instant}};
+use is::{stun::{StunMessage, StunPacket}, Candidate, IceAgent, Protocol};
 
 use crate::{
     ice_signaling::{IceDescription, IceRole, IceCandidateType},
+    ice_agent::credentials_from_description,
+    udp_owner::InboundDatagram,
     local_network::local_addresses,
     multi_interface::MAX_ACTIVE_INTERFACES,
     managed_candidates::{ManagedCandidates, ManagedPath},
@@ -272,6 +275,45 @@ impl Drop for ConnectPunchSender {
 /// Go v0.16.4 semantics: REPLY generation is not evidence that the creator
 /// has received it. Do not start the finite ICE timeout until an authenticated
 /// packet from the creator has been observed on a real local socket.
+/// 仅由 ICE Agent 对 MESSAGE-INTEGRITY 成功验证的 Binding Request
+/// 才允许唤醒被动 JOIN。单纯收到 STUN/QUIC/源 IP 不触发有限 ICE 超时。
+fn verified_ice_wake_response(
+    local: &IceDescription,
+    remote: &IceDescription,
+    bound: SocketAddr,
+    incoming: &InboundDatagram,
+) -> Option<Vec<u8>> {
+    if incoming.source.is_ipv4() != bound.is_ipv4()
+        || incoming.bytes.len() < 20
+        || incoming.bytes[..2] != [0x00, 0x01]
+    {
+        return None;
+    }
+    let mut agent = IceAgent::new(credentials_from_description(local));
+    agent.set_controlling(local.role == IceRole::Controlling);
+    agent.set_remote_credentials(credentials_from_description(remote));
+    agent.add_local_candidate(Candidate::host(bound, Protocol::Udp).ok()?);
+    // 尚未认证的来源只作为待验证候选提交给临时 ICE Agent，
+    // 只有输出 Binding Success 才说明凭据检查真正通过。
+    agent.add_remote_candidate(Candidate::host(incoming.source, Protocol::Udp).ok()?);
+    let message = StunMessage::parse(&incoming.bytes).ok()?;
+    agent.handle_packet(Instant::now(), StunPacket {
+        proto: Protocol::Udp,
+        source: incoming.source,
+        destination: bound,
+        message,
+    });
+    while let Some(tx) = agent.poll_transmit() {
+        if tx.proto == Protocol::Udp
+            && tx.destination == incoming.source
+            && tx.contents.starts_with(&[0x01, 0x01])
+        {
+            return Some(tx.contents);
+        }
+    }
+    None
+}
+
 async fn wait_for_authenticated_creator(
     gathered: &mut ManagedCandidates,
     pairing: &ManualPairing,
@@ -283,6 +325,23 @@ async fn wait_for_authenticated_creator(
     loop {
         for (interface, proof) in gathered.candidates.interfaces.iter_mut().zip(&proofs) {
             let handle = interface.owner.handle.clone();
+            // 创建方 ICE 检查可能先于 HMAC Punch 到达。验证其 STUN
+            // MESSAGE-INTEGRITY 后立即应答，才解除 JOIN 人工等待。
+            for _ in 0..8 {
+                let packet = match interface.owner.ice_packets.try_recv() {
+                    Ok(packet) => packet,
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) =>
+                        return Err(DirectPeerError::IceCheck),
+                };
+                if let Some(answer) = verified_ice_wake_response(
+                    &interface.local, remote, handle.local_address(), &packet,
+                ) {
+                    handle.send_ice(packet.source, &answer).await
+                        .map_err(|_| DirectPeerError::IceCheck)?;
+                    return Ok(());
+                }
+            }
             let Some(packet) = (match interface.owner.punch_packets.try_recv() {
                 Ok(packet) => Some(packet),
                 Err(tokio::sync::mpsc::error::TryRecvError::Empty) => None,
