@@ -122,7 +122,7 @@ mod tests {
                 demux_endpoint_config(), None, Arc::new(client_socket),
                 quinn::default_runtime().unwrap(),
             ).unwrap();
-            client.set_default_client_config(client_cfg);
+            client.set_default_client_config(client_cfg.clone());
             assert_eq!(client.local_addr().unwrap(), client_ip_port);
             assert_eq!(server.local_addr().unwrap(), server_ip_port);
 
@@ -152,7 +152,16 @@ mod tests {
 
                 // All four independent Data QUICs have completed TLS and
                 // per-connection HMAC proof before the initial lane fails.
-                pool.wait_for_count(4, Duration::from_secs(8)).await.unwrap();
+                let active = pool.wait_for_count(4, Duration::from_secs(8)).await.unwrap();
+                // Four independently authenticated data connections must
+                // arrive from four distinct client UDP source ports, while
+                // the Control QUIC remains on its original source port.
+                let sources = active.iter().map(|conn| conn.remote_address())
+                    .collect::<std::collections::HashSet<_>>();
+                assert_eq!(sources.len(), 4);
+                // Initial Data shares Control's validated UDP socket; three
+                // additional lanes use independent bound source ports.
+                assert!(sources.contains(&secure.control().remote_address()));
                 secure.data().closed().await;
                 let replacement = pool.wait_for_count(4, Duration::from_secs(8))
                     .await.unwrap().into_iter().next().unwrap();
@@ -184,8 +193,9 @@ mod tests {
                 103, Duration::from_secs(5),
             ).await.expect("initiator verified manual session");
             assert_ne!(secure.control().stable_id(), secure.data().stable_id());
-            let pool = ResilientDataLanes::start_creator(
-                &secure, client.clone(), server_ip_port, &client_pairing, 4,
+            let pool = ResilientDataLanes::start_creator_with_independent_udp(
+                &secure, client.clone(), server_ip_port, &client_pairing,
+                client_cfg, 4,
             ).unwrap();
             assert_eq!(pool.wait_for_count(4, Duration::from_secs(8)).await.unwrap().len(), 4);
 
