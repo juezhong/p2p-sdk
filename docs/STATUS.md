@@ -1,5 +1,14 @@
 # 开发交接状态 — p2p-sdk
 
+## 2026-10-10：Go v0.16.4 网络/会话对等修复分支（CI 待验证）
+
+- Go 基准：`p2p-friend@78c6b72`；Rust 最新已合并主线包含 SDK #66（`3f59c2f`），认证 ICE/STUN 可以唤醒被动 JOIN，但尚不能单凭认证 QUIC 唤醒。
+- [SDK #68](https://github.com/juezhong/p2p-sdk/pull/68)（独立 Draft）：多入站 QUIC 并发完成 TLS PIN / Session HMAC，有界 16 个握手；Go 同等的 150ms LAN head-start、600ms 固定方向/路径偏好宽限；显式取消/Join 落选 worker。加入停滞 HMAC 与后续合法入站、失效 NAT 信令端口通过 prflx→ICE→QUIC 的回归。
+- 本分支（叠加 #68，准备独立 PR）：JOIN 在人类交换 REPLY 期间就为每个真实 UDP Owner 创建 Quinn listener；仅经双向 TLS 与 Session HMAC 完全认证的 QUIC 或合法 Punch/ICE 才解除无上限人工等待；在 ICE 提名完成后重用原 UDP endpoint 和可用的早到认证连接，并清理未选中 endpoint/连接。新增 QUIC 先于 Punch/ICE 到达的纯网络回归。
+- **此时只是提交源码和自动化回归；最新 CI 和复杂网络现场验证仍未完成**。不能宣称 full Go parity。尤其继续审计 QUIC 竞速过程中新的动态 prflx 完整重试、多接口不同路由器的真实 NAT、Windows/macOS/ARM64/两个 musl 平台和长时故障恢复。
+- 此两 PR 不修改 Transfer 的四路 Data 应用策略/文件传输业务，不启用 TURN/Relay。#68 合并后应将叠加 PR 重新以 main 为目标，避免重复提交已合并改动。
+
+
 > 状态应随每次开发 PR 更新。**本文件不是运行测试的证据。** 新 Agent 必须重新读取当前分支、打开的 PR 和实际源码。
 
 ## 最新主线核查（2026-10-10）
