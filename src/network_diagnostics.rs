@@ -6,8 +6,10 @@
 use std::net::SocketAddr;
 
 use crate::{
-    ice_signaling::{IceCandidateType, IceDescription},
+    ice_signaling::{IceCandidateType, IceDescription, IceRole},
+    gateway::GatewayLease,
     managed_candidates::ManagedPath,
+    multi_stun::MappingConsistency,
     resilient_data::ResilientDataLanes,
     verified_session::VerifiedManualSession,
 };
@@ -19,11 +21,20 @@ pub enum LinkHealth {
     ControlDisconnected,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GatewayMethod { Pcp, NatPmp, Upnp }
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NetworkDiagnostic {
     /// The actual nominated UDP Owner (not the source of a STUN probe).
     pub local_udp: SocketAddr,
     pub remote_udp: SocketAddr,
+    pub ice_role: IceRole,
+    /// Advertised Host endpoints, not necessarily still-open UDP sockets.
+    pub offered_host_candidates: Vec<SocketAddr>,
+    /// Observed on the exact winning UDP Owner; None means no STUN evidence.
+    pub stun_consistency: Option<MappingConsistency>,
+    pub gateway_method: Option<GatewayMethod>,
     pub remote_candidate_kind: Option<IceCandidateType>,
     pub ipv6: bool,
     pub control_remote_udp: SocketAddr,
@@ -47,6 +58,18 @@ pub async fn snapshot(
     authenticated_sources: &[SocketAddr],
 ) -> NetworkDiagnostic {
     let path = selected.selected.path;
+    let stun_consistency = selected.selected.stun_mapping.as_ref()
+        .map(|report| report.consistency());
+    let gateway_method = selected.mapping_lease.as_ref().map(|lease| match lease {
+        GatewayLease::Pcp(_) => GatewayMethod::Pcp,
+        GatewayLease::NatPmp(_) => GatewayMethod::NatPmp,
+        GatewayLease::Upnp(_) => GatewayMethod::Upnp,
+    });
+    let mut offered_host_candidates = local_description.candidates.iter()
+        .filter(|candidate| candidate.kind == IceCandidateType::Host)
+        .map(|candidate| candidate.address).collect::<Vec<_>>();
+    offered_host_candidates.sort();
+    offered_host_candidates.dedup();
     let control_connected = session.control().close_reason().is_none();
     let base_data_connected = session.data().close_reason().is_none();
     let (desired_data_lanes, active_data_lanes, data_remotes) = match pool {
@@ -85,6 +108,8 @@ pub async fn snapshot(
     };
     NetworkDiagnostic {
         local_udp: path.local, remote_udp: path.remote,
+        ice_role: local_description.role,
+        offered_host_candidates, stun_consistency, gateway_method,
         remote_candidate_kind, ipv6: path.local.is_ipv6(),
         control_remote_udp: session.control().remote_address(),
         control_connected, base_data_connected,
@@ -104,6 +129,10 @@ mod tests {
             local_udp: "192.0.2.3:40001".parse().unwrap(),
             remote_udp: "198.51.100.4:42000".parse().unwrap(),
             remote_candidate_kind: Some(IceCandidateType::PeerReflexive),
+            ice_role: IceRole::Controlling,
+            offered_host_candidates: vec![],
+            stun_consistency: None,
+            gateway_method: None,
             ipv6: false,
             control_remote_udp: "198.51.100.4:42000".parse().unwrap(),
             control_connected: true,
