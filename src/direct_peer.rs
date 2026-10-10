@@ -724,7 +724,7 @@ async fn race_authenticated_control(
         }
     }
     #[cfg(test)]
-    if !matches!(result, Ok(Ok(_))) {
+    if !matches!(result.as_ref(), Ok(Ok(_))) {
         eprintln!("sdk-quic-race: role={role:?} socket={:?} remote={remote} result={:?}",
             endpoint.local_addr(), result.as_ref().map(|inner| inner.as_ref().map(|_| "connected")));
     }
@@ -1044,11 +1044,12 @@ async fn connect_authenticated_transport(
                         eprintln!("sdk-quic-race: role={role:?} QUIC candidate failed: {error:?}");
                         last_failure = error;
                     }
-                    unexpected => {
+                    Some(Err(error)) => {
                         #[cfg(test)]
-                        eprintln!("sdk-quic-race: role={role:?} candidate task ended: {unexpected:?}");
+                        eprintln!("sdk-quic-race: role={role:?} candidate join error: {error:?}");
                         last_failure = DirectPeerError::QuicHandshake;
-                    },
+                    }
+                    None => last_failure = DirectPeerError::QuicHandshake,
                 }
             }
             _ = tokio::time::sleep_until(
