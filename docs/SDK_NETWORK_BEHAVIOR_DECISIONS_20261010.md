@@ -67,4 +67,11 @@
 - [SDK PR #63](https://github.com/juezhong/p2p-sdk/pull/63)：继续处理 Go 的多候选拨号。原已 ICE 提名地址优先尝试，失败后同 socket 竞速其他人工确认信令的合法同族候选；全局限定并发最多 4，且每条 QUIC 都必须重新通过 mTLS PIN + Session HMAC。
 - 实际 QUIC 成功连接到替代 IP/端口后，SDK 使用认证成功的实际远端地址更新所选择的路径，而不是继续向错误的首选 IP 发 Data/Punch。
 - 新增测试：首选 UDP 端口拒绝 QUIC、备用已交换候选可以通过真实 Quinn/mTLS/会话认证；以及候选排序、IPv4/IPv6 家族隔离。
-- **PR #63 当前仍待 CI 与合并**；现场 CGNAT、多层 NAT、家庭 IPv6 防火墙、真实路由器映射变化及多天长时运行仍必须在实际网络设备上比较。
+- **PR #63 七组 CI 均成功，已合并**（`e4a5405`）。现场 CGNAT、多层 NAT、家庭 IPv6 防火墙、真实路由器映射变化及多天长时运行仍必须在实际网络设备上比较。
+
+## 十、取消和失败时的显式网络资源清理
+
+- [SDK PR #64](https://github.com/juezhong/p2p-sdk/pull/64)：在 #62/#63 多路径建连之后，成功/失败/取消都要 `abort_and_join` 未结束的 ICE 和 QUIC tasks，确保 UDP Owner 的主任务已停止。
+- 未入选的 PCP/NAT-PMP/UPnP 租约必须显式 `shutdown().await`（而非只依赖 runtime 中未来某个 task 能执行 Drop 清理）；路径选择消息发送失败、Punch 初始化失败亦要关闭连接并清理获胜租约。
+- 增加没有远端的 ICE 失败时双 UDP Owner 端口可立即复用回归；不允许留下残存 socket 或未释放 GatewayLease worker。
+- **PR #64 仍待跨平台 CI 与主分支合并**。真实路由器删除指令需要现场验收，进程被系统直接杀死无法保证立即删除，租约本身必须保持有限到期时间。
