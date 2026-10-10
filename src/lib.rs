@@ -51,6 +51,8 @@ pub mod managed_candidates;
 pub mod network_diagnostics;
 pub mod live_session;
 pub mod direct_peer;
+/// Generic Control-only network session with opt-in authenticated QUIC links.
+pub mod transport_session;
 pub mod upnp_lease;
 pub mod pcp;
 pub mod pcp_lease;
