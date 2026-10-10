@@ -60,24 +60,7 @@ pub async fn gather(
         // never disable a valid local Host candidate or offline LAN pairing.
         let report = query_via_owner(owner, servers, stun_deadline).await.ok();
         if let Some(report) = report {
-        // Multiple STUN servers can show different external endpoints,
-        // especially on endpoint-dependent mappings: preserve observations.
-        let mut seen: HashSet<SocketAddr> = HashSet::from([local]);
-        for observation in &report.observations {
-            let addr = observation.mapped_address;
-            if addr.port() == 0 || addr.ip().is_unspecified()
-                || addr.ip().is_multicast() || addr.is_ipv4() != local.is_ipv4()
-            {
-                continue;
-            }
-            if seen.insert(addr) && candidates.len() < MAX_CANDIDATES {
-                candidates.push(IceCandidate {
-                    address: addr,
-                    kind: IceCandidateType::ServerReflexive,
-                    priority: SRFLX_PRIORITY,
-                });
-            }
-        }
+        append_stun_observations(&mut candidates, local, &report);
         if report.observations.is_empty() { None } else { Some(report) }
         } else {
             None
@@ -90,6 +73,30 @@ pub async fn gather(
         candidates,
     };
     Ok(GatherResult { description, mapping })
+}
+
+/// 将同一实际 UDP Owner 观测到的 srflx 加入既有 ICE 凭据，不得重新创建绑定。
+pub(crate) fn append_stun_observations(
+    candidates: &mut Vec<IceCandidate>, local: SocketAddr, report: &MappingReport,
+) {
+    let mut seen: HashSet<SocketAddr> =
+        candidates.iter().map(|candidate| candidate.address).collect();
+    seen.insert(local);
+    for observation in &report.observations {
+        let addr = observation.mapped_address;
+        if addr.port() == 0 || addr.ip().is_unspecified()
+            || addr.ip().is_multicast() || addr.is_ipv4() != local.is_ipv4()
+        {
+            continue;
+        }
+        if seen.insert(addr) && candidates.len() < MAX_CANDIDATES {
+            candidates.push(IceCandidate {
+                address: addr,
+                kind: IceCandidateType::ServerReflexive,
+                priority: SRFLX_PRIORITY,
+            });
+        }
+    }
 }
 
 /// Attach a gateway-confirmed mapping as an ICE candidate ONLY if it
