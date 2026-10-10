@@ -56,6 +56,16 @@ pub mod live_session;
 pub mod direct_peer;
 /// Generic Control-only network session with opt-in authenticated QUIC links.
 pub mod transport_session;
+
+/// 面向业务程序的精简推荐 API；旧模块路径继续兼容现有 Transfer。
+pub use direct_peer::{
+    begin_creator, begin_creator_auto, begin_joiner, begin_joiner_auto,
+    DirectPeerError, PendingCreator, ReadyCreator, ReadyJoiner,
+};
+pub use transport_session::{
+    AuthenticatedDataLink, ConnectedTransportPeer, ManagedAuthenticatedLink,
+    ManagedLinkPhase, ManagedLinkStatus, TransportDiagnostic, TransportError,
+};
 pub mod upnp_lease;
 pub mod pcp;
 pub mod pcp_lease;
