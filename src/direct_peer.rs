@@ -785,6 +785,88 @@ mod tests {
         // 不能因不同城市的两端同为 192.168.1.x 就直接判定 LAN 可达。
     }
 
+    #[test]
+    fn quic_destinations_try_ice_nominated_address_then_other_signaled_hosts() {
+        use crate::ice_signaling::IceCandidate;
+        let primary: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let backup: SocketAddr = "127.0.0.1:30000".parse().unwrap();
+        let offer = IceDescription {
+            role: IceRole::Controlled,
+            ufrag: "offer-ufrag".into(),
+            password: "offer-pass".into(),
+            candidates: vec![
+                IceCandidate {
+                    address: backup, kind: IceCandidateType::Host, priority: 100,
+                },
+                IceCandidate {
+                    address: backup, kind: IceCandidateType::Host, priority: 99,
+                },
+                IceCandidate {
+                    address: "[::1]:30000".parse().unwrap(),
+                    kind: IceCandidateType::Host, priority: 1000,
+                },
+            ],
+        };
+        assert_eq!(quic_candidate_destinations(primary, &offer), vec![primary, backup]);
+    }
+
+    #[tokio::test]
+    async fn authenticated_control_dials_second_remote_when_first_quic_port_is_dead() {
+        tokio::time::timeout(Duration::from_secs(60), async {
+            let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+            let now = 1_800_000_000;
+            let (pending, invite) = begin_creator(&[bind], &[], now, 1200).await.unwrap();
+            let (joiner, reply) = begin_joiner(&invite, &[bind], &[], now).await.unwrap();
+            let creator = pending.receive_reply(&reply, now).unwrap();
+            let offer = creator.inner.remote.clone();
+            let mut cc = creator.confirmation().unwrap();
+            let mut jc = joiner.confirmation().unwrap();
+            cc.confirm(&creator.comparison_code()).unwrap();
+            jc.confirm(&joiner.comparison_code()).unwrap();
+            let (a, b) = tokio::join!(
+                creator.connect_transport(&cc, now),
+                joiner.connect_transport(&jc, now),
+            );
+            let a = a.unwrap();
+            let b = b.unwrap();
+            let actual = b.diagnostic().actual_local_udp;
+            assert!(offer.candidates.iter().any(|candidate| candidate.address == actual));
+            let invalid: SocketAddr = "127.0.0.1:9".parse().unwrap();
+            let binding = ManualPairing {
+                credentials: a.credentials.clone(),
+                remote_tls_cert_sha256: a.remote_pin,
+                comparison_code: 123456,
+                expires_at: u64::MAX,
+            };
+            let recv_proof = b.credentials.clone();
+            let recv_pin = b.remote_pin;
+            let (dialed, accepted) = tokio::join!(
+                race_authenticated_control(
+                    &a.endpoint, invalid, &offer, &binding,
+                    IceRole::Controlling,
+                    Arc::new(ReplayGuard::new(4096).unwrap()),
+                ),
+                async {
+                    let connection = b.endpoint.accept().await.unwrap().await.unwrap();
+                    PeerCertificatePin::new(recv_pin).unwrap()
+                        .verify_connection(&connection).unwrap();
+                    authenticate_responder(
+                        connection.clone(), &recv_proof, ChannelRole::Control,
+                        &ReplayGuard::new(4096).unwrap(), AUTH_DEADLINE,
+                    ).await.unwrap();
+                    connection
+                },
+            );
+            let (connection, outbound) = dialed.unwrap();
+            assert!(outbound);
+            assert_eq!(connection.remote_address(), actual);
+            connection.close(0u32.into(), b"test complete");
+            accepted.close(0u32.into(), b"test complete");
+            a.shutdown().await;
+            b.shutdown().await;
+        }).await.unwrap();
+    }
+
     #[tokio::test]
     async fn unreachable_ipv6_family_does_not_block_authenticated_ipv4_control() {
         tokio::time::timeout(Duration::from_secs(60), async {
