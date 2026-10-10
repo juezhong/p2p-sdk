@@ -528,6 +528,161 @@ async fn race_authenticated_control(
         }
     };
     tokio::pin!(dynamic_ice);
+    if role == IceRole::Controlled {
+        // JOIN 不得在 Creator 完成全局路径竞速前选定第一条已认证 QUIC。
+        // 同一 UDP Owner 可能同时与多个远端端口成功认证，只有在其中
+        // 一条连接收到 Creator 的 CONTROL_PATH_SELECTED 后才能对外宣告。
+        let expires = Instant::now() + QUIC_ACCEPT;
+        let destinations = quic_candidate_destinations(remote, advertised);
+        let mut backlog: VecDeque<_> = destinations.iter().copied().collect();
+        let mut allowed = destinations.iter().copied().collect::<HashSet<_>>();
+        let mut validated_late = Vec::new();
+        let mut verified_open = true;
+        let mut dialing = JoinSet::new();
+        let mut accepting = JoinSet::new();
+        let mut selected = JoinSet::new();
+        let mut active = Vec::<(usize, quinn::Connection)>::new();
+        let mut next_id = 0usize;
+        let mut periodic = tokio::time::interval(Duration::from_millis(180));
+        periodic.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut chosen = None;
+        loop {
+            while dialing.len() < 4 {
+                let Some(address) = backlog.pop_front() else { break };
+                let ep = endpoint.clone();
+                let credentials = pairing.credentials.clone();
+                let pin = pairing.remote_tls_cert_sha256;
+                dialing.spawn(async move {
+                    let conn = timeout(Duration::from_secs(3), async {
+                        ep.connect(address, "localhost")
+                            .map_err(|_| DirectPeerError::QuicHandshake)?
+                            .await.map_err(|_| DirectPeerError::QuicHandshake)
+                    }).await.map_err(|_| DirectPeerError::QuicHandshake)??;
+                    let verified = PeerCertificatePin::new(pin).ok()
+                        .is_some_and(|p| p.verify_connection(&conn).is_ok());
+                    if verified && authenticate_initiator(
+                        conn.clone(), &credentials, ChannelRole::Control, AUTH_DEADLINE,
+                    ).await.is_ok() {
+                        Some((conn, true))
+                    } else {
+                        conn.close(1u32.into(), b"untrusted outbound Control");
+                        None
+                    }
+                });
+            }
+            tokio::select! {
+                _ = &mut dynamic_ice, if checking_active => {
+                    checking_active = false;
+                }
+                verified = verified_rx.recv(), if verified_open => {
+                    match verified {
+                        Some(address) if address.is_ipv4() == remote.is_ipv4()
+                            && validated_late.len() < MAX_CANDIDATES
+                            && allowed.insert(address) => {
+                            if let Some(whitelist) = late_whitelist.as_ref() {
+                                if let Ok(mut set) = whitelist.lock() {
+                                    set.insert(address);
+                                }
+                            }
+                            validated_late.push(address);
+                            backlog.push_back(address);
+                        }
+                        Some(_) => {}
+                        None => verified_open = false,
+                    }
+                }
+                result = dialing.join_next(), if !dialing.is_empty() => {
+                    if let Some(Ok(Some((connection, outbound)))) = result {
+                        next_id += 1;
+                        let id = next_id;
+                        active.push((id, connection.clone()));
+                        selected.spawn(async move {
+                            let selected = tokio::time::timeout_at(expires, async {
+                                let mut stream = connection.accept_uni().await.ok()?;
+                                let message = stream.read_to_end(48).await.ok()?;
+                                (message.as_slice() == CONTROL_PATH_SELECTED).then_some(())
+                            }).await;
+                            if matches!(selected, Ok(Some(()))) {
+                                Some((id, connection, outbound))
+                            } else {
+                                connection.close(1u32.into(), b"Control path not selected");
+                                None
+                            }
+                        });
+                    }
+                }
+                incoming = endpoint.accept(), if accepting.len() < MAX_PENDING_INBOUND_AUTH => {
+                    if let Some(incoming) = incoming {
+                        let credentials = pairing.credentials.clone();
+                        let guard = Arc::clone(&replay_guard);
+                        let pin = pairing.remote_tls_cert_sha256;
+                        accepting.spawn(async move {
+                            let Ok(Ok(connection)) = timeout(AUTH_DEADLINE, incoming).await
+                                else { return None };
+                            let verified = PeerCertificatePin::new(pin).ok()
+                                .is_some_and(|p| p.verify_connection(&connection).is_ok());
+                            if verified && authenticate_responder(
+                                connection.clone(), &credentials, ChannelRole::Control,
+                                &guard, AUTH_DEADLINE,
+                            ).await.is_ok() {
+                                Some((connection, false))
+                            } else {
+                                connection.close(1u32.into(), b"untrusted inbound Control");
+                                None
+                            }
+                        });
+                    }
+                }
+                result = accepting.join_next(), if !accepting.is_empty() => {
+                    if let Some(Ok(Some((connection, outbound)))) = result {
+                        next_id += 1;
+                        let id = next_id;
+                        active.push((id, connection.clone()));
+                        selected.spawn(async move {
+                            let selected = tokio::time::timeout_at(expires, async {
+                                let mut stream = connection.accept_uni().await.ok()?;
+                                let message = stream.read_to_end(48).await.ok()?;
+                                (message.as_slice() == CONTROL_PATH_SELECTED).then_some(())
+                            }).await;
+                            if matches!(selected, Ok(Some(()))) {
+                                Some((id, connection, outbound))
+                            } else {
+                                connection.close(1u32.into(), b"Control path not selected");
+                                None
+                            }
+                        });
+                    }
+                }
+                result = selected.join_next(), if !selected.is_empty() => {
+                    if let Some(Ok(Some(winner))) = result {
+                        chosen = Some(winner);
+                        break;
+                    }
+                }
+                _ = periodic.tick() => {
+                    if dialing.is_empty() && backlog.is_empty() {
+                        backlog.extend(destinations.iter().copied());
+                        backlog.extend(validated_late.iter().copied());
+                    }
+                }
+                _ = tokio::time::sleep_until(expires) => break,
+            }
+        }
+        dialing.abort_all();
+        accepting.abort_all();
+        selected.abort_all();
+        while dialing.join_next().await.is_some() {}
+        while accepting.join_next().await.is_some() {}
+        while selected.join_next().await.is_some() {}
+        let selected_id = chosen.as_ref().map(|(id, _, _)| *id);
+        for (id, connection) in active {
+            if Some(id) != selected_id {
+                connection.close(0u32.into(), b"unselected authenticated Control");
+            }
+        }
+        return chosen.map(|(_, connection, outbound)| (connection, outbound))
+            .ok_or(DirectPeerError::QuicHandshake);
+    }
     let mut workers = JoinSet::new();
     let outgoing = endpoint.clone();
     let credentials = pairing.credentials.clone();
@@ -779,6 +934,8 @@ async fn authenticate_on_path(
         }
     });
     let dynamic_verified = Arc::new(std::sync::Mutex::new(HashSet::new()));
+    let selection_received_in_race = role == IceRole::Controlled
+        && nominated_prebound.is_none();
     let (control, outbound) = if let Some(connection) = nominated_prebound {
         (connection, false)
     } else {
@@ -815,7 +972,7 @@ async fn authenticate_on_path(
     path.selected.path.remote = actual_remote;
     // 创建方最终决定使用哪条已认证路径；加入方只有收到该
     // QUIC 内的选择消息才返回同一条 Control，防止多路竞速两端各选一条。
-    if role == IceRole::Controlled {
+    if role == IceRole::Controlled && !selection_received_in_race {
         let selected = timeout(QUIC_ACCEPT, async {
             let mut stream = control.accept_uni().await
                 .map_err(|_| DirectPeerError::QuicHandshake)?;
@@ -1044,9 +1201,9 @@ async fn connect_authenticated_transport(
                         eprintln!("sdk-quic-race: role={role:?} QUIC candidate failed: {error:?}");
                         last_failure = error;
                     }
-                    Some(Err(error)) => {
+                    Some(Err(_error)) => {
                         #[cfg(test)]
-                        eprintln!("sdk-quic-race: role={role:?} candidate join error: {error:?}");
+                        eprintln!("sdk-quic-race: role={role:?} candidate join error: {_error:?}");
                         last_failure = DirectPeerError::QuicHandshake;
                     }
                     None => last_failure = DirectPeerError::QuicHandshake,
