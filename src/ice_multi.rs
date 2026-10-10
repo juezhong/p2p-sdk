@@ -14,7 +14,7 @@ use tokio::time::{sleep, timeout, MissedTickBehavior};
 
 use crate::{
     ice_agent::{credentials_from_description, IceCheckError, NominatedPath},
-    ice_signaling::{IceCandidate, IceCandidateType, IceDescription, IceRole, MAX_CANDIDATES},
+    ice_signaling::{IceCandidateType, IceDescription, IceRole, MAX_CANDIDATES},
     punch::{unix_seconds, AuthenticatedPunch},
     udp_owner::UdpOwner,
 };
