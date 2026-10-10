@@ -5,6 +5,7 @@
 //! User confirmation of the pairing remains a mandatory explicit gate.
 
 use std::{net::SocketAddr, sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}};
+use tokio::{task::JoinSet, time::{timeout, Instant}};
 
 use crate::{
     ice_signaling::{IceDescription, IceRole, IceCandidateType},
@@ -510,6 +511,99 @@ impl ReadyJoiner {
     }
 }
 
+/// 与 Go connectQUIC/waitForPeerThenConnect 一致，两端同时 Listen/Dial。
+/// Joiner 优先 outbound，Creator 优先 inbound；只有同一个成功认证的
+/// QUIC 方向才能在双方成为 Control，短暂保留反向连接以防 NAT 单向阻断。
+async fn race_authenticated_control(
+    endpoint: &quinn::Endpoint,
+    remote: SocketAddr,
+    pairing: &ManualPairing,
+    role: IceRole,
+    replay_guard: Arc<ReplayGuard>,
+) -> Result<(quinn::Connection, bool), DirectPeerError> {
+    let mut workers = JoinSet::new();
+    let outgoing = endpoint.clone();
+    let credentials = pairing.credentials.clone();
+    let pin = pairing.remote_tls_cert_sha256;
+    workers.spawn(async move {
+        let expires = Instant::now() + QUIC_ACCEPT;
+        while Instant::now() < expires {
+            if let Ok(connecting) = outgoing.connect(remote, "localhost") {
+                if let Ok(Ok(connection)) = timeout(Duration::from_secs(3), connecting).await {
+                    let verified = PeerCertificatePin::new(pin)
+                        .ok().is_some_and(|p| p.verify_connection(&connection).is_ok());
+                    if verified && authenticate_initiator(
+                        connection.clone(), &credentials,
+                        ChannelRole::Control, AUTH_DEADLINE,
+                    ).await.is_ok() {
+                        return Ok((connection, true));
+                    }
+                    connection.close(1u32.into(), b"Control identity or proof rejected");
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(180)).await;
+        }
+        Err(DirectPeerError::QuicHandshake)
+    });
+    let incoming = endpoint.clone();
+    let credentials = pairing.credentials.clone();
+    workers.spawn(async move {
+        let expires = Instant::now() + QUIC_ACCEPT;
+        while Instant::now() < expires {
+            let remaining = expires.saturating_duration_since(Instant::now());
+            let Some(connecting) = timeout(remaining, incoming.accept())
+                .await.map_err(|_| DirectPeerError::QuicHandshake)?
+            else { return Err(DirectPeerError::QuicHandshake) };
+            let Ok(Ok(connection)) = timeout(AUTH_DEADLINE, connecting).await else {
+                continue;
+            };
+            let verified = PeerCertificatePin::new(pin)
+                .ok().is_some_and(|p| p.verify_connection(&connection).is_ok());
+            if verified && authenticate_responder(
+                connection.clone(), &credentials,
+                ChannelRole::Control, &replay_guard, AUTH_DEADLINE,
+            ).await.is_ok() {
+                return Ok((connection, false));
+            }
+            connection.close(1u32.into(), b"Control identity or proof rejected");
+        }
+        Err(DirectPeerError::QuicHandshake)
+    });
+
+    let prefer_outbound = role == IceRole::Controlled;
+    let result = timeout(QUIC_ACCEPT, async {
+        let mut fallback: Option<(quinn::Connection, bool)> = None;
+        loop {
+            tokio::select! {
+                result = workers.join_next() => {
+                    match result {
+                        Some(Ok(Ok((connection, outbound)))) => {
+                            if outbound == prefer_outbound {
+                                if let Some((loser, _)) = fallback.take() {
+                                    loser.close(0u32.into(), b"preferred direction won");
+                                }
+                                return Ok((connection, outbound));
+                            }
+                            if fallback.is_none() {
+                                fallback = Some((connection, outbound));
+                            } else {
+                                connection.close(0u32.into(), b"connection race loser");
+                            }
+                        }
+                        Some(_) => {},
+                        None => return fallback.ok_or(DirectPeerError::QuicHandshake),
+                    }
+                }
+                _ = tokio::time::sleep(Duration::from_millis(300)), if fallback.is_some() => {
+                    return fallback.ok_or(DirectPeerError::QuicHandshake);
+                }
+            }
+        }
+    }).await;
+    workers.abort_all();
+    result.unwrap_or(Err(DirectPeerError::QuicHandshake))
+}
+
 /// A generic SDK consumer can establish exactly one Control QUIC without
 /// allocating any Data transport. Unlike the convenience dual-QUIC facade,
 /// this interface has no Transfer-shaped lane count or stream scheduler.
@@ -542,29 +636,31 @@ impl ReadyCreator {
         let nominated = path.nominated();
         let remote_candidate_kind = remote.candidates.iter()
             .find(|c| c.address == nominated.remote).map(|c| c.kind);
+        let trusted = trusted_certificate(remote_certificate)?;
+        let cert = vec![identity.cert.der().clone()];
         let tls = authenticated_client_config(
-            vec![identity.cert.der().clone()],
-            rustls::pki_types::PrivateKeyDer::Pkcs8(
+            cert.clone(), rustls::pki_types::PrivateKeyDer::Pkcs8(
                 identity.signing_key.serialize_der().into()
-            ),
-            trusted_certificate(remote_certificate)?,
+            ), trusted.clone(),
+        ).map_err(|_| DirectPeerError::TlsConfig)?;
+        let server_tls = authenticated_server_config(
+            cert, rustls::pki_types::PrivateKeyDer::Pkcs8(
+                identity.signing_key.serialize_der().into()
+            ), trusted,
         ).map_err(|_| DirectPeerError::TlsConfig)?;
         let adapter = QuinnUdpAdapter::from_owner(&mut path.selected.owner)
             .map_err(|_| DirectPeerError::UdpAdapter)?;
         let mut endpoint = quinn::Endpoint::new_with_abstract_socket(
-            demux_endpoint_config(), None, Arc::new(adapter),
+            demux_endpoint_config(), Some(server_tls), Arc::new(adapter),
             quinn::default_runtime().ok_or(DirectPeerError::QuicEndpoint)?,
         ).map_err(|_| DirectPeerError::QuicEndpoint)?;
         endpoint.set_default_client_config(tls.clone());
-        let control = endpoint.connect(nominated.remote, "localhost")
-            .map_err(|_| DirectPeerError::QuicHandshake)?.await
-            .map_err(|_| DirectPeerError::QuicHandshake)?;
-        PeerCertificatePin::new(pairing.remote_tls_cert_sha256)
-            .map_err(|_| DirectPeerError::VerifiedSession)?
-            .verify_connection(&control).map_err(|_| DirectPeerError::VerifiedSession)?;
-        authenticate_initiator(
-            control.clone(), &pairing.credentials, ChannelRole::Control, AUTH_DEADLINE,
-        ).await.map_err(|_| DirectPeerError::VerifiedSession)?;
+        let replay_guard = Arc::new(ReplayGuard::new(4096)
+            .map_err(|_| DirectPeerError::VerifiedSession)?);
+        let (control, control_outbound) = race_authenticated_control(
+            &endpoint, nominated.remote, &pairing, IceRole::Controlling,
+            Arc::clone(&replay_guard),
+        ).await?;
         if control.remote_address() != nominated.remote {
             return Err(DirectPeerError::LiveSession);
         }
@@ -578,9 +674,9 @@ impl ReadyCreator {
             credentials: pairing.credentials,
             remote_pin: pairing.remote_tls_cert_sha256,
             role: IceRole::Controlling, client_tls: Some(tls),
+            control_outbound,
             remote_candidate_kind, offered_host_candidates,
-            replay_guard: Arc::new(ReplayGuard::new(4096)
-                .map_err(|_| DirectPeerError::VerifiedSession)?),
+            replay_guard,
         })
     }
 }
@@ -612,32 +708,31 @@ impl ReadyJoiner {
         let nominated = path.nominated();
         let remote_candidate_kind = remote.candidates.iter()
             .find(|c| c.address == nominated.remote).map(|c| c.kind);
+        let trusted = trusted_certificate(remote_certificate)?;
+        let cert = vec![identity.cert.der().clone()];
         let tls = authenticated_server_config(
-            vec![identity.cert.der().clone()],
-            rustls::pki_types::PrivateKeyDer::Pkcs8(
+            cert.clone(), rustls::pki_types::PrivateKeyDer::Pkcs8(
                 identity.signing_key.serialize_der().into()
-            ),
-            trusted_certificate(remote_certificate)?,
+            ), trusted.clone(),
+        ).map_err(|_| DirectPeerError::TlsConfig)?;
+        let client_tls = authenticated_client_config(
+            cert, rustls::pki_types::PrivateKeyDer::Pkcs8(
+                identity.signing_key.serialize_der().into()
+            ), trusted,
         ).map_err(|_| DirectPeerError::TlsConfig)?;
         let adapter = QuinnUdpAdapter::from_owner(&mut path.selected.owner)
             .map_err(|_| DirectPeerError::UdpAdapter)?;
-        let endpoint = quinn::Endpoint::new_with_abstract_socket(
+        let mut endpoint = quinn::Endpoint::new_with_abstract_socket(
             demux_endpoint_config(), Some(tls), Arc::new(adapter),
             quinn::default_runtime().ok_or(DirectPeerError::QuicEndpoint)?,
         ).map_err(|_| DirectPeerError::QuicEndpoint)?;
-        let control = tokio::time::timeout(QUIC_ACCEPT, endpoint.accept())
-            .await.map_err(|_| DirectPeerError::QuicHandshake)?
-            .ok_or(DirectPeerError::QuicHandshake)?
-            .await.map_err(|_| DirectPeerError::QuicHandshake)?;
-        PeerCertificatePin::new(pairing.remote_tls_cert_sha256)
-            .map_err(|_| DirectPeerError::VerifiedSession)?
-            .verify_connection(&control).map_err(|_| DirectPeerError::VerifiedSession)?;
+        endpoint.set_default_client_config(client_tls.clone());
         let replay_guard = Arc::new(ReplayGuard::new(4096)
             .map_err(|_| DirectPeerError::VerifiedSession)?);
-        authenticate_responder(
-            control.clone(), &pairing.credentials, ChannelRole::Control,
-            &replay_guard, AUTH_DEADLINE,
-        ).await.map_err(|_| DirectPeerError::VerifiedSession)?;
+        let (control, control_outbound) = race_authenticated_control(
+            &endpoint, nominated.remote, &pairing, IceRole::Controlled,
+            Arc::clone(&replay_guard),
+        ).await?;
         if control.remote_address() != nominated.remote {
             return Err(DirectPeerError::LiveSession);
         }
@@ -650,8 +745,8 @@ impl ReadyJoiner {
             endpoint, control, path, punch: Some(punch),
             credentials: pairing.credentials,
             remote_pin: pairing.remote_tls_cert_sha256,
-            role: IceRole::Controlled, client_tls: None, replay_guard,
-            remote_candidate_kind, offered_host_candidates,
+            role: IceRole::Controlled, client_tls: Some(client_tls), replay_guard,
+            control_outbound, remote_candidate_kind, offered_host_candidates,
         })
     }
 }
@@ -809,6 +904,9 @@ mod tests {
             let joiner = joiner.unwrap();
             assert!(creator.diagnostic().control_connected);
             assert!(joiner.diagnostic().control_connected);
+            // Go v0.16.4：创建方偏向入站，加入方偏向出站。
+            assert!(!creator.diagnostic().control_outbound);
+            assert!(joiner.diagnostic().control_outbound);
             // API 不接受零预算，且不能在未认证前返回附属 QUIC。
             assert!(matches!(
                 creator.open_authenticated_data(Duration::ZERO).await,
