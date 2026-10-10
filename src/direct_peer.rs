@@ -698,6 +698,42 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn quic_path_race_shutdown_releases_all_advertised_udp_ports() {
+        tokio::time::timeout(Duration::from_secs(70), async {
+            let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+            let now = 1_800_000_000;
+            let (pending, invite) = begin_creator(&[bind, bind], &[], now, 1200).await.unwrap();
+            let (joiner, reply) = begin_joiner(&invite, &[bind, bind], &[], now).await.unwrap();
+            let creator = pending.receive_reply(&reply, now).unwrap();
+            let mut cc = creator.confirmation().unwrap();
+            let mut jc = joiner.confirmation().unwrap();
+            cc.confirm(&creator.comparison_code()).unwrap();
+            jc.confirm(&joiner.comparison_code()).unwrap();
+            let (a, b) = tokio::join!(
+                creator.connect_transport(&cc, now),
+                joiner.connect_transport(&jc, now),
+            );
+            let a = a.unwrap();
+            let b = b.unwrap();
+            let mut all_ports = a.diagnostic().offered_host_candidates;
+            all_ports.extend(b.diagnostic().offered_host_candidates);
+            assert_eq!(all_ports.len(), 4);
+            a.shutdown().await;
+            b.shutdown().await;
+            for addr in all_ports {
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        if tokio::net::UdpSocket::bind(addr).await.is_ok() {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                }).await.expect("all ICE/QUIC loser sockets must be released");
+            }
+        }).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn creator_accepts_manual_reply_after_two_hour_human_delay() {
         let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let now = 1_800_000_000;
