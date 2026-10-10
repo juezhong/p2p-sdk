@@ -544,6 +544,27 @@ async fn authenticate_on_path(
     Ok((path, endpoint, control, outbound))
 }
 
+/// 本机接口的实际 netmask 仅能提供 LAN *候选* 的提示，
+/// 不证明双方处于同一物理 LAN；最终仍必须由 ICE 和 QUIC 认证。
+fn same_local_interface_subnet(
+    local: std::net::IpAddr, remote: std::net::IpAddr,
+) -> bool {
+    let Ok(interfaces) = if_addrs::get_if_addrs() else { return false };
+    interfaces.into_iter().any(|interface| match (interface.addr, local, remote) {
+        (if_addrs::IfAddr::V4(addr),
+            std::net::IpAddr::V4(l), std::net::IpAddr::V4(r)) if addr.ip == l => {
+            u32::from(l) & u32::from(addr.netmask)
+                == u32::from(r) & u32::from(addr.netmask)
+        }
+        (if_addrs::IfAddr::V6(addr),
+            std::net::IpAddr::V6(l), std::net::IpAddr::V6(r)) if addr.ip == l => {
+            u128::from(l) & u128::from(addr.netmask)
+                == u128::from(r) & u128::from(addr.netmask)
+        }
+        _ => false,
+    })
+}
+
 /// 仅对双方已经通过 ICE+mTLS+HMAC 的网络路径进行评分。
 /// 相同 192.168.x.x 前缀不能证明在同一个 LAN；没有实际认证绝不入选。
 fn nominated_address_priority(
@@ -552,11 +573,14 @@ fn nominated_address_priority(
 ) -> u8 {
     match (local, remote, kind) {
         (std::net::IpAddr::V4(a), std::net::IpAddr::V4(b),
-            Some(IceCandidateType::Host)) if a.is_private() && b.is_private() => 5,
+            Some(IceCandidateType::Host))
+            if a.is_private() && b.is_private()
+                && same_local_interface_subnet(local, remote) => 5,
         (std::net::IpAddr::V6(a), std::net::IpAddr::V6(b),
             Some(IceCandidateType::Host))
-            if (a.is_unique_local() && b.is_unique_local())
-                || (a.is_unicast_link_local() && b.is_unicast_link_local()) => 5,
+            if ((a.is_unique_local() && b.is_unique_local())
+                || (a.is_unicast_link_local() && b.is_unicast_link_local()))
+                && same_local_interface_subnet(local, remote) => 5,
         (std::net::IpAddr::V6(a), std::net::IpAddr::V6(b),
             Some(IceCandidateType::Host))
             if !a.is_unique_local() && !b.is_unique_local()
@@ -793,9 +817,11 @@ mod tests {
         let lan_b = "192.168.1.200".parse().unwrap();
         let ipv6_a = "2001:4860:1::1".parse().unwrap();
         let ipv6_b = "2606:4700::1111".parse().unwrap();
+        // 测试环境未必有 192.168.1.x 网卡；不能臆测 LAN 最高分。
+        let lan_hint = same_local_interface_subnet(lan_a, lan_b);
         assert_eq!(nominated_address_priority(
             lan_a, lan_b, Some(IceCandidateType::Host),
-        ), 5);
+        ), if lan_hint { 5 } else { 3 });
         assert_eq!(nominated_address_priority(
             ipv6_a, ipv6_b, Some(IceCandidateType::Host),
         ), 4);
@@ -804,6 +830,16 @@ mod tests {
         ), 2);
         // 仅在 ICE 与 QUIC 都真实通过认证之后调用评分，
         // 不能因不同城市的两端同为 192.168.1.x 就直接判定 LAN 可达。
+    }
+
+    #[test]
+    fn unrelated_private_networks_are_not_preferred_as_lan() {
+        let local = "192.168.1.100".parse().unwrap();
+        let remote = "10.28.7.20".parse().unwrap();
+        assert!(!same_local_interface_subnet(local, remote));
+        assert_eq!(nominated_address_priority(
+            local, remote, Some(IceCandidateType::Host),
+        ), 3);
     }
 
     #[test]
@@ -885,6 +921,46 @@ mod tests {
             accepted.close(0u32.into(), b"test complete");
             a.shutdown().await;
             b.shutdown().await;
+        }).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn overlapping_private_candidates_cannot_replace_verified_reachable_path() {
+        // 两个远端可能都公布 192.168.1.0/24，但该前缀不能作为
+        // 位于同一物理 LAN 的证据：虚假高优先级私网候选不允许阻塞有效路径。
+        tokio::time::timeout(Duration::from_secs(65), async {
+            let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+            let now = 1_800_000_000;
+            let (pending, invite) = begin_creator(&[bind], &[], now, 1200).await.unwrap();
+            let (joiner, reply) = begin_joiner(&invite, &[bind], &[], now).await.unwrap();
+            let mut creator = pending.receive_reply(&reply, now).unwrap();
+            let mut joiner = joiner;
+            creator.inner.remote.candidates.push(crate::ice_signaling::IceCandidate {
+                address: "192.168.1.200:57001".parse().unwrap(),
+                kind: IceCandidateType::Host,
+                priority: u32::MAX,
+            });
+            joiner.inner.remote.candidates.push(crate::ice_signaling::IceCandidate {
+                address: "192.168.1.100:57002".parse().unwrap(),
+                kind: IceCandidateType::Host,
+                priority: u32::MAX,
+            });
+            let mut cc = creator.confirmation().unwrap();
+            let mut jc = joiner.confirmation().unwrap();
+            cc.confirm(&creator.comparison_code()).unwrap();
+            jc.confirm(&joiner.comparison_code()).unwrap();
+            let (left, right) = tokio::join!(
+                creator.connect_transport(&cc, now),
+                joiner.connect_transport(&jc, now),
+            );
+            let left = left.unwrap();
+            let right = right.unwrap();
+            assert!(left.diagnostic().actual_remote_udp.ip().is_loopback());
+            assert!(right.diagnostic().actual_remote_udp.ip().is_loopback());
+            assert!(left.diagnostic().control_connected);
+            assert!(right.diagnostic().control_connected);
+            left.shutdown().await;
+            right.shutdown().await;
         }).await.unwrap();
     }
 
