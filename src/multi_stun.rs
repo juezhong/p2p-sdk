@@ -129,9 +129,19 @@ pub async fn query_via_owner(
         });
     }
     let mut observations = Vec::with_capacity(servers.len());
-    while let Some(result) = tasks.join_next().await {
+    let mut grace_deadline: Option<Instant> = None;
+    loop {
+        // Go 的语义：第一个有效 srflx 足以作为候选；最多再等 220ms
+        // 获得第二份观测以判断映射是否依赖目标，而不为无响应服务器拖延。
+        let next = match grace_deadline {
+            Some(until) => timeout_at(until, tasks.join_next()).await.ok().flatten(),
+            None => tasks.join_next().await,
+        };
+        let Some(result) = next else { break; };
         if let Ok((server, Ok(mapped_address))) = result {
             observations.push(StunObservation { server, mapped_address });
+            if observations.len() >= 2 { break; }
+            grace_deadline = Some(Instant::now() + Duration::from_millis(220));
         }
     }
     observations.sort_by_key(|o| o.server);
@@ -232,6 +242,25 @@ mod tests {
         for server in servers {
             assert_eq!(server.await.unwrap(), report.local_address);
         }
+    }
+
+    #[tokio::test]
+    async fn first_valid_stun_does_not_wait_for_silent_backup() {
+        let owner = crate::udp_owner::UdpOwner::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let fast = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let silent = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addresses = [fast.local_addr().unwrap(), silent.local_addr().unwrap()];
+        let handler = tokio::spawn(async move {
+            let mut buffer = [0u8; 128];
+            let (size, from) = fast.recv_from(&mut buffer).await.unwrap();
+            let reply = response(&buffer[..size], "198.51.100.20:41000".parse().unwrap());
+            fast.send_to(&reply, from).await.unwrap();
+        });
+        let report = tokio::time::timeout(Duration::from_millis(900),
+            query_via_owner(&owner.handle, &addresses, Duration::from_secs(3)),
+        ).await.expect("one valid STUN should trigger short grace").unwrap();
+        assert_eq!(report.observations.len(), 1);
+        handler.await.unwrap();
     }
 
     #[tokio::test]
