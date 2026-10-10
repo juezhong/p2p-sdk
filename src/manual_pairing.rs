@@ -23,7 +23,10 @@ const REPLY_MAGIC: &[u8; 4] = b"P2PA";
 const VERSION: u8 = 1;
 const OFFER_BYTES: usize = 109;
 const REPLY_BYTES: usize = 141;
-const MAX_LIFETIME_SECS: u64 = 1800;
+const MAX_LIFETIME_SECS: u64 = 7 * 24 * 60 * 60;
+/// 人工配对等待不使用网络建连截止时间；显式取消或进程关闭才能结束等待。
+/// 单独建连的 ICE/QUIC 超时仍由网络层负责。
+pub const UNLIMITED_INVITE_LIFETIME: u64 = u64::MAX;
 const MIN_LIFETIME_SECS: u64 = 10;
 const KEY_SALT_CONTEXT: &[u8] = b"p2p-sdk/manual-invite-reply-transcript/v1";
 const KEY_INFO: &[u8] = b"p2p-sdk/manual-session-bindings/v1";
@@ -80,13 +83,19 @@ impl ManualInviteState {
         lifetime_secs: u64,
         local_tls_cert_sha256: [u8; 32],
     ) -> Result<(Self, String), ManualError> {
-        if !(MIN_LIFETIME_SECS..=MAX_LIFETIME_SECS).contains(&lifetime_secs) {
+        if lifetime_secs != UNLIMITED_INVITE_LIFETIME
+            && !(MIN_LIFETIME_SECS..=MAX_LIFETIME_SECS).contains(&lifetime_secs)
+        {
             return Err(ManualError::InvalidLifetime);
         }
         if local_tls_cert_sha256 == [0; 32] {
             return Err(ManualError::InvalidFingerprint);
         }
-        let expires_at = now.checked_add(lifetime_secs).ok_or(ManualError::InvalidLifetime)?;
+        let expires_at = if lifetime_secs == UNLIMITED_INVITE_LIFETIME {
+            u64::MAX
+        } else {
+            now.checked_add(lifetime_secs).ok_or(ManualError::InvalidLifetime)?
+        };
         let mut offer = [0_u8; OFFER_BYTES];
         offer[..4].copy_from_slice(INVITE_MAGIC);
         offer[4] = VERSION;
@@ -271,12 +280,36 @@ mod tests {
     #[test]
     fn refuses_expired_codes_and_bad_lifetimes() {
         assert!(matches!(ManualInviteState::create(0, 0, A), Err(ManualError::InvalidLifetime)));
-        assert!(matches!(ManualInviteState::create(0, 1_801, A), Err(ManualError::InvalidLifetime)));
+        assert!(matches!(ManualInviteState::create(0, 7 * 24 * 3600 + 1, A), Err(ManualError::InvalidLifetime)));
         let (pending, invite) = ManualInviteState::create(100, 10, A).unwrap();
         assert_eq!(preview_invite(&invite, 110), Err(ManualError::Expired));
         assert!(matches!(respond(&invite, 110, B), Err(ManualError::Expired)));
         let (reply, _) = respond(&invite, 109, B).unwrap();
         assert!(matches!(pending.finish(&reply, 110), Err(ManualError::Expired)));
+    }
+
+
+    #[test]
+    fn unlimited_invite_accepts_reply_after_two_hours_and_more() {
+        let now = 1_800_000_000;
+        let (pending, invite) =
+            ManualInviteState::create(now, UNLIMITED_INVITE_LIFETIME, A).unwrap();
+        let two_hours_later = now + 2 * 3600 + 300;
+        let preview = preview_invite(&invite, two_hours_later).unwrap();
+        assert_eq!(preview.expires_at, u64::MAX);
+        let (reply, responder) = respond(&invite, two_hours_later, B).unwrap();
+        let initiator = pending.finish(&reply, two_hours_later + 3600).unwrap();
+        assert_eq!(initiator.credentials.session_id(), responder.credentials.session_id());
+        assert_eq!(initiator.comparison_code, responder.comparison_code);
+    }
+
+    #[test]
+    fn finite_invite_can_optionally_expire_after_two_hours() {
+        let now = 1_800_000_000;
+        let (pending, invite) = ManualInviteState::create(now, 3 * 3600, A).unwrap();
+        let (reply, _) = respond(&invite, now + 2 * 3600, B).unwrap();
+        assert!(pending.finish(&reply, now + 2 * 3600 + 1).is_ok());
+        assert!(matches!(respond(&invite, now + 3 * 3600, B), Err(ManualError::Expired)));
     }
 
     #[test]

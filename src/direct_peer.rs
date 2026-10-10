@@ -24,6 +24,8 @@ use crate::{
     tls_identity::{authenticated_client_config, authenticated_server_config},
 };
 
+use crate::manual_pairing::UNLIMITED_INVITE_LIFETIME;
+
 const GATHER: Duration = Duration::from_secs(3);
 const MAPPING: Duration = Duration::from_millis(1200);
 const ICE_CHECK: Duration = Duration::from_secs(30);
@@ -136,12 +138,14 @@ pub async fn discover_default_stun() -> Vec<SocketAddr> {
     {
         return Vec::new();
     }
-    let (first, second) = tokio::join!(
+    // 提供商冗余：避免仅依赖 Google，且默认值不影响离线 LAN 模式。
+    let (cloudflare, google, google_backup) = tokio::join!(
+        resolve_stun("stun.cloudflare.com:3478"),
         resolve_stun("stun.l.google.com:19302"),
         resolve_stun("stun1.l.google.com:19302"),
     );
     let mut unique = Vec::new();
-    for addr in first.into_iter().chain(second) {
+    for addr in cloudflare.into_iter().chain(google).chain(google_backup) {
         if !unique.contains(&addr) { unique.push(addr); }
     }
     unique
@@ -154,7 +158,7 @@ pub async fn begin_creator_auto()
 {
     let interfaces = discovered_interfaces()?;
     let stun = discover_default_stun().await;
-    begin_creator(&interfaces, &stun, current_unix_seconds()?, 1200).await
+    begin_creator(&interfaces, &stun, current_unix_seconds()?, UNLIMITED_INVITE_LIFETIME).await
 }
 
 pub async fn begin_joiner_auto(invite: &str)
@@ -589,6 +593,21 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn creator_accepts_manual_reply_after_two_hour_human_delay() {
+        let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let now = 1_800_000_000;
+        let (pending, invite) =
+            begin_creator(&[bind], &[], now, UNLIMITED_INVITE_LIFETIME).await.unwrap();
+        let two_hours_later = now + 7200;
+        let (joiner, reply) =
+            begin_joiner(&invite, &[bind], &[], two_hours_later).await.unwrap();
+        let creator = pending.receive_reply(&reply, two_hours_later).unwrap();
+        assert_eq!(creator.comparison_code(), joiner.comparison_code());
+        assert!(creator.confirmation().is_ok());
+        assert!(joiner.confirmation().is_ok());
+    }
+
+    #[tokio::test]
     async fn joiner_waits_for_verified_creator_activity_without_ice_timeout() {
         let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let now = 1_800_000_000;
@@ -729,16 +748,27 @@ mod tests {
             let joiner = joiner.unwrap();
             assert!(creator.diagnostic().control_connected);
             assert!(joiner.diagnostic().control_connected);
-            // Go v0.16.4：创建方偏向入站，加入方偏向出站。
-            assert!(!creator.diagnostic().control_outbound);
-            assert!(joiner.diagnostic().control_outbound);
-            // API 不接受零预算，且不能在未认证前返回附属 QUIC。
+            // 额外连接由实际 Control 拨号方发起，不由邀请码创建/加入角色决定。
+            assert_ne!(creator.control_outbound, joiner.control_outbound);
+            let (dialer, listener) = if creator.control_outbound {
+                (&creator, &joiner)
+            } else {
+                (&joiner, &creator)
+            };
             assert!(matches!(
-                creator.open_authenticated_data(Duration::ZERO).await,
+                listener.open_authenticated_data(Duration::from_secs(1)).await,
+                Err(crate::transport_session::TransportError::WrongRole)
+            ));
+            assert!(matches!(
+                dialer.accept_authenticated_data(Duration::from_secs(1)).await,
+                Err(crate::transport_session::TransportError::WrongRole)
+            ));
+            assert!(matches!(
+                dialer.open_authenticated_data(Duration::ZERO).await,
                 Err(crate::transport_session::TransportError::Timeout)
             ));
             assert!(matches!(
-                joiner.accept_authenticated_data(Duration::ZERO).await,
+                listener.accept_authenticated_data(Duration::ZERO).await,
                 Err(crate::transport_session::TransportError::Timeout)
             ));
             let (mut tx, _) = creator.control.open_bi().await.unwrap();
@@ -749,8 +779,8 @@ mod tests {
 
             // No Data QUIC was created until this explicit application call.
             let (outgoing, incoming) = tokio::join!(
-                creator.open_authenticated_data(Duration::from_secs(12)),
-                joiner.accept_authenticated_data(Duration::from_secs(12)),
+                dialer.open_authenticated_data(Duration::from_secs(12)),
+                listener.accept_authenticated_data(Duration::from_secs(12)),
             );
             let outgoing = outgoing.unwrap();
             let incoming = incoming.unwrap();
