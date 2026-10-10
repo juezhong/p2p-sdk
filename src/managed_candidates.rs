@@ -110,6 +110,29 @@ impl ManagedCandidates {
         Ok(Self { candidates: set, leases })
     }
 
+    /// Authenticate runtime NAT endpoints before attempting ICE nomination.
+    /// Gateway mappings stay owned until a successful nominated path is
+    /// selected; losing mappings are still explicitly cleaned up.
+    pub async fn nominate_first_with_authenticated_punch(
+        self,
+        remote: &IceDescription,
+        credentials: crate::session_binding::SessionCredentials,
+        deadline: Duration,
+    ) -> Result<ManagedPath, MultiInterfaceError> {
+        let selected = self.candidates
+            .nominate_first_with_authenticated_punch(remote, credentials, deadline).await?;
+        let addr = selected.owner.handle.local_address();
+        let mut winner = None;
+        for (local, lease) in self.leases {
+            if local == addr && winner.is_none() {
+                winner = Some(lease);
+            } else {
+                tokio::spawn(async move { let _ = lease.shutdown().await; });
+            }
+        }
+        Ok(ManagedPath { selected, mapping_lease: winner })
+    }
+
     /// Strict ICE nomination is mandatory even for a gateway MAP success.
     /// Drop/close all losing gateway leases, keeping only the one backing the
     /// nominated UDP Owner alive for the subsequent authenticated QUIC session.
