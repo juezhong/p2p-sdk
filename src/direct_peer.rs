@@ -557,7 +557,7 @@ async fn race_authenticated_control(
                         ep.connect(address, "localhost")
                             .map_err(|_| DirectPeerError::QuicHandshake)?
                             .await.map_err(|_| DirectPeerError::QuicHandshake)
-                    }).await.map_err(|_| DirectPeerError::QuicHandshake)??;
+                    }).await.ok()?.ok()?;
                     let verified = PeerCertificatePin::new(pin).ok()
                         .is_some_and(|p| p.verify_connection(&conn).is_ok());
                     if verified && authenticate_initiator(
