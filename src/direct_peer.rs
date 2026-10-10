@@ -4,10 +4,12 @@
 //! ICE nomination, mutual TLS, authenticated Control/Data, and Data repair.
 //! User confirmation of the pairing remains a mandatory explicit gate.
 
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{net::SocketAddr, sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}};
 
 use crate::{
     ice_signaling::{IceDescription, IceRole},
+    local_network::local_addresses,
+    multi_interface::MAX_ACTIVE_INTERFACES,
     live_session::LiveSdkSession,
     managed_candidates::ManagedCandidates,
     manual_ice_v2::{self, ManualIceInvite},
@@ -30,6 +32,7 @@ const PUNCH_CADENCE: Duration = Duration::from_secs(2);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DirectPeerError {
     Identity,
+    Clock,
     CandidateGather,
     ManualSignal,
     Confirmation,
@@ -72,6 +75,69 @@ fn identity() -> Result<rcgen::CertifiedKey<rcgen::KeyPair>, DirectPeerError> {
         .map_err(|_| DirectPeerError::Identity)
 }
 
+fn current_unix_seconds() -> Result<u64, DirectPeerError> {
+    SystemTime::now().duration_since(UNIX_EPOCH)
+        .map(|value| value.as_secs()).map_err(|_| DirectPeerError::Clock)
+}
+
+fn discovered_interfaces() -> Result<Vec<SocketAddr>, DirectPeerError> {
+    let interfaces = local_addresses()
+        .map_err(|_| DirectPeerError::CandidateGather)?;
+    let addresses = interfaces.into_iter()
+        .take(MAX_ACTIVE_INTERFACES)
+        .map(|ip| SocketAddr::new(ip, 0)).collect::<Vec<_>>();
+    if addresses.is_empty() { return Err(DirectPeerError::CandidateGather); }
+    Ok(addresses)
+}
+
+async fn resolve_stun(host: &str) -> Vec<SocketAddr> {
+    let result = tokio::time::timeout(
+        Duration::from_millis(1200), tokio::net::lookup_host(host),
+    ).await;
+    match result {
+        Ok(Ok(addrs)) => addrs.collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// STUN is discovery-only. It may reveal the machine's public UDP endpoint
+/// to the STUN operator; it does not carry messages, keys or file contents.
+/// Offline LAN still works when all STUN/DNS probes fail or are disabled.
+pub async fn discover_default_stun() -> Vec<SocketAddr> {
+    if std::env::var_os("P2P_SDK_STUN").as_deref()
+        == Some(std::ffi::OsStr::new("off"))
+    {
+        return Vec::new();
+    }
+    let (first, second) = tokio::join!(
+        resolve_stun("stun.l.google.com:19302"),
+        resolve_stun("stun1.l.google.com:19302"),
+    );
+    let mut unique = Vec::new();
+    for addr in first.into_iter().chain(second) {
+        if !unique.contains(&addr) { unique.push(addr); }
+    }
+    unique
+}
+
+/// Fully automatic local address, UDP port and optional STUN discovery.
+/// No user-supplied IP, port or CLI send/receive role required.
+pub async fn begin_creator_auto()
+    -> Result<(PendingCreator, String), DirectPeerError>
+{
+    let interfaces = discovered_interfaces()?;
+    let stun = discover_default_stun().await;
+    begin_creator(&interfaces, &stun, current_unix_seconds()?, 1200).await
+}
+
+pub async fn begin_joiner_auto(invite: &str)
+    -> Result<(ReadyJoiner, String), DirectPeerError>
+{
+    let interfaces = discovered_interfaces()?;
+    let stun = discover_default_stun().await;
+    begin_joiner(invite, &interfaces, &stun, current_unix_seconds()?).await
+}
+
 /// Caller sends the returned INVITE text privately, then supplies the
 /// received REPLY to PendingCreator::receive_reply. No address or port is
 /// required from the end user: callers provide OS-enumerated local addresses.
@@ -91,6 +157,12 @@ pub async fn begin_creator(
 }
 
 impl PendingCreator {
+    pub fn receive_reply_now(self, code: &str)
+        -> Result<ReadyCreator, DirectPeerError>
+    {
+        self.receive_reply(code, current_unix_seconds()?)
+    }
+
     pub fn receive_reply(
         self, code: &str, now: u64,
     ) -> Result<ReadyCreator, DirectPeerError> {
@@ -144,6 +216,12 @@ fn trusted_certificate(bytes: Vec<u8>)
 }
 
 impl ReadyCreator {
+    pub async fn connect_now(self, confirmed: &ManualConfirmation)
+        -> Result<ConnectedDirectPeer, DirectPeerError>
+    {
+        self.connect(confirmed, current_unix_seconds()?).await
+    }
+
     pub fn comparison_code(&self) -> String {
         self.inner.pairing.comparison_code_text()
     }
@@ -200,6 +278,12 @@ impl ReadyCreator {
 }
 
 impl ReadyJoiner {
+    pub async fn connect_now(self, confirmed: &ManualConfirmation)
+        -> Result<ConnectedDirectPeer, DirectPeerError>
+    {
+        self.connect(confirmed, current_unix_seconds()?).await
+    }
+
     pub fn comparison_code(&self) -> String {
         self.inner.pairing.comparison_code_text()
     }
