@@ -321,10 +321,62 @@ async fn wait_for_authenticated_creator(
     gathered: &mut ManagedCandidates,
     pairing: &ManualPairing,
     remote: &IceDescription,
-) -> Result<(), DirectPeerError> {
+    endpoints: &std::collections::HashMap<SocketAddr, quinn::Endpoint>,
+    replay_guard: Arc<ReplayGuard>,
+) -> Result<Option<(SocketAddr, quinn::Connection)>, DirectPeerError> {
     let proofs = gathered.candidates.interfaces.iter().map(|interface| {
         AuthenticatedPunch::new(pairing.credentials.clone(), interface.local.role)
     }).collect::<Vec<_>>();
+    // JOIN 在等待用户人工传递 REPLY 的整个阶段保持 QUIC listener
+    // 运行；只有 mTLS PIN + 会话 HMAC 全部成功才允许网络活动唤醒。
+    let mut listeners = JoinSet::new();
+    for (&local, endpoint) in endpoints {
+        let endpoint = endpoint.clone();
+        let credentials = pairing.credentials.clone();
+        let pin = pairing.remote_tls_cert_sha256;
+        let guard = Arc::clone(&replay_guard);
+        listeners.spawn(async move {
+            let mut pending = JoinSet::new();
+            loop {
+                tokio::select! {
+                    accepted = endpoint.accept(), if pending.len() < MAX_PENDING_INBOUND_AUTH => {
+                        let Some(incoming) = accepted else { break };
+                        let credentials = credentials.clone();
+                        let guard = Arc::clone(&guard);
+                        pending.spawn(async move {
+                            let Ok(Ok(connection)) = timeout(AUTH_DEADLINE, incoming).await else {
+                                return None;
+                            };
+                            let verified = PeerCertificatePin::new(pin)
+                                .ok().is_some_and(|p| p.verify_connection(&connection).is_ok());
+                            if verified && authenticate_responder(
+                                connection.clone(), &credentials, ChannelRole::Control,
+                                &guard, AUTH_DEADLINE,
+                            ).await.is_ok() {
+                                Some(connection)
+                            } else {
+                                connection.close(1u32.into(), b"passive Control identity rejected");
+                                None
+                            }
+                        });
+                    }
+                    completed = pending.join_next(), if !pending.is_empty() => {
+                        if let Some(Ok(Some(connection))) = completed {
+                            pending.abort_all();
+                            while let Some(result) = pending.join_next().await {
+                                if let Ok(Some(loser)) = result {
+                                    loser.close(0u32.into(), b"passive Control loser");
+                                }
+                            }
+                            return Some((local, connection));
+                        }
+                    }
+                }
+            }
+            pending.abort_all();
+            None
+        });
+    }
     loop {
         for (interface, proof) in gathered.candidates.interfaces.iter_mut().zip(&proofs) {
             let handle = interface.owner.handle.clone();
@@ -342,7 +394,7 @@ async fn wait_for_authenticated_creator(
                 ) {
                     handle.send_ice(packet.source, &answer).await
                         .map_err(|_| DirectPeerError::IceCheck)?;
-                    return Ok(());
+                    return Ok(None);
                 }
             }
             let Some(packet) = (match interface.owner.punch_packets.try_recv() {
@@ -362,13 +414,20 @@ async fn wait_for_authenticated_creator(
             let reply = proof.make_packet(now).map_err(|_| DirectPeerError::IceCheck)?;
             handle.send_punch(packet.source, &reply).await
                 .map_err(|_| DirectPeerError::IceCheck)?;
-            return Ok(());
+            return Ok(None);
         }
         // Passive NAT keepalive does not turn unverified probes into ICE paths.
         for (interface, proof) in gathered.candidates.interfaces.iter().zip(&proofs) {
             let _ = proof.send_to_candidates(&interface.owner.handle, remote).await;
         }
-        tokio::time::sleep(PASSIVE_POLL).await;
+        tokio::select! {
+            received = listeners.join_next(), if !listeners.is_empty() => {
+                if let Some(Ok(Some(authenticated))) = received {
+                    return Ok(Some(authenticated));
+                }
+            }
+            _ = tokio::time::sleep(PASSIVE_POLL) => {}
+        }
     }
 }
 
