@@ -153,7 +153,7 @@ pub async fn gather_interfaces_with_mapping(
         if let Ok(Ok(owner)) = result { obtained.push(owner); }
     }
     if obtained.is_empty() { return Err(MultiInterfaceError::Bind); }
-    obtained.sort_by_key(|(index, _)| *index);
+    obtained.sort_by_key(|(index, _, _)| *index);
 
     // All independent ICE checks must use one exchanged ufrag/password pair.
     // No ICE agent may claim candidates collected on a different UDP owner.
