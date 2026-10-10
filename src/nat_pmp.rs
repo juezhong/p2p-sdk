@@ -188,6 +188,9 @@ where
                         }
                     }
                 }
+                // Windows reports asynchronous ICMP Port Unreachable from
+                // recv_from as ConnectionReset; keep the request deadline.
+                Ok(Err(err)) if crate::udp_errors::is_transient_unreachable(&err) => continue,
                 Ok(Err(err)) => return Err(PortMapError::Io(err)),
                 Err(_) => break,
             }

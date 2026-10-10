@@ -46,6 +46,7 @@ pub mod multi_interface;
 pub mod nat_pmp;
 pub mod nat_pmp_lease;
 pub mod gateway;
+mod udp_errors;
 pub mod managed_candidates;
 pub mod network_diagnostics;
 pub mod live_session;
