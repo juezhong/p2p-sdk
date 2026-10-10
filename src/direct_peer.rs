@@ -229,9 +229,23 @@ impl ReadyCreator {
         confirmation(&self.inner.pairing)
     }
 
+    /// Only one authenticated Data connection is created by default.
+    /// The application explicitly selects additional concurrent connections.
     pub async fn connect(
         self, confirmed: &ManualConfirmation, now: u64,
     ) -> Result<ConnectedDirectPeer, DirectPeerError> {
+        self.connect_with_data_connections(confirmed, now, 1).await
+    }
+
+    /// Choose transport connection concurrency; this is NOT a file lane
+    /// scheduler. The application owns message framing and stream allocation.
+    pub async fn connect_with_data_connections(
+        self, confirmed: &ManualConfirmation, now: u64,
+        desired_data_connections: usize,
+    ) -> Result<ConnectedDirectPeer, DirectPeerError> {
+        if !(1..=MAX_DATA_LANES).contains(&desired_data_connections) {
+            return Err(DirectPeerError::DataLanePool);
+        }
         let ReadyBase {
             identity, gathered, pairing, remote, remote_certificate,
         } = self.inner;
@@ -275,7 +289,7 @@ impl ReadyCreator {
         ).await.map_err(|_| DirectPeerError::VerifiedSession)?;
         let data_lanes = ResilientDataLanes::start_creator_with_independent_udp(
             &secure, endpoint.clone(), nominated.remote, &pairing,
-            client_config, MAX_DATA_LANES,
+            client_config, desired_data_connections,
         ).map_err(|_| DirectPeerError::DataLanePool)?;
         #[cfg(test)]
         eprintln!("DIRECT_TEST: establishing live session");
@@ -301,9 +315,23 @@ impl ReadyJoiner {
         confirmation(&self.inner.pairing)
     }
 
+    /// Only one authenticated Data connection is created by default.
+    /// The application explicitly selects additional concurrent connections.
     pub async fn connect(
         self, confirmed: &ManualConfirmation, now: u64,
     ) -> Result<ConnectedDirectPeer, DirectPeerError> {
+        self.connect_with_data_connections(confirmed, now, 1).await
+    }
+
+    /// Choose transport connection concurrency; this is NOT a file lane
+    /// scheduler. The application owns message framing and stream allocation.
+    pub async fn connect_with_data_connections(
+        self, confirmed: &ManualConfirmation, now: u64,
+        desired_data_connections: usize,
+    ) -> Result<ConnectedDirectPeer, DirectPeerError> {
+        if !(1..=MAX_DATA_LANES).contains(&desired_data_connections) {
+            return Err(DirectPeerError::DataLanePool);
+        }
         let ReadyBase {
             identity, gathered, pairing, remote, remote_certificate,
         } = self.inner;
@@ -349,7 +377,7 @@ impl ReadyJoiner {
             now, AUTH_DEADLINE,
         ).await.map_err(|_| DirectPeerError::VerifiedSession)?;
         let data_lanes = ResilientDataLanes::start_joiner(
-            &secure, endpoint.clone(), &pairing, guard, MAX_DATA_LANES,
+            &secure, endpoint.clone(), &pairing, guard, desired_data_connections,
         ).map_err(|_| DirectPeerError::DataLanePool)?;
         #[cfg(test)]
         eprintln!("DIRECT_TEST: establishing live session");
@@ -396,6 +424,8 @@ mod tests {
             eprintln!("DIRECT_TEST: both connected");
             let a = a.unwrap();
             let b = b.unwrap();
+            assert_eq!(a.data_lanes.subscribe().borrow().desired, 1);
+            assert_eq!(b.data_lanes.subscribe().borrow().desired, 1);
             let (mut tx, mut rx) =
                 a.session.verified().control().open_bi().await.unwrap();
             // QUIC does not notify the peer of a newly opened stream until
