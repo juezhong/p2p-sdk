@@ -40,11 +40,7 @@ file-pipeline internals.
   reconnects over the already nominated UDP path; after **Control loss** it
   stops instead of inventing ICE Restart or pretending a QUIC session survived
   network failure. Physical NAT/IPv6 firewall success still requires field tests.
-- The earlier dual-QUIC convenience facade `connect()` remains available for
-  compatibility and starts one initial Data connection.
-  `connect_with_data_connections(..., n)` opts into a supervised connection
-  pool (currently 1..=4). New non-Transfer consumers should prefer the generic
-  transport-only facade.
+- The fixed `connect_with_data_connections(..., n)` facade and old `ResilientDataLanes` pool are removed on SDK PR #59; Transfer PR #29 owns all four-lane application scheduling. Neither removal is considered released before both PRs are validated and merged.
 - Define application channel and stream semantics. In particular, Transfer owns
   the exact `4-lane` business strategy, file chunk assignment, ACK, ordering,
   cancellation and resumable transmission. The SDK must not transmit any file
