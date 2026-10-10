@@ -204,6 +204,48 @@ mod tests {
     use crate::ice_gather::gather;
 
     #[tokio::test]
+    async fn late_authenticated_peer_source_can_nominate_after_old_probe_window() {
+        tokio::time::timeout(Duration::from_secs(8), async {
+            let mut creator = UdpOwner::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+            let mut joiner = UdpOwner::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+            let creator_address = creator.handle.local_address();
+            let joiner_address = joiner.handle.local_address();
+            let local = gather(&creator.handle, &[], IceRole::Controlling,
+                Duration::from_millis(100)).await.unwrap().description;
+            let remote = gather(&joiner.handle, &[], IceRole::Controlled,
+                Duration::from_millis(100)).await.unwrap().description;
+            // The signaled endpoint became stale. The true endpoint is only
+            // learned from session-authenticated traffic after 900ms.
+            let mut stale = remote.clone();
+            stale.candidates[0].address = "127.0.0.1:9".parse().unwrap();
+            let credentials = crate::session_binding::SessionCredentials::new(
+                [5; 16], [7; 32],
+            ).unwrap();
+            let creator_proof = AuthenticatedPunch::new(
+                credentials.clone(), IceRole::Controlling,
+            );
+            let joiner_proof = AuthenticatedPunch::new(
+                credentials, IceRole::Controlled,
+            );
+            let (left, right) = tokio::join!(
+                nominate_with_authenticated_punch(
+                    &mut creator, &local, &stale,
+                    &creator_proof, Duration::from_secs(6),
+                ),
+                async {
+                    tokio::time::sleep(Duration::from_millis(900)).await;
+                    nominate_with_authenticated_punch(
+                        &mut joiner, &remote, &local,
+                        &joiner_proof, Duration::from_secs(5),
+                    ).await
+                },
+            );
+            assert_eq!(left.unwrap().remote, joiner_address);
+            assert_eq!(right.unwrap().remote, creator_address);
+        }).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn prefers_reachable_host_candidate_over_invalid_public_fallback() {
         let mut a = UdpOwner::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
         let mut b = UdpOwner::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
