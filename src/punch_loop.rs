@@ -36,6 +36,23 @@ impl PunchLoop {
     pub fn start(owner: &mut UdpOwner, peer: AuthenticatedPunch,
         remote: IceDescription, cadence: Duration) -> Result<Self, UdpOwnerError>
     {
+        Self::start_inner(owner, peer, remote, cadence, None)
+    }
+
+    /// The authenticated Control channel owns this NAT probing lifetime.
+    /// Once Control terminates, the punch task must not keep announcing the
+    /// previous session's candidate addresses indefinitely.
+    pub fn start_for_control(owner: &mut UdpOwner, peer: AuthenticatedPunch,
+        remote: IceDescription, cadence: Duration, control: quinn::Connection)
+        -> Result<Self, UdpOwnerError>
+    {
+        Self::start_inner(owner, peer, remote, cadence, Some(control))
+    }
+
+    fn start_inner(owner: &mut UdpOwner, peer: AuthenticatedPunch,
+        remote: IceDescription, cadence: Duration, control: Option<quinn::Connection>)
+        -> Result<Self, UdpOwnerError>
+    {
         if cadence < Duration::from_millis(100)
             || cadence > Duration::from_secs(60)
             || remote.validate().is_err()
@@ -54,6 +71,12 @@ impl PunchLoop {
             let mut sources = HashMap::<SocketAddr, Instant>::new();
             loop {
                 tokio::select! {
+                    _ = async {
+                        match control.as_ref() {
+                            Some(connection) => { connection.closed().await; }
+                            None => std::future::pending::<()>().await,
+                        }
+                    } => break,
                     changed = stopping.changed() => {
                         if changed.is_err() || *stopping.borrow() { break; }
                     }
