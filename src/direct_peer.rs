@@ -7,7 +7,7 @@
 use std::{net::SocketAddr, sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}};
 
 use crate::{
-    ice_signaling::{IceDescription, IceRole},
+    ice_signaling::{IceDescription, IceRole, IceCandidateType},
     local_network::local_addresses,
     multi_interface::MAX_ACTIVE_INTERFACES,
     live_session::LiveSdkSession,
@@ -499,6 +499,9 @@ impl ReadyCreator {
             pairing.credentials.session_id(), pairing.comparison_code,
         ).map_err(|_| DirectPeerError::Confirmation)?;
         if now >= pairing.expires_at { return Err(DirectPeerError::ManualSignal); }
+        let offered_host_candidates = gathered.candidates.combined.candidates.iter()
+            .filter(|c| c.kind == IceCandidateType::Host)
+            .map(|c| c.address).collect::<Vec<_>>();
 
         let sender = ConnectPunchSender::start(&gathered, &pairing, &remote);
         let mut path = gathered.nominate_first_with_authenticated_punch(
@@ -506,6 +509,8 @@ impl ReadyCreator {
         ).await.map_err(|_| DirectPeerError::IceCheck)?;
         drop(sender);
         let nominated = path.nominated();
+        let remote_candidate_kind = remote.candidates.iter()
+            .find(|c| c.address == nominated.remote).map(|c| c.kind);
         let tls = authenticated_client_config(
             vec![identity.cert.der().clone()],
             rustls::pki_types::PrivateKeyDer::Pkcs8(
@@ -542,6 +547,7 @@ impl ReadyCreator {
             credentials: pairing.credentials,
             remote_pin: pairing.remote_tls_cert_sha256,
             role: IceRole::Controlling, client_tls: Some(tls),
+            remote_candidate_kind, offered_host_candidates,
             replay_guard: Arc::new(ReplayGuard::new(4096)
                 .map_err(|_| DirectPeerError::VerifiedSession)?),
         })
@@ -565,11 +571,16 @@ impl ReadyJoiner {
             pairing.credentials.session_id(), pairing.comparison_code,
         ).map_err(|_| DirectPeerError::Confirmation)?;
         if now >= pairing.expires_at { return Err(DirectPeerError::ManualSignal); }
+        let offered_host_candidates = gathered.candidates.combined.candidates.iter()
+            .filter(|c| c.kind == IceCandidateType::Host)
+            .map(|c| c.address).collect::<Vec<_>>();
         wait_for_authenticated_creator(&mut gathered, &pairing, &remote).await?;
         let mut path = gathered.nominate_first_with_authenticated_punch(
             &remote, pairing.credentials.clone(), ICE_CHECK,
         ).await.map_err(|_| DirectPeerError::IceCheck)?;
         let nominated = path.nominated();
+        let remote_candidate_kind = remote.candidates.iter()
+            .find(|c| c.address == nominated.remote).map(|c| c.kind);
         let tls = authenticated_server_config(
             vec![identity.cert.der().clone()],
             rustls::pki_types::PrivateKeyDer::Pkcs8(
@@ -609,6 +620,7 @@ impl ReadyJoiner {
             credentials: pairing.credentials,
             remote_pin: pairing.remote_tls_cert_sha256,
             role: IceRole::Controlled, client_tls: None, replay_guard,
+            remote_candidate_kind, offered_host_candidates,
         })
     }
 }
