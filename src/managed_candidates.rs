@@ -46,6 +46,15 @@ impl ManagedPathRace {
             .map(|index| self.leases.swap_remove(index).1);
         Some(ManagedPath { selected, mapping_lease })
     }
+
+    /// 无论成功/失败均要完成取消任务与路由器映射删除，不能仅依赖
+    /// Drop 中的 best-effort 通知（应用可能马上退出 Tokio runtime）。
+    pub async fn cleanup(mut self) {
+        self.candidates.abort_and_join().await;
+        for (_, lease) in self.leases.drain(..) {
+            let _ = lease.shutdown().await;
+        }
+    }
 }
 
 impl ManagedCandidates {
