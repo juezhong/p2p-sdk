@@ -134,10 +134,16 @@ impl ConnectedTransportPeer {
                 result.map_err(|_| TransportError::Timeout)?
                     .map_err(|_| TransportError::QuicConnection)?,
         };
-        self.verify_remote(&connection)?;
-        authenticate_responder(connection.clone(), &self.credentials,
-            ChannelRole::Data, &self.replay_guard, deadline).await
-            .map_err(|_| TransportError::Authentication)?;
+        if let Err(error) = self.verify_remote(&connection) {
+            connection.close(1u32.into(), b"unverified remote certificate");
+            return Err(error);
+        }
+        if authenticate_responder(connection.clone(), &self.credentials,
+            ChannelRole::Data, &self.replay_guard, deadline).await.is_err()
+        {
+            connection.close(1u32.into(), b"invalid data session proof");
+            return Err(TransportError::Authentication);
+        }
         Ok(self.supervise_data(connection, None, None))
     }
 
@@ -161,10 +167,16 @@ impl ConnectedTransportPeer {
         let connection = endpoint.connect(remote, "localhost")
             .map_err(|_| TransportError::QuicConnection)?
             .await.map_err(|_| TransportError::QuicConnection)?;
-        self.verify_remote(&connection)?;
-        authenticate_initiator(connection.clone(), &self.credentials,
-            ChannelRole::Data, Duration::from_secs(6)).await
-            .map_err(|_| TransportError::Authentication)?;
+        if let Err(error) = self.verify_remote(&connection) {
+            connection.close(1u32.into(), b"unverified remote certificate");
+            return Err(error);
+        }
+        if authenticate_initiator(connection.clone(), &self.credentials,
+            ChannelRole::Data, Duration::from_secs(6)).await.is_err()
+        {
+            connection.close(1u32.into(), b"invalid data session proof");
+            return Err(TransportError::Authentication);
+        }
         Ok(connection)
     }
 
