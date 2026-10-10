@@ -4,7 +4,7 @@
 //! ICE nomination, mutual TLS, authenticated Control/Data, and Data repair.
 //! User confirmation of the pairing remains a mandatory explicit gate.
 
-use std::{collections::VecDeque, net::SocketAddr, sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}};
+use std::{collections::{HashSet, VecDeque}, net::SocketAddr, sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}};
 use tokio::{task::JoinSet, time::{timeout, Instant}};
 use is::{stun::{StunMessage, StunPacket}, Candidate, IceAgent, Protocol};
 
@@ -315,7 +315,7 @@ fn verified_ice_wake_response(
 }
 
 // 只有收到已认证的打洞或 ICE 报文，才将观察到的实际源端口加入后续 ICE。
- // 限额和去重防止恶意报文导致信令候选无界增长。
+// 限额和去重防止恶意报文导致信令候选无界增长。
 fn learn_verified_remote(remote: &mut IceDescription, source: SocketAddr) {
     if source.port() == 0 || source.ip().is_unspecified() || source.ip().is_multicast()
         || remote.candidates.iter().any(|candidate| candidate.address == source)
@@ -334,57 +334,119 @@ async fn wait_for_authenticated_creator(
     gathered: &mut ManagedCandidates,
     pairing: &ManualPairing,
     remote: &mut IceDescription,
-) -> Result<(), DirectPeerError> {
+    client_tls: &quinn::ClientConfig,
+    server_tls: &quinn::ServerConfig,
+    replay_guard: &Arc<ReplayGuard>,
+) -> Result<Option<(usize, quinn::Connection)>, DirectPeerError> {
+    // 提前在每个真正绑定的 UDP Owner 上创建 QUIC Endpoint。ICE 与 QUIC
+    // 仍使用同一个 recv loop；人工等待不启动 ICE/QUIC 总超时。
+    let mut listeners = JoinSet::new();
+    for (index, interface) in gathered.candidates.interfaces.iter_mut().enumerate() {
+        let adapter = QuinnUdpAdapter::from_owner(&mut interface.owner)
+            .map_err(|_| DirectPeerError::UdpAdapter)?;
+        let mut endpoint = quinn::Endpoint::new_with_abstract_socket(
+            demux_endpoint_config(), Some(server_tls.clone()), Arc::new(adapter),
+            quinn::default_runtime().ok_or(DirectPeerError::QuicEndpoint)?,
+        ).map_err(|_| DirectPeerError::QuicEndpoint)?;
+        endpoint.set_default_client_config(client_tls.clone());
+        interface.owner.passive_endpoint = Some(endpoint.clone());
+
+        let credentials = pairing.credentials.clone();
+        let pin = pairing.remote_tls_cert_sha256;
+        let guard = Arc::clone(replay_guard);
+        listeners.spawn(async move {
+            loop {
+                let Some(connecting) = endpoint.accept().await else {
+                    return None;
+                };
+                let Ok(Ok(connection)) = timeout(AUTH_DEADLINE, connecting).await else {
+                    continue;
+                };
+                let valid_pin = PeerCertificatePin::new(pin).ok()
+                    .is_some_and(|p| p.verify_connection(&connection).is_ok());
+                if !valid_pin || authenticate_responder(
+                    connection.clone(), &credentials, ChannelRole::Control,
+                    &guard, AUTH_DEADLINE,
+                ).await.is_err() {
+                    connection.close(1u32.into(), b"untrusted passive QUIC");
+                    continue;
+                }
+                // 创建方的选路消息是双端 Control 一致性屏障。
+                // TLS/HMAC 成功但未被创建方选中的连接绝不对外公布。
+                let selected = timeout(QUIC_ACCEPT, async {
+                    let mut stream = connection.accept_uni().await.ok()?;
+                    stream.read_to_end(48).await.ok()
+                }).await;
+                if matches!(selected, Ok(Some(ref bytes)) if bytes.as_slice() == CONTROL_PATH_SELECTED) {
+                    return Some((index, connection));
+                }
+                connection.close(1u32.into(), b"passive path not selected");
+            }
+        });
+    }
+    if listeners.is_empty() {
+        return Err(DirectPeerError::QuicEndpoint);
+    }
     let proofs = gathered.candidates.interfaces.iter().map(|interface| {
         AuthenticatedPunch::new(pairing.credentials.clone(), interface.local.role)
     }).collect::<Vec<_>>();
-    loop {
-        for (interface, proof) in gathered.candidates.interfaces.iter_mut().zip(&proofs) {
-            let handle = interface.owner.handle.clone();
-            // 创建方 ICE 检查可能先于 HMAC Punch 到达。验证其 STUN
-            // MESSAGE-INTEGRITY 后立即应答，才解除 JOIN 人工等待。
-            for _ in 0..8 {
-                let packet = match interface.owner.ice_packets.try_recv() {
+    let result = async {
+        loop {
+            for (interface, proof) in gathered.candidates.interfaces.iter_mut().zip(&proofs) {
+                let handle = interface.owner.handle.clone();
+                // 只允许 ICE Agent 真正校验过 MESSAGE-INTEGRITY 的报文唤醒。
+                for _ in 0..8 {
+                    let packet = match interface.owner.ice_packets.try_recv() {
+                        Ok(packet) => packet,
+                        Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                        Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) =>
+                            return Err(DirectPeerError::IceCheck),
+                    };
+                    if let Some(answer) = verified_ice_wake_response(
+                        &interface.local, remote, handle.local_address(), &packet,
+                    ) {
+                        handle.send_ice(packet.source, &answer).await
+                            .map_err(|_| DirectPeerError::IceCheck)?;
+                        learn_verified_remote(remote, packet.source);
+                        return Ok(None);
+                    }
+                }
+                let packet = match interface.owner.punch_packets.try_recv() {
                     Ok(packet) => packet,
-                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => continue,
                     Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) =>
                         return Err(DirectPeerError::IceCheck),
                 };
-                if let Some(answer) = verified_ice_wake_response(
-                    &interface.local, remote, handle.local_address(), &packet,
-                ) {
-                    handle.send_ice(packet.source, &answer).await
-                        .map_err(|_| DirectPeerError::IceCheck)?;
-                    learn_verified_remote(remote, packet.source);
-                    return Ok(());
+                let now = unix_seconds().map_err(|_| DirectPeerError::Clock)?;
+                if packet.source.is_ipv4() != handle.local_address().is_ipv4()
+                    || proof.authenticate(&packet.bytes, packet.source, now).is_err()
+                {
+                    continue;
                 }
+                let reply = proof.make_packet(now).map_err(|_| DirectPeerError::IceCheck)?;
+                handle.send_punch(packet.source, &reply).await
+                    .map_err(|_| DirectPeerError::IceCheck)?;
+                learn_verified_remote(remote, packet.source);
+                return Ok(None);
             }
-            let Some(packet) = (match interface.owner.punch_packets.try_recv() {
-                Ok(packet) => Some(packet),
-                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => None,
-                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) =>
-                    return Err(DirectPeerError::IceCheck),
-            }) else { continue };
-            let now = unix_seconds().map_err(|_| DirectPeerError::Clock)?;
-            if packet.source.is_ipv4() != handle.local_address().is_ipv4()
-                || proof.authenticate(&packet.bytes, packet.source, now).is_err()
-            {
-                continue;
+            for (interface, proof) in gathered.candidates.interfaces.iter().zip(&proofs) {
+                let _ = proof.send_to_candidates(&interface.owner.handle, remote).await;
             }
-            // Respond to the verified observed endpoint, not merely the
-            // signaled address (which may be stale behind symmetric NAT).
-            let reply = proof.make_packet(now).map_err(|_| DirectPeerError::IceCheck)?;
-            handle.send_punch(packet.source, &reply).await
-                .map_err(|_| DirectPeerError::IceCheck)?;
-            learn_verified_remote(remote, packet.source);
-            return Ok(());
+            tokio::select! {
+                joined = listeners.join_next() => {
+                    match joined {
+                        Some(Ok(Some(authenticated))) => return Ok(Some(authenticated)),
+                        Some(_) => {},
+                        None => return Err(DirectPeerError::QuicHandshake),
+                    }
+                }
+                _ = tokio::time::sleep(PASSIVE_POLL) => {}
+            }
         }
-        // Passive NAT keepalive does not turn unverified probes into ICE paths.
-        for (interface, proof) in gathered.candidates.interfaces.iter().zip(&proofs) {
-            let _ = proof.send_to_candidates(&interface.owner.handle, remote).await;
-        }
-        tokio::time::sleep(PASSIVE_POLL).await;
-    }
+    }.await;
+    listeners.abort_all();
+    while listeners.join_next().await.is_some() {}
+    result
 }
 
 fn confirmation(pairing: &ManualPairing)
@@ -457,15 +519,25 @@ async fn race_authenticated_control(
     pairing: &ManualPairing,
     role: IceRole,
     replay_guard: Arc<ReplayGuard>,
+    mut live_punch: Option<(
+        crate::udp_owner::UdpOwnerHandle,
+        &mut tokio::sync::mpsc::Receiver<InboundDatagram>,
+    )>,
 ) -> Result<(quinn::Connection, bool), DirectPeerError> {
     let mut workers = JoinSet::new();
     let outgoing = endpoint.clone();
     let credentials = pairing.credentials.clone();
     let pin = pairing.remote_tls_cert_sha256;
     let dial_addrs = quic_candidate_destinations(remote, advertised);
+    let (learned_tx, mut learned_rx) = tokio::sync::watch::channel(Vec::<SocketAddr>::new());
+    let punch_proof = AuthenticatedPunch::new(pairing.credentials.clone(), role);
+    let mut punch_tick = tokio::time::interval(Duration::from_millis(250));
+    punch_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     workers.spawn(async move {
         let expires = Instant::now() + QUIC_ACCEPT;
         let mut backlog: VecDeque<_> = dial_addrs.iter().copied().collect();
+        let mut known = dial_addrs.iter().copied().collect::<HashSet<_>>();
+        let mut learned = Vec::<SocketAddr>::new();
         let mut attempts = JoinSet::new();
         loop {
             while attempts.len() < 4 {
@@ -491,21 +563,35 @@ async fn race_authenticated_control(
                     }
                 });
             }
-            if attempts.is_empty() && backlog.is_empty() {
-                if Instant::now() >= expires {
+            tokio::select! {
+                result = attempts.join_next(), if !attempts.is_empty() => {
+                    if let Some(Ok(Ok(authenticated))) = result {
+                        attempts.abort_all();
+                        return Ok(authenticated);
+                    }
+                }
+                changed = learned_rx.changed() => {
+                    if changed.is_ok() {
+                        let updated = learned_rx.borrow_and_update().clone();
+                        for address in updated {
+                            if address.is_ipv4() == remote.is_ipv4()
+                                && known.insert(address)
+                            {
+                                learned.push(address);
+                                backlog.push_back(address);
+                            }
+                        }
+                    }
+                }
+                _ = tokio::time::sleep(Duration::from_millis(180)),
+                    if attempts.is_empty() && backlog.is_empty() => {
+                    backlog.extend(dial_addrs.iter().copied());
+                    backlog.extend(learned.iter().copied());
+                }
+                _ = tokio::time::sleep_until(expires) => {
+                    attempts.abort_all();
                     return Err(DirectPeerError::QuicHandshake);
                 }
-                tokio::time::sleep(Duration::from_millis(180)).await;
-                backlog.extend(dial_addrs.iter().copied());
-                continue;
-            }
-            match tokio::time::timeout_at(expires, attempts.join_next()).await {
-                Ok(Some(Ok(Ok(authenticated)))) => {
-                    attempts.abort_all();
-                    return Ok(authenticated);
-                }
-                Ok(Some(_)) => {}
-                _ => return Err(DirectPeerError::QuicHandshake),
             }
         }
     });
@@ -537,6 +623,7 @@ async fn race_authenticated_control(
     let prefer_outbound = role == IceRole::Controlled;
     let result = timeout(QUIC_ACCEPT, async {
         let mut fallback: Option<(quinn::Connection, bool)> = None;
+        let mut fallback_deadline: Option<Instant> = None;
         loop {
             tokio::select! {
                 result = workers.join_next() => {
@@ -550,6 +637,9 @@ async fn race_authenticated_control(
                             }
                             if fallback.is_none() {
                                 fallback = Some((connection, outbound));
+                                fallback_deadline = Some(
+                                    Instant::now() + Duration::from_millis(600),
+                                );
                             } else {
                                 connection.close(0u32.into(), b"connection race loser");
                             }
@@ -558,13 +648,47 @@ async fn race_authenticated_control(
                         None => return fallback.ok_or(DirectPeerError::QuicHandshake),
                     }
                 }
-                _ = tokio::time::sleep(Duration::from_millis(300)), if fallback.is_some() => {
+                packet = async {
+                    match live_punch.as_mut() {
+                        Some((_, receiver)) => receiver.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if let Some(packet) = packet {
+                        if let Ok(now) = unix_seconds() {
+                            if punch_proof.authenticate(&packet.bytes, packet.source, now).is_ok()
+                                && packet.source.is_ipv4() == remote.is_ipv4()
+                            {
+                                let source = packet.source;
+                                learned_tx.send_modify(|known| {
+                                    if known.len() < MAX_CANDIDATES && !known.contains(&source) {
+                                        known.push(source);
+                                    }
+                                });
+                                if let Some((handle, _)) = live_punch.as_ref() {
+                                    if let Ok(reply) = punch_proof.make_packet(now) {
+                                        let _ = handle.send_punch(source, &reply).await;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                _ = punch_tick.tick(), if live_punch.is_some() => {
+                    if let Some((handle, _)) = live_punch.as_ref() {
+                        let _ = punch_proof.send_to_candidates(handle, advertised).await;
+                    }
+                }
+                _ = tokio::time::sleep_until(fallback_deadline.unwrap_or(
+                    Instant::now() + QUIC_ACCEPT
+                )), if fallback_deadline.is_some() => {
                     return fallback.ok_or(DirectPeerError::QuicHandshake);
                 }
             }
         }
     }).await;
     workers.abort_all();
+    while workers.join_next().await.is_some() {}
     result.unwrap_or(Err(DirectPeerError::QuicHandshake))
 }
 
@@ -580,15 +704,22 @@ async fn authenticate_on_path(
     replay_guard: Arc<ReplayGuard>,
 ) -> Result<(ManagedPath, quinn::Endpoint, quinn::Connection, bool), DirectPeerError> {
     let remote = path.nominated().remote;
-    let adapter = QuinnUdpAdapter::from_owner(&mut path.selected.owner)
-        .map_err(|_| DirectPeerError::UdpAdapter)?;
-    let mut endpoint = quinn::Endpoint::new_with_abstract_socket(
-        demux_endpoint_config(), Some(server_tls), Arc::new(adapter),
-        quinn::default_runtime().ok_or(DirectPeerError::QuicEndpoint)?,
-    ).map_err(|_| DirectPeerError::QuicEndpoint)?;
-    endpoint.set_default_client_config(client_tls);
+    let endpoint = if let Some(endpoint) = path.selected.owner.passive_endpoint.take() {
+        endpoint
+    } else {
+        let adapter = QuinnUdpAdapter::from_owner(&mut path.selected.owner)
+            .map_err(|_| DirectPeerError::UdpAdapter)?;
+        let mut endpoint = quinn::Endpoint::new_with_abstract_socket(
+            demux_endpoint_config(), Some(server_tls), Arc::new(adapter),
+            quinn::default_runtime().ok_or(DirectPeerError::QuicEndpoint)?,
+        ).map_err(|_| DirectPeerError::QuicEndpoint)?;
+        endpoint.set_default_client_config(client_tls);
+        endpoint
+    };
+    let handle = path.selected.owner.handle.clone();
     let (control, outbound) = race_authenticated_control(
         &endpoint, remote, &advertised, &pairing, role, replay_guard,
+        Some((handle, &mut path.selected.owner.punch_packets)),
     ).await?;
     let actual_remote = control.remote_address();
     if outbound && actual_remote != remote
@@ -698,18 +829,6 @@ async fn connect_authenticated_transport(
     let offered_host_candidates = gathered.candidates.combined.candidates.iter()
         .filter(|candidate| candidate.kind == IceCandidateType::Host)
         .map(|candidate| candidate.address).collect::<Vec<_>>();
-    if role == IceRole::Controlled {
-        wait_for_authenticated_creator(&mut gathered, &pairing, &mut remote).await?;
-    }
-    let sender = if role == IceRole::Controlling {
-        Some(ConnectPunchSender::start(&gathered, &pairing, &remote))
-    } else {
-        None
-    };
-    let mut candidates = gathered.start_authenticated_path_race(
-        &remote, pairing.credentials.clone(), ICE_CHECK,
-    ).map_err(|_| DirectPeerError::IceCheck)?;
-
     let trusted = trusted_certificate(remote_certificate)?;
     let cert = vec![identity.cert.der().clone()];
     let private_key = || rustls::pki_types::PrivateKeyDer::Pkcs8(
@@ -723,6 +842,31 @@ async fn connect_authenticated_transport(
     ).map_err(|_| DirectPeerError::TlsConfig)?;
     let replay_guard = Arc::new(ReplayGuard::new(4096)
         .map_err(|_| DirectPeerError::VerifiedSession)?);
+    let passive = if role == IceRole::Controlled {
+        wait_for_authenticated_creator(
+            &mut gathered, &pairing, &mut remote,
+            &client_tls, &server_tls, &replay_guard,
+        ).await?
+    } else {
+        None
+    };
+    let winner = if let Some((index, control)) = passive {
+        let peer_address = control.remote_address();
+        learn_verified_remote(&mut remote, peer_address);
+        let mut path = gathered.take_authenticated_inbound(index, peer_address).await
+            .ok_or(DirectPeerError::LiveSession)?;
+        let endpoint = path.selected.owner.passive_endpoint.take()
+            .ok_or(DirectPeerError::QuicEndpoint)?;
+        (path, endpoint, control, false)
+    } else {
+    let sender = if role == IceRole::Controlling {
+        Some(ConnectPunchSender::start(&gathered, &pairing, &remote))
+    } else {
+        None
+    };
+    let mut candidates = gathered.start_authenticated_path_race(
+        &remote, pairing.credentials.clone(), ICE_CHECK,
+    ).map_err(|_| DirectPeerError::IceCheck)?;
     let mut in_flight = JoinSet::new();
     let mut ice_exhausted = false;
     let limit = Instant::now() + ICE_CHECK + QUIC_ACCEPT;
@@ -807,7 +951,8 @@ async fn connect_authenticated_transport(
     while in_flight.join_next().await.is_some() {}
     drop(sender);
     candidates.cleanup().await;
-    let winner = result?;
+    result?
+    };
     if role == IceRole::Controlling {
         let selected = async {
             let mut stream = winner.2.open_uni().await
@@ -979,6 +1124,7 @@ mod tests {
                     &a.endpoint, invalid, &offer, &binding,
                     IceRole::Controlling,
                     Arc::new(ReplayGuard::new(4096).unwrap()),
+                    None,
                 ),
                 async {
                     let connection = b.endpoint.accept().await.unwrap().await.unwrap();
@@ -999,6 +1145,86 @@ mod tests {
             a.shutdown().await;
             b.shutdown().await;
         }).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn late_authenticated_punch_updates_active_quic_race() {
+        // 竞速启动时仅有不可达地址，之后从已认证 HMAC Punch
+        // 学到新端口；必须在同一轮竞速中重新尝试并完成 mTLS/HMAC。
+        tokio::time::timeout(Duration::from_secs(65), async {
+            let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+            let now = 1_800_000_000;
+            let (pending, invite) = begin_creator(&[bind], &[], now, 1200)
+                .await.unwrap();
+            let (joiner, reply) = begin_joiner(&invite, &[bind], &[], now)
+                .await.unwrap();
+            let creator = pending.receive_reply(&reply, now).unwrap();
+            let mut cc = creator.confirmation().unwrap();
+            let mut jc = joiner.confirmation().unwrap();
+            cc.confirm(&creator.comparison_code()).unwrap();
+            jc.confirm(&joiner.comparison_code()).unwrap();
+            let (left, right) = tokio::join!(
+                creator.connect_transport(&cc, now),
+                joiner.connect_transport(&jc, now),
+            );
+            let left = left.unwrap();
+            let right = right.unwrap();
+            let actual = right.diagnostic().actual_local_udp;
+            let invalid: SocketAddr = "127.0.0.1:9".parse().unwrap();
+            let advertised = IceDescription {
+                role: IceRole::Controlled,
+                ufrag: "new-ufrag".into(),
+                password: "abcdefghijklmnopqrstuv123456".into(),
+                candidates: vec![IceCandidate {
+                    address: invalid,
+                    kind: IceCandidateType::Host,
+                    priority: 1,
+                }],
+            };
+            let binding = ManualPairing {
+                credentials: left.credentials.clone(),
+                remote_tls_cert_sha256: left.remote_pin,
+                comparison_code: 123456,
+                expires_at: u64::MAX,
+            };
+            let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+            let authenticated_packet = InboundDatagram {
+                source: actual,
+                bytes: AuthenticatedPunch::new(
+                    right.credentials.clone(), IceRole::Controlled
+                ).make_packet(unix_seconds().unwrap()).unwrap(),
+            };
+            let recv_proof = right.credentials.clone();
+            let recv_pin = right.remote_pin;
+            let (dialed, accepted) = tokio::join!(
+                race_authenticated_control(
+                    &left.endpoint, invalid, &advertised, &binding,
+                    IceRole::Controlling,
+                    Arc::new(ReplayGuard::new(4096).unwrap()),
+                    Some((left.path.selected.owner.handle.clone(), &mut rx)),
+                ),
+                async {
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                    tx.send(authenticated_packet).await.unwrap();
+                    let connection = right.endpoint.accept().await.unwrap()
+                        .await.unwrap();
+                    PeerCertificatePin::new(recv_pin).unwrap()
+                        .verify_connection(&connection).unwrap();
+                    authenticate_responder(
+                        connection.clone(), &recv_proof, ChannelRole::Control,
+                        &ReplayGuard::new(4096).unwrap(), AUTH_DEADLINE,
+                    ).await.unwrap();
+                    connection
+                },
+            );
+            let (connection, outbound) = dialed.unwrap();
+            assert!(outbound);
+            assert_eq!(connection.remote_address(), actual);
+            connection.close(0u32.into(), b"dynamic prflx test finished");
+            accepted.close(0u32.into(), b"dynamic prflx test finished");
+            left.shutdown().await;
+            right.shutdown().await;
+        }).await.expect("live authenticated NAT endpoint must be retried");
     }
 
     #[tokio::test]
@@ -1120,6 +1346,71 @@ mod tests {
         assert_eq!(creator.comparison_code(), joiner.comparison_code());
         assert!(creator.confirmation().is_ok());
         assert!(joiner.confirmation().is_ok());
+    }
+
+    #[tokio::test]
+    async fn joiner_accepts_authenticated_quic_before_any_punch_or_ice() {
+        // 创建方直接发送 QUIC，不启动 creator.connect_transport，
+        // 因而不存在 HMAC Punch 或早到 ICE 唤醒作为前置条件。
+        tokio::time::timeout(Duration::from_secs(25), async {
+            let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+            let now = 1_800_000_000;
+            let (pending, invite) = begin_creator(&[bind], &[], now, 1200)
+                .await.unwrap();
+            let (joiner, reply) = begin_joiner(&invite, &[bind], &[], now)
+                .await.unwrap();
+            let mut creator = pending.receive_reply(&reply, now).unwrap();
+            let mut confirmation = joiner.confirmation().unwrap();
+            confirmation.confirm(&joiner.comparison_code()).unwrap();
+            let join_address = joiner.inner.gathered.candidates.interfaces[0]
+                .owner.handle.local_address();
+            let creator_address = creator.inner.gathered.candidates.interfaces[0]
+                .owner.handle.local_address();
+            let trust = trusted_certificate(
+                creator.inner.remote_certificate.clone()
+            ).unwrap();
+            let cert = vec![creator.inner.identity.cert.der().clone()];
+            let private_key = rustls::pki_types::PrivateKeyDer::Pkcs8(
+                creator.inner.identity.signing_key.serialize_der().into()
+            );
+            let config = authenticated_client_config(
+                cert, private_key, trust,
+            ).unwrap();
+            let adapter = QuinnUdpAdapter::from_owner(
+                &mut creator.inner.gathered.candidates.interfaces[0].owner
+            ).unwrap();
+            let mut endpoint = quinn::Endpoint::new_with_abstract_socket(
+                demux_endpoint_config(), None, Arc::new(adapter),
+                quinn::default_runtime().unwrap(),
+            ).unwrap();
+            endpoint.set_default_client_config(config);
+            let credentials = creator.inner.pairing.credentials.clone();
+            let pin = creator.inner.pairing.remote_tls_cert_sha256;
+            let pending_join = tokio::spawn(async move {
+                joiner.connect_transport(&confirmation, now).await
+            });
+            let connection = endpoint.connect(join_address, "localhost")
+                .unwrap().await.unwrap();
+            PeerCertificatePin::new(pin).unwrap()
+                .verify_connection(&connection).unwrap();
+            authenticate_initiator(
+                connection.clone(), &credentials, ChannelRole::Control,
+                AUTH_DEADLINE,
+            ).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            assert!(!pending_join.is_finished(), "HMAC alone cannot choose Control");
+            let mut selected = connection.open_uni().await.unwrap();
+            selected.write_all(CONTROL_PATH_SELECTED).await.unwrap();
+            selected.finish().unwrap();
+            let peer = pending_join.await.unwrap().unwrap();
+            assert!(peer.diagnostic().control_connected);
+            assert!(!peer.diagnostic().control_outbound);
+            assert_eq!(peer.diagnostic().actual_remote_udp, creator_address);
+            peer.shutdown().await;
+            connection.close(0u32.into(), b"passive test finished");
+            endpoint.close(0u32.into(), b"passive test finished");
+            drop(creator);
+        }).await.expect("verified QUIC must connect without a pre-ICE wakeup");
     }
 
     #[tokio::test]

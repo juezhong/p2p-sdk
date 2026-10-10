@@ -75,3 +75,8 @@ TCP ICE、完整 Mesh 路由、强制账号服务、TURN/其他业务中继、VP
 - Trickle ICE: https://www.rfc-editor.org/rfc/rfc8838
 - Quinn: https://docs.rs/quinn/latest/quinn/
 - 独立 Sans-I/O ICE 候选: https://docs.rs/is/latest/is/
+
+
+## 2026-10-10：被动 QUIC / ICE 共 socket 生命周期（SDK PR #70 待 CI）
+
+JOIN 人工等待期间在每个已绑定 UdpOwner 上创建 Quinn Endpoint，先于有限 ICE timeout 接纳入站 QUIC。所有 QUIC 仍由唯一 recv loop 分包。若先收到经过 ICE MESSAGE-INTEGRITY 或 HMAC Punch 的流量，进入常规认证 ICE 竞速，并复用已有 Endpoint（严禁二次接管 QUIC 队列）。若先完成 QUIC 双向 mTLS、Session HMAC 与创建方的 Control-path 选择消息，可使用实际 QUIC 验证过的同一 UDP Owner 建立 Control，不再伪称发生过 ICE nomination。失败/取消关闭所有落选 Endpoint 和 UDP Owner，显式清理网关租约。

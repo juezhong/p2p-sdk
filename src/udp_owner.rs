@@ -124,6 +124,9 @@ pub struct UdpOwner {
     pub(crate) quic_packets: mpsc::Receiver<InboundDatagram>,
     pub(crate) socket: Arc<UdpSocket>,
     pub(crate) quic_adapter_taken: bool,
+    // JOIN 在进入有限 ICE 检查前创建的真实 QUIC listener。
+    // 与后续 ICE/QUIC 共用原 UDP socket，不能再次接管 QUIC 队列。
+    pub(crate) passive_endpoint: Option<quinn::Endpoint>,
     task: JoinHandle<()>,
 }
 
@@ -145,6 +148,7 @@ impl UdpOwner {
             quic_packets: quic_rx,
             socket,
             quic_adapter_taken: false,
+            passive_endpoint: None,
             task,
         })
     }
@@ -152,6 +156,9 @@ impl UdpOwner {
 
 impl Drop for UdpOwner {
     fn drop(&mut self) {
+        if let Some(endpoint) = self.passive_endpoint.take() {
+            endpoint.close(0u32.into(), b"UDP owner released");
+        }
         self.task.abort();
     }
 }

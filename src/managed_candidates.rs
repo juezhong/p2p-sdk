@@ -82,6 +82,41 @@ impl ManagedCandidates {
         Ok(Self { candidates: set, leases })
     }
 
+    /// QUIC listener 可在人工 JOIN 等待阶段先于 ICE 收到完整认证连接。
+    /// mTLS/会话 HMAC 和创建方 Control 选择标记均通过后，取回它所在的
+    /// 原 UDP Owner，其他 Owner/映射显式关闭；不将 QUIC 认证伪称为 ICE 提名。
+    pub async fn take_authenticated_inbound(
+        mut self, index: usize, remote: SocketAddr,
+    ) -> Option<ManagedPath> {
+        if index >= self.candidates.interfaces.len() {
+            return None;
+        }
+        let interface = self.candidates.interfaces.swap_remove(index);
+        let local = interface.owner.handle.local_address();
+        if local.is_ipv4() != remote.is_ipv4()
+            || remote.port() == 0 || remote.ip().is_unspecified()
+            || remote.ip().is_multicast()
+        {
+            return None;
+        }
+        let mapping_lease = self.leases.iter().position(|(address, _)| *address == local)
+            .map(|position| self.leases.swap_remove(position).1);
+        let mut cleanup = tokio::task::JoinSet::new();
+        for (_, lease) in self.leases.drain(..) {
+            cleanup.spawn(async move { let _ = lease.shutdown().await; });
+        }
+        while cleanup.join_next().await.is_some() {}
+        // 不同接口的 UdpOwner 随 CandidateSet 被销毁并关闭其 listener。
+        Some(ManagedPath {
+            selected: SelectedDirectPath {
+                owner: interface.owner,
+                path: NominatedPath { local, remote },
+                stun_mapping: interface.stun_mapping,
+            },
+            mapping_lease,
+        })
+    }
+
     pub fn start_authenticated_path_race(
         self, remote: &IceDescription,
         credentials: crate::session_binding::SessionCredentials,

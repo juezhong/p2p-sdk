@@ -44,3 +44,10 @@ STUN 是 ICE 使用的协议，既可通过服务器发现映射（srflx），�
 - RFC 8489 STUN: https://www.rfc-editor.org/rfc/rfc8489
 - RFC 8838 Trickle ICE: https://www.rfc-editor.org/rfc/rfc8838
 - RFC 8863 ICE PAC: https://www.rfc-editor.org/rfc/rfc8863
+
+
+## 2026-10-10：Go 被动接纳 / 运行期 prflx 竞速
+
+Go v0.16.4 除 ICE/STUN 唤醒外，还允许创建方的 QUIC Initial 首先到达；Rust JOIN 在确认会话后提前开启各个真实 socket 的 QUIC listener。只有 mTLS、Session HMAC 与创建方 Control-path 选择均成功，才可以直接接受被动 QUIC；未认证 QUIC 报文不是就绪证据。ICE 成功路径继续使用原始 UDP Owner。
+
+已通过 HMAC/角色/nonce 校验发现的新 NAT 端口，进入当前 QUIC 重试目标集合，而非仅用于诊断；实际使用该端口仍须通过完整 mTLS + 会话 HMAC。动态地址不等于独立 ICE nomination，也不能提高 LAN 选路等级。竞速有总截止时间，失败明确返回，不引入 Relay。现场 NAT/IPv6 防火墙和多网卡回归仍需记录。

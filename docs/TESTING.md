@@ -53,3 +53,12 @@
 ```
 
 这是结构示意，真正的报告应包含结构化错误、时间戳、观测来源与隐私分级。
+
+
+## SDK #70 联合网络/会话回归（待最新 CI 结果）
+
+- joiner_accepts_authenticated_quic_before_any_punch_or_ice：创建方跳过 Punch/ICE，通过同一 UDP socket 启动真实 QUIC+mTLS+HMAC，创建方选路消息到达前 JOIN 不报告成功。
+- late_authenticated_punch_updates_active_quic_race：初始只有不可达地址，竞速中注入合法 HMAC 的真实对端端口，再建立认证 QUIC。
+- passive_authenticated_source_is_added_once_and_bounded：验证源地址去重、无效地址和最多 32 条候选限制。
+- 既有 overlapping_private_candidates_cannot_replace_verified_reachable_path、unreachable_ipv6_family_does_not_block_authenticated_ipv4_control、quic_path_race_shutdown_releases_all_advertised_udp_ports、generic_managed_data_recovers_without_transfer_lane_scheduler 保持覆盖。
+- 以上均为自动化软件测试，真实多 NAT、CGNAT、IPv6 防火墙、24h soak 仍需双机证据；PR 提交不等于 CI 通过。
