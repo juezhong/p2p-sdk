@@ -7,22 +7,29 @@
 //! 自动化 CI 与环回连接成功不代表真实复杂 NAT 环境已完成对等验收。
 
 pub mod candidate;
+#[doc(hidden)]
 pub mod channel;
+#[doc(hidden)]
 pub mod dual_quic;
+#[doc(hidden)]
 pub mod config;
 pub mod packet_demux;
 pub mod peer_pin;
 pub mod manual_pairing;
 pub mod session_binding;
+#[doc(hidden)]
 pub mod state;
 pub mod stun;
 pub mod stun_client;
 pub mod tls_identity;
 
 pub use candidate::{Candidate, CandidateKind, Family, TransportProtocol};
+#[doc(hidden)]
 pub use config::{Config, ConfigError};
+#[doc(hidden)]
 pub use state::{ConnectionPhase, ConnectionState, StateError};
 
+#[doc(hidden)]
 pub mod verified_session;
 
 pub mod ice_signaling;
@@ -52,6 +59,7 @@ pub mod gateway;
 mod udp_errors;
 pub mod managed_candidates;
 pub mod network_diagnostics;
+#[doc(hidden)]
 pub mod live_session;
 pub mod direct_peer;
 /// Generic Control-only network session with opt-in authenticated QUIC links.
