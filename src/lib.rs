@@ -50,6 +50,7 @@ mod udp_errors;
 pub mod managed_candidates;
 pub mod network_diagnostics;
 pub mod live_session;
+pub mod direct_peer;
 pub mod upnp_lease;
 pub mod pcp;
 pub mod pcp_lease;
