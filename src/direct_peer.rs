@@ -687,18 +687,38 @@ async fn authenticate_on_path(
     advertised: IceDescription,
     role: IceRole,
     replay_guard: Arc<ReplayGuard>,
+    prebound_endpoint: Option<quinn::Endpoint>,
+    preauthenticated_control: Option<quinn::Connection>,
 ) -> Result<(ManagedPath, quinn::Endpoint, quinn::Connection, bool), DirectPeerError> {
     let remote = path.nominated().remote;
-    let adapter = QuinnUdpAdapter::from_owner(&mut path.selected.owner)
-        .map_err(|_| DirectPeerError::UdpAdapter)?;
-    let mut endpoint = quinn::Endpoint::new_with_abstract_socket(
-        demux_endpoint_config(), Some(server_tls), Arc::new(adapter),
-        quinn::default_runtime().ok_or(DirectPeerError::QuicEndpoint)?,
-    ).map_err(|_| DirectPeerError::QuicEndpoint)?;
+    let mut endpoint = if let Some(endpoint) = prebound_endpoint {
+        endpoint
+    } else {
+        let adapter = QuinnUdpAdapter::from_owner(&mut path.selected.owner)
+            .map_err(|_| DirectPeerError::UdpAdapter)?;
+        quinn::Endpoint::new_with_abstract_socket(
+            demux_endpoint_config(), Some(server_tls), Arc::new(adapter),
+            quinn::default_runtime().ok_or(DirectPeerError::QuicEndpoint)?,
+        ).map_err(|_| DirectPeerError::QuicEndpoint)?
+    };
     endpoint.set_default_client_config(client_tls);
-    let (control, outbound) = race_authenticated_control(
-        &endpoint, remote, &advertised, &pairing, role, replay_guard,
-    ).await?;
+    // 被动阶段已经验证 mTLS 与会话 HMAC 的连接仍必须与本 UDP
+    // Owner 的有效 ICE 提名绑定，不能仅凭早到 QUIC 绕过连通性检查。
+    let (control, outbound) = if let Some(connection) =
+        preauthenticated_control.filter(|c| c.close_reason().is_none())
+    {
+        (connection, false)
+    } else {
+        match race_authenticated_control(
+            &endpoint, remote, &advertised, &pairing, role, replay_guard,
+        ).await {
+            Ok(result) => result,
+            Err(error) => {
+                endpoint.close(1u32.into(), b"Control authentication failed");
+                return Err(error);
+            }
+        }
+    };
     let actual_remote = control.remote_address();
     if outbound && actual_remote != remote
         && !advertised.candidates.iter().any(|candidate| candidate.address == actual_remote)
