@@ -12,6 +12,7 @@ use crate::{
     multi_interface::MAX_ACTIVE_INTERFACES,
     live_session::LiveSdkSession,
     managed_candidates::ManagedCandidates,
+    punch::{AuthenticatedPunch, unix_seconds},
     manual_ice_v2::{self, ManualIceInvite},
     manual_pairing::ManualPairing,
     peer_pin::ManualConfirmation,
@@ -28,6 +29,7 @@ const ICE_CHECK: Duration = Duration::from_secs(30);
 const QUIC_ACCEPT: Duration = Duration::from_secs(45);
 const AUTH_DEADLINE: Duration = Duration::from_secs(10);
 const PUNCH_CADENCE: Duration = Duration::from_secs(2);
+const PASSIVE_POLL: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DirectPeerError {
@@ -198,6 +200,85 @@ pub async fn begin_joiner(
     } }, reply))
 }
 
+/// Go runs authenticated Punch concurrently with the creator's connectivity
+/// attempts. An isolated pre-ICE probe can end before the joiner sees it.
+struct ConnectPunchSender {
+    workers: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl ConnectPunchSender {
+    fn start(
+        gathered: &ManagedCandidates,
+        pairing: &ManualPairing,
+        remote: &IceDescription,
+    ) -> Self {
+        let mut workers = Vec::new();
+        for interface in &gathered.candidates.interfaces {
+            let handle = interface.owner.handle.clone();
+            let proof = AuthenticatedPunch::new(
+                pairing.credentials.clone(), interface.local.role,
+            );
+            let remote = remote.clone();
+            workers.push(tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(PASSIVE_POLL);
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    ticker.tick().await;
+                    let _ = proof.send_to_candidates(&handle, &remote).await;
+                }
+            }));
+        }
+        Self { workers }
+    }
+}
+
+impl Drop for ConnectPunchSender {
+    fn drop(&mut self) {
+        for worker in &self.workers { worker.abort(); }
+    }
+}
+
+/// Go v0.16.4 semantics: REPLY generation is not evidence that the creator
+/// has received it. Do not start the finite ICE timeout until an authenticated
+/// packet from the creator has been observed on a real local socket.
+async fn wait_for_authenticated_creator(
+    gathered: &mut ManagedCandidates,
+    pairing: &ManualPairing,
+    remote: &IceDescription,
+) -> Result<(), DirectPeerError> {
+    let proofs = gathered.candidates.interfaces.iter().map(|interface| {
+        AuthenticatedPunch::new(pairing.credentials.clone(), interface.local.role)
+    }).collect::<Vec<_>>();
+    loop {
+        for (interface, proof) in gathered.candidates.interfaces.iter_mut().zip(&proofs) {
+            let handle = interface.owner.handle.clone();
+            let Some(packet) = (match interface.owner.punch_packets.try_recv() {
+                Ok(packet) => Some(packet),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => None,
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) =>
+                    return Err(DirectPeerError::IceCheck),
+            }) else { continue };
+            let now = unix_seconds().map_err(|_| DirectPeerError::Clock)?;
+            if packet.source.is_ipv4() != handle.local_address().is_ipv4()
+                || proof.authenticate(&packet.bytes, packet.source, now).is_err()
+            {
+                continue;
+            }
+            // Respond to the verified observed endpoint, not merely the
+            // signaled address (which may be stale behind symmetric NAT).
+            let reply = proof.make_packet(now).map_err(|_| DirectPeerError::IceCheck)?;
+            handle.send_punch(packet.source, &reply).await
+                .map_err(|_| DirectPeerError::IceCheck)?;
+            return Ok(());
+        }
+        // Passive NAT keepalive does not turn unverified probes into ICE paths.
+        for (interface, proof) in gathered.candidates.interfaces.iter().zip(&proofs) {
+            let _ = proof.send_to_candidates(&interface.owner.handle, remote).await;
+        }
+        tokio::time::sleep(PASSIVE_POLL).await;
+    }
+}
+
 fn confirmation(pairing: &ManualPairing)
     -> Result<ManualConfirmation, DirectPeerError>
 {
@@ -240,9 +321,12 @@ impl ReadyCreator {
         ).map_err(|_| DirectPeerError::Confirmation)?;
         let local_description = gathered.candidates.combined.clone();
         #[cfg(test)]
-        eprintln!("DIRECT_TEST: starting ICE");
-        let mut selected = gathered.nominate_first(&remote, ICE_CHECK).await
+        eprintln!("DIRECT_TEST: creator starts ICE and authenticated Punch");
+        let sending = ConnectPunchSender::start(&gathered, &pairing, &remote);
+        let mut selected = gathered.nominate_first_with_authenticated_punch(
+            &remote, pairing.credentials.clone(), ICE_CHECK).await
             .map_err(|_| DirectPeerError::IceCheck)?;
+        drop(sending);
         let nominated = selected.nominated();
         #[cfg(test)]
         eprintln!("DIRECT_TEST: creator ICE done, configuring client");
@@ -311,9 +395,12 @@ impl ReadyJoiner {
             pairing.credentials.session_id(), pairing.comparison_code,
         ).map_err(|_| DirectPeerError::Confirmation)?;
         let local_description = gathered.candidates.combined.clone();
+        let mut gathered = gathered;
+        wait_for_authenticated_creator(&mut gathered, &pairing, &remote).await?;
         #[cfg(test)]
-        eprintln!("DIRECT_TEST: starting ICE");
-        let mut selected = gathered.nominate_first(&remote, ICE_CHECK).await
+        eprintln!("DIRECT_TEST: joiner starts ICE after verified creator activity");
+        let mut selected = gathered.nominate_first_with_authenticated_punch(
+            &remote, pairing.credentials.clone(), ICE_CHECK).await
             .map_err(|_| DirectPeerError::IceCheck)?;
         #[cfg(test)]
         eprintln!("DIRECT_TEST: joiner ICE done, configuring server");
@@ -372,6 +459,33 @@ impl ConnectedDirectPeer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn joiner_waits_for_verified_creator_activity_without_ice_timeout() {
+        let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let now = 1_800_000_000;
+        let (pending, invite) = begin_creator(&[bind], &[], now, 1200).await.unwrap();
+        let (joiner, reply) = begin_joiner(&invite, &[bind], &[], now).await.unwrap();
+        let creator = pending.receive_reply(&reply, now).unwrap();
+        let mut cc = creator.confirmation().unwrap();
+        let mut jc = joiner.confirmation().unwrap();
+        cc.confirm(&creator.comparison_code()).unwrap();
+        jc.confirm(&joiner.comparison_code()).unwrap();
+        let waiting = tokio::spawn(async move { joiner.connect(&jc, now).await });
+        // An authenticated REPLY alone must never start the joiner's ICE
+        // deadline. A missing creator remains a pending, not failed, session.
+        tokio::time::sleep(Duration::from_millis(1400)).await;
+        assert!(!waiting.is_finished(), "joiner started ICE before creator activity");
+        let connected = creator.connect(&cc, now);
+        let (creator_result, joiner_result) = tokio::time::timeout(
+            Duration::from_secs(60),
+            async { tokio::join!(connected, waiting) },
+        ).await.unwrap();
+        let left = creator_result.unwrap();
+        let right = joiner_result.unwrap().unwrap();
+        left.shutdown().await;
+        right.shutdown().await;
+    }
 
     #[tokio::test]
     async fn complete_creator_joiner_pairing_and_control_roundtrip() {
