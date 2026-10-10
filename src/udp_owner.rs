@@ -197,6 +197,7 @@ async fn run_owner(
             received = socket.recv_from(&mut buf) => {
                 let (size, source) = match received {
                     Ok(value) => value,
+                    Err(error) if crate::udp_errors::is_transient_unreachable(&error) => continue,
                     Err(_) => break,
                 };
                 let bytes = &buf[..size];
