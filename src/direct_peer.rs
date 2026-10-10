@@ -9,7 +9,7 @@ use tokio::{task::JoinSet, time::{timeout, Instant}};
 use is::{stun::{StunMessage, StunPacket}, Candidate, IceAgent, Protocol};
 
 use crate::{
-    ice_signaling::{IceDescription, IceRole, IceCandidateType},
+    ice_signaling::{IceDescription, IceRole, IceCandidate, IceCandidateType, MAX_CANDIDATES},
     ice_agent::credentials_from_description,
     udp_owner::InboundDatagram,
     local_network::local_addresses,
@@ -314,10 +314,26 @@ fn verified_ice_wake_response(
     None
 }
 
+// 只有收到已认证的打洞或 ICE 报文，才将观察到的实际源端口加入后续 ICE。
+ // 限额和去重防止恶意报文导致信令候选无界增长。
+fn learn_verified_remote(remote: &mut IceDescription, source: SocketAddr) {
+    if source.port() == 0 || source.ip().is_unspecified() || source.ip().is_multicast()
+        || remote.candidates.iter().any(|candidate| candidate.address == source)
+        || remote.candidates.len() >= MAX_CANDIDATES
+    {
+        return;
+    }
+    remote.candidates.push(IceCandidate {
+        address: source,
+        kind: IceCandidateType::PeerReflexive,
+        priority: 1,
+    });
+}
+
 async fn wait_for_authenticated_creator(
     gathered: &mut ManagedCandidates,
     pairing: &ManualPairing,
-    remote: &IceDescription,
+    remote: &mut IceDescription,
 ) -> Result<(), DirectPeerError> {
     let proofs = gathered.candidates.interfaces.iter().map(|interface| {
         AuthenticatedPunch::new(pairing.credentials.clone(), interface.local.role)
@@ -339,6 +355,7 @@ async fn wait_for_authenticated_creator(
                 ) {
                     handle.send_ice(packet.source, &answer).await
                         .map_err(|_| DirectPeerError::IceCheck)?;
+                    learn_verified_remote(remote, packet.source);
                     return Ok(());
                 }
             }
@@ -359,6 +376,7 @@ async fn wait_for_authenticated_creator(
             let reply = proof.make_packet(now).map_err(|_| DirectPeerError::IceCheck)?;
             handle.send_punch(packet.source, &reply).await
                 .map_err(|_| DirectPeerError::IceCheck)?;
+            learn_verified_remote(remote, packet.source);
             return Ok(());
         }
         // Passive NAT keepalive does not turn unverified probes into ICE paths.
@@ -669,7 +687,7 @@ async fn connect_authenticated_transport(
     role: IceRole,
 ) -> Result<ConnectedTransportPeer, DirectPeerError> {
     let ReadyBase {
-        identity, mut gathered, pairing, remote, remote_certificate,
+        identity, mut gathered, pairing, mut remote, remote_certificate,
     } = ready;
     confirmed.ensure_pairing_confirmed(
         pairing.credentials.session_id(), pairing.comparison_code,
@@ -681,7 +699,7 @@ async fn connect_authenticated_transport(
         .filter(|candidate| candidate.kind == IceCandidateType::Host)
         .map(|candidate| candidate.address).collect::<Vec<_>>();
     if role == IceRole::Controlled {
-        wait_for_authenticated_creator(&mut gathered, &pairing, &remote).await?;
+        wait_for_authenticated_creator(&mut gathered, &pairing, &mut remote).await?;
     }
     let sender = if role == IceRole::Controlling {
         Some(ConnectPunchSender::start(&gathered, &pairing, &remote))
@@ -1178,6 +1196,32 @@ mod tests {
         let right = joiner_result.unwrap().unwrap();
         left.shutdown().await;
         right.shutdown().await;
+    }
+
+    #[test]
+    fn passive_authenticated_source_is_added_once_and_bounded() {
+        let mut remote = IceDescription {
+            role: IceRole::Controlling,
+            ufrag: "testUser".into(),
+            password: "abcdefghijklmnopqrstuv123456".into(),
+            candidates: vec![IceCandidate {
+                address: "192.0.2.1:1234".parse().unwrap(),
+                kind: IceCandidateType::Host,
+                priority: 100,
+            }],
+        };
+        let learned = "198.51.100.2:45000".parse().unwrap();
+        learn_verified_remote(&mut remote, learned);
+        learn_verified_remote(&mut remote, learned);
+        assert_eq!(remote.candidates.len(), 2);
+        assert_eq!(remote.candidates[1].kind, IceCandidateType::PeerReflexive);
+        assert!(remote.validate().is_ok());
+        for port in 10000..10100 {
+            learn_verified_remote(&mut remote, SocketAddr::new(learned.ip(), port));
+        }
+        assert_eq!(remote.candidates.len(), MAX_CANDIDATES);
+        learn_verified_remote(&mut remote, "0.0.0.0:4455".parse().unwrap());
+        assert_eq!(remote.candidates.len(), MAX_CANDIDATES);
     }
 
     #[test]
