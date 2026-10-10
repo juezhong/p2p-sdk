@@ -5,7 +5,7 @@
 //! User confirmation of the pairing remains a mandatory explicit gate.
 
 use std::{net::SocketAddr, sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}};
-use tokio::{task::JoinSet, time::{timeout, Instant}};
+use tokio::{io::AsyncWriteExt, task::JoinSet, time::{timeout, Instant}};
 
 use crate::{
     ice_signaling::{IceDescription, IceRole, IceCandidateType},
@@ -33,6 +33,8 @@ const QUIC_ACCEPT: Duration = Duration::from_secs(45);
 const AUTH_DEADLINE: Duration = Duration::from_secs(10);
 const PUNCH_CADENCE: Duration = Duration::from_secs(2);
 const PASSIVE_POLL: Duration = Duration::from_millis(500);
+const PATH_PREFERENCE_GRACE: Duration = Duration::from_millis(180);
+const CONTROL_PATH_SELECTED: &[u8] = b"P2P-SDK-CONTROL-PATH-1";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DirectPeerError {
@@ -465,7 +467,48 @@ async fn authenticate_on_path(
         control.close(1u32.into(), b"non-nominated remote address");
         return Err(DirectPeerError::LiveSession);
     }
+    // 创建方最终决定使用哪条已认证路径；加入方只有收到该
+    // QUIC 内的选择消息才返回同一条 Control，防止多路竞速两端各选一条。
+    if role == IceRole::Controlled {
+        let selected = timeout(QUIC_ACCEPT, async {
+            let mut stream = control.accept_uni().await
+                .map_err(|_| DirectPeerError::QuicHandshake)?;
+            let packet = stream.read_to_end(48).await
+                .map_err(|_| DirectPeerError::QuicHandshake)?;
+            if packet != CONTROL_PATH_SELECTED {
+                return Err(DirectPeerError::VerifiedSession);
+            }
+            Ok::<(), DirectPeerError>(())
+        }).await.map_err(|_| DirectPeerError::QuicHandshake)?;
+        if selected.is_err() {
+            control.close(1u32.into(), b"invalid path choice");
+        }
+        selected?;
+    }
     Ok((path, endpoint, control, outbound))
+}
+
+/// 仅对双方已经通过 ICE+mTLS+HMAC 的网络路径进行评分。
+/// 相同 192.168.x.x 前缀不能证明在同一个 LAN；没有实际认证绝不入选。
+fn authenticated_path_priority(path: &ManagedPath, remote: &IceDescription) -> u8 {
+    let local = path.nominated().local.ip();
+    let address = path.nominated().remote;
+    let kind = remote.candidates.iter()
+        .find(|candidate| candidate.address == address)
+        .map(|candidate| candidate.kind);
+    match (local, address.ip(), kind) {
+        (std::net::IpAddr::V4(a), std::net::IpAddr::V4(b),
+            Some(IceCandidateType::Host)) if a.is_private() && b.is_private() => 5,
+        (std::net::IpAddr::V6(a), std::net::IpAddr::V6(b),
+            Some(IceCandidateType::Host))
+            if !a.is_unique_local() && !b.is_unique_local()
+                && !a.is_unicast_link_local() && !b.is_unicast_link_local()
+                && !a.is_loopback() && !b.is_loopback() => 4,
+        (_, _, Some(IceCandidateType::Host)) => 3,
+        (_, _, Some(IceCandidateType::PortMapped)) => 2,
+        (_, _, Some(IceCandidateType::PeerReflexive)) => 1,
+        _ => 0,
+    }
 }
 
 /// 多接口 ICE 和 QUIC 相互认证同时推进。首个 ICE 路径如果完成不了
@@ -517,8 +560,15 @@ async fn connect_authenticated_transport(
     let mut ice_exhausted = false;
     let limit = Instant::now() + ICE_CHECK + QUIC_ACCEPT;
     let mut last_failure = DirectPeerError::IceCheck;
+    let mut best: Option<(ManagedPath, quinn::Endpoint, quinn::Connection, bool)> = None;
+    let mut best_score = 0_u8;
+    let mut preference_deadline: Option<Instant> = None;
     let winner = loop {
+        // 仅创建方选择路径；加入方必须等待选中 QUIC 内的认证后通知。
         if ice_exhausted && in_flight.is_empty() {
+            if let Some(verified) = best.take() {
+                break verified;
+            }
             return Err(last_failure);
         }
         tokio::select! {
@@ -543,16 +593,52 @@ async fn connect_authenticated_transport(
             }
             result = in_flight.join_next(), if !in_flight.is_empty() => {
                 match result {
-                    Some(Ok(Ok(authenticated))) => break authenticated,
+                    Some(Ok(Ok(authenticated))) => {
+                        if role == IceRole::Controlled {
+                            break authenticated;
+                        }
+                        let score = authenticated_path_priority(&authenticated.0, &remote);
+                        if score > best_score || best.is_none() {
+                            if let Some((_, endpoint, loser, _)) = best.replace(authenticated) {
+                                loser.close(0u32.into(), b"higher priority path selected");
+                                endpoint.close(0u32.into(), b"higher priority path selected");
+                            }
+                            best_score = score;
+                        } else {
+                            authenticated.2.close(0u32.into(), b"lower priority path");
+                            authenticated.1.close(0u32.into(), b"lower priority path");
+                        }
+                        if best_score >= 5 {
+                            break best.take().expect("authenticated path present");
+                        }
+                        preference_deadline.get_or_insert(
+                            Instant::now() + PATH_PREFERENCE_GRACE,
+                        );
+                    }
                     Some(Ok(Err(error))) => last_failure = error,
                     _ => last_failure = DirectPeerError::QuicHandshake,
                 }
             }
+            _ = tokio::time::sleep_until(
+                preference_deadline.unwrap_or(limit)
+            ), if preference_deadline.is_some() => {
+                break best.take().expect("a verified QUIC candidate started grace");
+            }
             _ = tokio::time::sleep_until(limit) => {
+                if let Some(verified) = best.take() {
+                    break verified;
+                }
                 return Err(DirectPeerError::QuicHandshake);
             }
         }
     };
+    if role == IceRole::Controlling {
+        let mut stream = winner.2.open_uni().await
+            .map_err(|_| DirectPeerError::QuicHandshake)?;
+        stream.write_all(CONTROL_PATH_SELECTED).await
+            .map_err(|_| DirectPeerError::QuicHandshake)?;
+        stream.finish().map_err(|_| DirectPeerError::QuicHandshake)?;
+    }
     drop(candidates);
     in_flight.abort_all();
     drop(sender);
