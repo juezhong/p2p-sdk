@@ -24,6 +24,8 @@ use crate::{
     tls_identity::{authenticated_client_config, authenticated_server_config},
 };
 
+use crate::manual_pairing::UNLIMITED_INVITE_LIFETIME;
+
 const GATHER: Duration = Duration::from_secs(3);
 const MAPPING: Duration = Duration::from_millis(1200);
 const ICE_CHECK: Duration = Duration::from_secs(30);
@@ -154,7 +156,7 @@ pub async fn begin_creator_auto()
 {
     let interfaces = discovered_interfaces()?;
     let stun = discover_default_stun().await;
-    begin_creator(&interfaces, &stun, current_unix_seconds()?, 1200).await
+    begin_creator(&interfaces, &stun, current_unix_seconds()?, UNLIMITED_INVITE_LIFETIME).await
 }
 
 pub async fn begin_joiner_auto(invite: &str)
@@ -587,6 +589,21 @@ impl ReadyJoiner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn creator_accepts_manual_reply_after_two_hour_human_delay() {
+        let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let now = 1_800_000_000;
+        let (pending, invite) =
+            begin_creator(&[bind], &[], now, UNLIMITED_INVITE_LIFETIME).await.unwrap();
+        let two_hours_later = now + 7200;
+        let (joiner, reply) =
+            begin_joiner(&invite, &[bind], &[], two_hours_later).await.unwrap();
+        let creator = pending.receive_reply(&reply, two_hours_later).unwrap();
+        assert_eq!(creator.comparison_code(), joiner.comparison_code());
+        assert!(creator.confirmation().is_ok());
+        assert!(joiner.confirmation().is_ok());
+    }
 
     #[tokio::test]
     async fn joiner_waits_for_verified_creator_activity_without_ice_timeout() {
