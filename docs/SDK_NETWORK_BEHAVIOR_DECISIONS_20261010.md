@@ -52,5 +52,12 @@
 ## 七、对应代码交付进度（2026-10-10）
 
 - [SDK PR #60](https://github.com/juezhong/p2p-sdk/pull/60)：默认人工邀请码无自动过期（可单独指定有限 TTL）、Cloudflare + Google 默认 STUN、额外 QUIC 使用 Control 真实 outbound 方向。**七组 CI 通过并已合并**，提交 `cad81b6`。
-- [SDK PR #61](https://github.com/juezhong/p2p-sdk/pull/61)：STUN 首个有效候选触发短等待、异步网关映射任务后到清理、避免慢响应拖长邀请码生成。**当前尚在 CI 验收，未合并**。
+- [SDK PR #61](https://github.com/juezhong/p2p-sdk/pull/61)：STUN 首个有效候选触发短等待、异步网关映射任务后到清理。**7/7 CI 成功并已合并**（`324e4f8`）。
 - 仍待做：跨 ICE/QUIC 候选失败回退（B3/B6）、LAN 优先但不同私网不误判（A5/B4）、全球 IPv6 优先与单侧 IPv6 防火墙（B5/B8）、JOIN 没有 Punch 但已出现安全入站 QUIC 的补充流程（A12）、网关动态变化和真实资源清理/长时间测试（D7/D9/D11/D12）。
+
+## 八、多路径 QUIC 失败回退与资源验证进度
+
+- [SDK PR #62](https://github.com/juezhong/p2p-sdk/pull/62)：使用 `CandidatePathRace` / `ManagedPathRace` 保留其他 UDP Owner 的 ICE 检查结果，不再在第一次 ICE 提名后全部终止。每条候选须完成 QUIC/mTLS/HMAC 才能参与胜出；创建方通过经过认证的 QUIC 发送路径选择消息，加入方只接纳被选择的 Control。
+- 已在 PR 中实现短暂 LAN/全球 IPv6 优先，仅对真正通过 ICE+QUIC 认证的候选生效；两个完全不同的 `192.168.1.x` 家庭网络不会因为 IP 前缀相同就直接判定已联通。
+- 已增加候选 UDP Owner 保持测试、双端多端口关闭后重新绑定测试，以及路径评分的确定性测试。这是**代码和自动化测试**，不是 CGNAT/IPv6 有状态防火墙的真实设备结果。
+- **当前 PR #62 尚未通过最终全部 CI / 合并**。必须查看该 PR 最新 revision 检查结果；如有回归或死锁须修复，不应跳过验证。
