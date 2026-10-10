@@ -1439,6 +1439,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn passive_join_accepts_authenticated_quic_before_punch_or_ice() {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+            let now = 1_800_000_000;
+            let (pending, invite) = begin_creator(&[bind], &[], now, 1200).await.unwrap();
+            let (mut joiner, reply) = begin_joiner(&invite, &[bind], &[], now).await.unwrap();
+            let mut creator = pending.receive_reply(&reply, now).unwrap();
+
+            let joiner_cert = vec![joiner.inner.identity.cert.der().clone()];
+            let joiner_key = rustls::pki_types::PrivateKeyDer::Pkcs8(
+                joiner.inner.identity.signing_key.serialize_der().into(),
+            );
+            let joiner_server = authenticated_server_config(
+                joiner_cert, joiner_key,
+                trusted_certificate(joiner.inner.remote_certificate.clone()).unwrap(),
+            ).unwrap();
+            let joiner_owner = &mut joiner.inner.gathered.candidates.interfaces[0].owner;
+            let destination = joiner_owner.handle.local_address();
+            let joiner_adapter = QuinnUdpAdapter::from_owner(joiner_owner).unwrap();
+            let joiner_endpoint = quinn::Endpoint::new_with_abstract_socket(
+                demux_endpoint_config(), Some(joiner_server),
+                Arc::new(joiner_adapter), quinn::default_runtime().unwrap(),
+            ).unwrap();
+            let mut passive_endpoints = std::collections::HashMap::new();
+            passive_endpoints.insert(destination, joiner_endpoint);
+
+            let creator_cert = vec![creator.inner.identity.cert.der().clone()];
+            let creator_key = rustls::pki_types::PrivateKeyDer::Pkcs8(
+                creator.inner.identity.signing_key.serialize_der().into(),
+            );
+            let client_tls = authenticated_client_config(
+                creator_cert, creator_key,
+                trusted_certificate(creator.inner.remote_certificate.clone()).unwrap(),
+            ).unwrap();
+            let creator_adapter = QuinnUdpAdapter::from_owner(
+                &mut creator.inner.gathered.candidates.interfaces[0].owner,
+            ).unwrap();
+            let mut creator_endpoint = quinn::Endpoint::new_with_abstract_socket(
+                demux_endpoint_config(), None, Arc::new(creator_adapter),
+                quinn::default_runtime().unwrap(),
+            ).unwrap();
+            creator_endpoint.set_default_client_config(client_tls);
+            let creds = creator.inner.pairing.credentials.clone();
+
+            // 没有 ICE/Punch 唤醒的情况下，合法 Control QUIC 必须直接
+            // 通过被动 listener 完成 TLS + Session HMAC 并解除等待。
+            let (woken, initiated) = tokio::join!(
+                wait_for_authenticated_creator(
+                    &mut joiner.inner.gathered,
+                    &joiner.inner.pairing, &joiner.inner.remote,
+                    &passive_endpoints, Arc::new(ReplayGuard::new(4096).unwrap()),
+                ),
+                async {
+                    tokio::time::sleep(Duration::from_millis(80)).await;
+                    let connection = creator_endpoint.connect(destination, "localhost")
+                        .unwrap().await.unwrap();
+                    authenticate_initiator(
+                        connection.clone(), &creds, ChannelRole::Control,
+                        AUTH_DEADLINE,
+                    ).await.unwrap();
+                    connection
+                },
+            );
+            let (bound, accepted) = woken.unwrap()
+                .expect("valid authenticated QUIC must wake passive JOIN");
+            assert_eq!(bound, destination);
+            assert!(accepted.close_reason().is_none());
+            initiated.close(0u32.into(), b"test complete");
+            accepted.close(0u32.into(), b"test complete");
+            creator_endpoint.close(0u32.into(), b"test complete");
+            for endpoint in passive_endpoints.into_values() {
+                endpoint.close(0u32.into(), b"test complete");
+            }
+        }).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn joiner_waits_for_verified_creator_activity_without_ice_timeout() {
         let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let now = 1_800_000_000;
