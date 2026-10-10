@@ -36,6 +36,8 @@ pub struct TransportDiagnostic {
     pub actual_local_udp: SocketAddr,
     pub actual_remote_udp: SocketAddr,
     pub control_connected: bool,
+    /// QUIC Control 是否由本端拨号建立（与配对创建/加入角色无关）。
+    pub control_outbound: bool,
     pub gateway_mapping: Option<SocketAddr>,
     pub gateway_method: Option<GatewayMethod>,
     pub remote_candidate_kind: Option<IceCandidateType>,
@@ -130,6 +132,7 @@ pub struct ConnectedTransportPeer {
     pub(crate) endpoint: Endpoint,
     /// 已通过 mTLS 和会话绑定认证的 Control 连接。
     pub control: Connection,
+    pub(crate) control_outbound: bool,
     pub(crate) path: ManagedPath,
     pub(crate) punch: Option<PunchLoop>,
     pub(crate) credentials: SessionCredentials,
@@ -264,6 +267,7 @@ impl ConnectedTransportPeer {
             actual_local_udp: self.path.selected.path.local,
             actual_remote_udp: self.path.selected.path.remote,
             control_connected: self.control.close_reason().is_none(),
+            control_outbound: self.control_outbound,
             gateway_mapping: self.path.mapping_lease.as_ref()
                 .and_then(|lease| lease.subscribe().mapped_address()),
             gateway_method: self.path.mapping_lease.as_ref().map(|lease| match lease {
