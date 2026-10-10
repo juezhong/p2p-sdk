@@ -26,7 +26,9 @@ use crate::{
     udp_owner::UdpOwner,
 };
 
-pub const MAX_ACTIVE_INTERFACES: usize = 8;
+/// One owner per advertised interface. Bound by the signaling candidate
+/// limit, not by a smaller hidden cap that can exclude a usable IP family.
+pub const MAX_ACTIVE_INTERFACES: usize = MAX_CANDIDATES;
 
 #[derive(Debug)]
 pub enum MultiInterfaceError {

@@ -85,12 +85,43 @@ fn current_unix_seconds() -> Result<u64, DirectPeerError> {
         .map(|value| value.as_secs()).map_err(|_| DirectPeerError::Clock)
 }
 
+/// Alternate IPv6 and IPv4 candidates before truncating. OS interface
+/// enumeration often returns many VPN/virtual IPv4 addresses first; an
+/// arbitrary first-N truncation can silently omit a routable IPv6 path.
+fn pick_local_interfaces(ips: Vec<std::net::IpAddr>) -> Vec<SocketAddr> {
+    let mut v6 = ips.iter().copied()
+        .filter(|ip| ip.is_ipv6()).collect::<Vec<_>>();
+    let mut v4 = ips.into_iter()
+        .filter(|ip| ip.is_ipv4()).collect::<Vec<_>>();
+    v6.sort_by_key(|ip| match ip {
+        std::net::IpAddr::V6(addr) if !addr.is_unique_local() => 0,
+        _ => 1,
+    });
+    v4.sort_by_key(|ip| match ip {
+        std::net::IpAddr::V4(addr) if !addr.is_private() => 0,
+        _ => 1,
+    });
+    let mut v6 = v6.into_iter();
+    let mut v4 = v4.into_iter();
+    let mut selected = Vec::new();
+    while selected.len() < MAX_ACTIVE_INTERFACES {
+        let mut progress = false;
+        for family in [&mut v6, &mut v4] {
+            if selected.len() >= MAX_ACTIVE_INTERFACES { break; }
+            if let Some(ip) = family.next() {
+                selected.push(SocketAddr::new(ip, 0));
+                progress = true;
+            }
+        }
+        if !progress { break; }
+    }
+    selected
+}
+
 fn discovered_interfaces() -> Result<Vec<SocketAddr>, DirectPeerError> {
     let interfaces = local_addresses()
         .map_err(|_| DirectPeerError::CandidateGather)?;
-    let addresses = interfaces.into_iter()
-        .take(MAX_ACTIVE_INTERFACES)
-        .map(|ip| SocketAddr::new(ip, 0)).collect::<Vec<_>>();
+    let addresses = pick_local_interfaces(interfaces);
     if addresses.is_empty() { return Err(DirectPeerError::CandidateGather); }
     Ok(addresses)
 }
@@ -662,6 +693,23 @@ mod tests {
         let right = joiner_result.unwrap().unwrap();
         left.shutdown().await;
         right.shutdown().await;
+    }
+
+    #[test]
+    fn interface_cap_must_not_starve_global_ipv6_behind_vpn_addresses() {
+        let mut ips = (1..=40u8).map(|n| {
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, n))
+        }).collect::<Vec<_>>();
+        let globally_routed_v6: std::net::IpAddr = "2001:db8::42".parse().unwrap();
+        let local_v6: std::net::IpAddr = "fd00::7".parse().unwrap();
+        ips.push(local_v6);
+        ips.push(globally_routed_v6);
+        let selected = pick_local_interfaces(ips);
+        assert_eq!(selected.len(), MAX_ACTIVE_INTERFACES);
+        assert!(selected.iter().any(|entry| entry.ip() == globally_routed_v6));
+        assert!(selected.iter().any(|entry| entry.ip() == local_v6));
+        assert!(selected.iter().any(SocketAddr::is_ipv4));
+        assert_eq!(selected[0].ip(), globally_routed_v6);
     }
 
     #[tokio::test]
