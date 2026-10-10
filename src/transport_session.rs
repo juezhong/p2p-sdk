@@ -187,7 +187,7 @@ impl ConnectedTransportPeer {
                 &self.replay_guard, deadline,
             )) => result,
         };
-        if !matches!(proof, Ok(Ok(_))) {
+        if !matches!(&proof, Ok(Ok(_))) {
             connection.close(1u32.into(), b"invalid or timed-out data session proof");
             return Err(if proof.is_err() {
                 TransportError::Timeout
