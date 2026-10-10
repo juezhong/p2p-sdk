@@ -25,9 +25,21 @@ file-pipeline internals.
   QUIC is established. No Data QUIC is created by default.
 - The application may call `ConnectedTransportPeer::open_authenticated_data()`
   on the creator and `accept_authenticated_data()` on the joiner for each
-  additional independently authenticated transport; there is no fixed four-lane
-  scheduler or file semantics in this API. The SDK tracks lifetime, connection
-  pin and session HMAC; applications select their message streams.
+  additional independently authenticated transport. No fixed four-lane
+  scheduling, file framing or retransmission belongs to the SDK.
+- If stable auxiliary QUIC connectivity is needed, wrap the transport peer in
+  `Arc` and call `peer.manage_authenticated_data()` **once for each
+  application-requested connection**. Its `ManagedAuthenticatedLink` publishes
+  `Connecting / Connected / Reconnecting / ControlLost / Stopped` and a
+  generation counter. The SDK automatically retries failed links with bounded
+  backoff, per-link TLS PIN / session HMAC verification and source-port
+  preference / fallback. An unverified or closed connection is never advertised
+  as healthy. Call `manager.shutdown().await` before consuming the peer with
+  `Arc::try_unwrap(peer).ok().unwrap().shutdown().await`.
+- The managed link API does not create files, streams or data-lane indexes. It
+  reconnects over the already nominated UDP path; after **Control loss** it
+  stops instead of inventing ICE Restart or pretending a QUIC session survived
+  network failure. Physical NAT/IPv6 firewall success still requires field tests.
 - The earlier dual-QUIC convenience facade `connect()` remains available for
   compatibility and starts one initial Data connection.
   `connect_with_data_connections(..., n)` opts into a supervised connection
