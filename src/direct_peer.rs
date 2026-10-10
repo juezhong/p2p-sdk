@@ -1105,6 +1105,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn passive_join_wakes_for_valid_ice_integrity_not_untrusted_stun() {
+        let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let owner = crate::udp_owner::UdpOwner::bind(bind).await.unwrap();
+        let sender = crate::udp_owner::UdpOwner::bind(bind).await.unwrap();
+        let joined = crate::ice_gather::gather(
+            &owner.handle, &[], IceRole::Controlled, Duration::from_millis(20),
+        ).await.unwrap().description;
+        let creator = crate::ice_gather::gather(
+            &sender.handle, &[], IceRole::Controlling, Duration::from_millis(20),
+        ).await.unwrap().description;
+        let mut agent = IceAgent::new(credentials_from_description(&creator));
+        agent.set_controlling(true);
+        agent.set_remote_credentials(credentials_from_description(&joined));
+        agent.add_local_candidate(Candidate::host(
+            sender.handle.local_address(), Protocol::Udp,
+        ).unwrap());
+        agent.add_remote_candidate(Candidate::host(
+            owner.handle.local_address(), Protocol::Udp,
+        ).unwrap());
+        let mut request = None;
+        for attempt in 0..8 {
+            agent.handle_timeout(Instant::now() + Duration::from_millis(attempt * 50));
+            if let Some(tx) = agent.poll_transmit() {
+                request = Some(tx.contents);
+                break;
+            }
+        }
+        let request = request.expect("ICE agent must produce an authenticated request");
+        let packet = InboundDatagram {
+            source: sender.handle.local_address(), bytes: request.clone(),
+        };
+        let answer = verified_ice_wake_response(
+            &joined, &creator, owner.handle.local_address(), &packet,
+        ).expect("valid ICE credentials should wake passive JOIN");
+        assert!(answer.starts_with(&[0x01, 0x01]));
+        let mut invalid = joined.clone();
+        invalid.password.push_str("not-the-original-key");
+        assert!(verified_ice_wake_response(
+            &invalid, &creator, owner.handle.local_address(), &packet,
+        ).is_none());
+        let fake = InboundDatagram {
+            source: packet.source, bytes: vec![0; 20],
+        };
+        assert!(verified_ice_wake_response(
+            &joined, &creator, owner.handle.local_address(), &fake,
+        ).is_none());
+    }
+
+    #[tokio::test]
     async fn joiner_waits_for_verified_creator_activity_without_ice_timeout() {
         let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let now = 1_800_000_000;
