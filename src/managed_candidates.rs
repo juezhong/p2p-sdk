@@ -51,9 +51,15 @@ impl ManagedPathRace {
     /// Drop 中的 best-effort 通知（应用可能马上退出 Tokio runtime）。
     pub async fn cleanup(mut self) {
         self.candidates.abort_and_join().await;
+        // 多个路由器删除命令必须并发等待；逐个 await 会把成功建连
+        // 延迟累加成 N 个网关超时，不符合 Go 的快速可用路径语义。
+        let mut cleanup = tokio::task::JoinSet::new();
         for (_, lease) in self.leases.drain(..) {
-            let _ = lease.shutdown().await;
+            cleanup.spawn(async move {
+                let _ = lease.shutdown().await;
+            });
         }
+        while cleanup.join_next().await.is_some() {}
     }
 }
 
