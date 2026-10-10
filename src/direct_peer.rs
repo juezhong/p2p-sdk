@@ -1158,6 +1158,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn late_hmac_prflx_recovers_stale_signaled_nat_port_through_ice_and_quic() {
+        tokio::time::timeout(Duration::from_secs(70), async {
+            let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+            let now = 1_800_000_000;
+            let (pending, invite) = begin_creator(&[bind], &[], now, 1200).await.unwrap();
+            let (joiner, reply) = begin_joiner(&invite, &[bind], &[], now).await.unwrap();
+            let mut creator = pending.receive_reply(&reply, now).unwrap();
+            let real_joiner = creator.inner.remote.candidates[0].address;
+            // 模拟 NAT 映射改变：信令端口已不可达，实际端口只能从
+            // 经过 Session HMAC 认证的入站 Punch 学到，再经 ICE 提名。
+            creator.inner.remote.candidates[0].address =
+                "127.0.0.1:9".parse().unwrap();
+            let mut cc = creator.confirmation().unwrap();
+            let mut jc = joiner.confirmation().unwrap();
+            cc.confirm(&creator.comparison_code()).unwrap();
+            jc.confirm(&joiner.comparison_code()).unwrap();
+            let (left, right) = tokio::join!(
+                creator.connect_transport(&cc, now),
+                joiner.connect_transport(&jc, now),
+            );
+            let left = left.unwrap();
+            let right = right.unwrap();
+            assert_eq!(left.diagnostic().actual_remote_udp, real_joiner);
+            assert!(left.diagnostic().control_connected);
+            assert!(right.diagnostic().control_connected);
+            left.shutdown().await;
+            right.shutdown().await;
+        }).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn unreachable_ipv6_family_does_not_block_authenticated_ipv4_control() {
         tokio::time::timeout(Duration::from_secs(60), async {
             let v4: SocketAddr = "127.0.0.1:0".parse().unwrap();
