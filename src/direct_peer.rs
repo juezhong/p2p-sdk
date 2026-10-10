@@ -239,9 +239,13 @@ impl ReadyCreator {
             pairing.credentials.session_id(), pairing.comparison_code,
         ).map_err(|_| DirectPeerError::Confirmation)?;
         let local_description = gathered.candidates.combined.clone();
+        #[cfg(test)]
+        eprintln!("DIRECT_TEST: starting ICE");
         let mut selected = gathered.nominate_first(&remote, ICE_CHECK).await
             .map_err(|_| DirectPeerError::IceCheck)?;
         let nominated = selected.nominated();
+        #[cfg(test)]
+        eprintln!("DIRECT_TEST: creator ICE done, configuring client");
         let client_config = authenticated_client_config(
             vec![identity.cert.der().clone()],
             rustls::pki_types::PrivateKeyDer::Pkcs8(
@@ -256,12 +260,16 @@ impl ReadyCreator {
             quinn::default_runtime().ok_or(DirectPeerError::QuicEndpoint)?,
         ).map_err(|_| DirectPeerError::QuicEndpoint)?;
         endpoint.set_default_client_config(client_config.clone());
+        #[cfg(test)]
+        eprintln!("DIRECT_TEST: creator dialing Control");
         let control = endpoint.connect(nominated.remote, "localhost")
             .map_err(|_| DirectPeerError::QuicHandshake)?.await
             .map_err(|_| DirectPeerError::QuicHandshake)?;
         let data = endpoint.connect(nominated.remote, "localhost")
             .map_err(|_| DirectPeerError::QuicHandshake)?.await
             .map_err(|_| DirectPeerError::QuicHandshake)?;
+        #[cfg(test)]
+        eprintln!("DIRECT_TEST: creator QUIC done, HMAC");
         let secure = establish_initiator(
             control, data, &pairing, confirmed, now, AUTH_DEADLINE,
         ).await.map_err(|_| DirectPeerError::VerifiedSession)?;
@@ -269,6 +277,8 @@ impl ReadyCreator {
             &secure, endpoint.clone(), nominated.remote, &pairing,
             client_config, MAX_DATA_LANES,
         ).map_err(|_| DirectPeerError::DataLanePool)?;
+        #[cfg(test)]
+        eprintln!("DIRECT_TEST: establishing live session");
         let session = LiveSdkSession::attach(
             secure, selected, &pairing, local_description, remote,
             IceRole::Controlling, PUNCH_CADENCE,
@@ -301,8 +311,12 @@ impl ReadyJoiner {
             pairing.credentials.session_id(), pairing.comparison_code,
         ).map_err(|_| DirectPeerError::Confirmation)?;
         let local_description = gathered.candidates.combined.clone();
+        #[cfg(test)]
+        eprintln!("DIRECT_TEST: starting ICE");
         let mut selected = gathered.nominate_first(&remote, ICE_CHECK).await
             .map_err(|_| DirectPeerError::IceCheck)?;
+        #[cfg(test)]
+        eprintln!("DIRECT_TEST: joiner ICE done, configuring server");
         let tls = authenticated_server_config(
             vec![identity.cert.der().clone()],
             rustls::pki_types::PrivateKeyDer::Pkcs8(
@@ -316,6 +330,8 @@ impl ReadyJoiner {
             demux_endpoint_config(), Some(tls), Arc::new(adapter),
             quinn::default_runtime().ok_or(DirectPeerError::QuicEndpoint)?,
         ).map_err(|_| DirectPeerError::QuicEndpoint)?;
+        #[cfg(test)]
+        eprintln!("DIRECT_TEST: joiner waiting Control");
         let control = tokio::time::timeout(QUIC_ACCEPT, endpoint.accept())
             .await.map_err(|_| DirectPeerError::QuicHandshake)?
             .ok_or(DirectPeerError::QuicHandshake)?
@@ -326,6 +342,8 @@ impl ReadyJoiner {
             .await.map_err(|_| DirectPeerError::QuicHandshake)?;
         let guard = Arc::new(ReplayGuard::new(4096)
             .map_err(|_| DirectPeerError::VerifiedSession)?);
+        #[cfg(test)]
+        eprintln!("DIRECT_TEST: joiner QUIC done, HMAC");
         let secure = establish_responder(
             control, data, &pairing, confirmed, &guard,
             now, AUTH_DEADLINE,
@@ -333,6 +351,8 @@ impl ReadyJoiner {
         let data_lanes = ResilientDataLanes::start_joiner(
             &secure, endpoint.clone(), &pairing, guard, MAX_DATA_LANES,
         ).map_err(|_| DirectPeerError::DataLanePool)?;
+        #[cfg(test)]
+        eprintln!("DIRECT_TEST: establishing live session");
         let session = LiveSdkSession::attach(
             secure, selected, &pairing, local_description, remote,
             IceRole::Controlled, PUNCH_CADENCE,
@@ -368,10 +388,12 @@ mod tests {
             let mut jc = joiner.confirmation().unwrap();
             cc.confirm(&creator.comparison_code()).unwrap();
             jc.confirm(&joiner.comparison_code()).unwrap();
+            eprintln!("DIRECT_TEST: paired codes confirmed, start connect");
             let (a, b) = tokio::join!(
                 creator.connect(&cc, now),
                 joiner.connect(&jc, now),
             );
+            eprintln!("DIRECT_TEST: both connected");
             let a = a.unwrap();
             let b = b.unwrap();
             let (mut tx, mut rx) =
@@ -385,8 +407,11 @@ mod tests {
             reply_tx.finish().unwrap();
             assert_eq!(rx.read_to_end(64).await.unwrap(), b"ok");
             assert_eq!(a.session.actual_path().1, b.session.actual_path().0);
+            eprintln!("DIRECT_TEST: control echo completed, shutdown creator");
             a.shutdown().await;
+            eprintln!("DIRECT_TEST: shutdown joiner");
             b.shutdown().await;
+            eprintln!("DIRECT_TEST: finished");
         }).await.unwrap();
     }
 }
