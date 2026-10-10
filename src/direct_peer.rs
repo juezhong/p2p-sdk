@@ -5,7 +5,7 @@
 //! User confirmation of the pairing remains a mandatory explicit gate.
 
 use std::{net::SocketAddr, sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}};
-use tokio::{io::AsyncWriteExt, task::JoinSet, time::{timeout, Instant}};
+use tokio::{task::JoinSet, time::{timeout, Instant}};
 
 use crate::{
     ice_signaling::{IceDescription, IceRole, IceCandidateType},
