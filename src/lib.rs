@@ -1,7 +1,10 @@
-//! Core value types and safety invariants for the future Rust P2P SDK.
+//! 可复用的直连 P2P 网络 SDK：网络候选、认证打洞、ICE、QUIC 与诊断。
 //!
-//! M0 only: no ICE agent, UDP probing, authenticated QUIC transport, or
-//! production-ready connectivity is implemented yet.
+//! 通用应用入口为 direct_peer 的 INVITE/REPLY 配对与
+//! ReadyCreator/ReadyJoiner::connect_transport()。
+//! Transport session 默认只建立认证 Control QUIC；额外 QUIC 由应用按需请求。
+//! 文件数据分配、分片、ACK、重传和四路 Stripe 策略不属于 SDK。
+//! 自动化 CI 与环回连接成功不代表真实复杂 NAT 环境已完成对等验收。
 
 pub mod candidate;
 pub mod channel;
@@ -57,7 +60,9 @@ pub mod upnp_lease;
 pub mod pcp;
 pub mod pcp_lease;
 
-/// Reauthenticated Data QUIC lane pool with fault-driven repair.
+/// 为尚未迁移的 Transfer 调用者保留的旧连接池接口。
+/// 新 SDK 应用应使用 transport_session 中的通用认证连接 API。
+#[doc(hidden)]
 pub mod resilient_data;
 pub mod punch;
 pub mod punch_loop;
