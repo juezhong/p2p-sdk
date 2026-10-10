@@ -827,18 +827,6 @@ async fn connect_authenticated_transport(
     let offered_host_candidates = gathered.candidates.combined.candidates.iter()
         .filter(|candidate| candidate.kind == IceCandidateType::Host)
         .map(|candidate| candidate.address).collect::<Vec<_>>();
-    if role == IceRole::Controlled {
-        wait_for_authenticated_creator(&mut gathered, &pairing, &remote).await?;
-    }
-    let sender = if role == IceRole::Controlling {
-        Some(ConnectPunchSender::start(&gathered, &pairing, &remote))
-    } else {
-        None
-    };
-    let mut candidates = gathered.start_authenticated_path_race(
-        &remote, pairing.credentials.clone(), ICE_CHECK,
-    ).map_err(|_| DirectPeerError::IceCheck)?;
-
     let trusted = trusted_certificate(remote_certificate)?;
     let cert = vec![identity.cert.der().clone()];
     let private_key = || rustls::pki_types::PrivateKeyDer::Pkcs8(
@@ -852,6 +840,38 @@ async fn connect_authenticated_transport(
     ).map_err(|_| DirectPeerError::TlsConfig)?;
     let replay_guard = Arc::new(ReplayGuard::new(4096)
         .map_err(|_| DirectPeerError::VerifiedSession)?);
+
+    // JOIN 在人工等待阶段就绑定与 ICE 共用的 Quinn UDP endpoint。
+    // 后续该 UDP Owner 一旦通过 ICE 提名，必须复用同一个 endpoint，
+    // 禁止重新绑定导致公网 NAT 映射或早到认证连接丢失。
+    let mut prebound_endpoints = std::collections::HashMap::new();
+    let mut early_control = None;
+    if role == IceRole::Controlled {
+        for interface in &mut gathered.candidates.interfaces {
+            let local = interface.owner.handle.local_address();
+            let adapter = QuinnUdpAdapter::from_owner(&mut interface.owner)
+                .map_err(|_| DirectPeerError::UdpAdapter)?;
+            let mut endpoint = quinn::Endpoint::new_with_abstract_socket(
+                demux_endpoint_config(), Some(server_tls.clone()), Arc::new(adapter),
+                quinn::default_runtime().ok_or(DirectPeerError::QuicEndpoint)?,
+            ).map_err(|_| DirectPeerError::QuicEndpoint)?;
+            endpoint.set_default_client_config(client_tls.clone());
+            prebound_endpoints.insert(local, endpoint);
+        }
+        early_control = wait_for_authenticated_creator(
+            &mut gathered, &pairing, &remote,
+            &prebound_endpoints, Arc::clone(&replay_guard),
+        ).await?;
+    }
+    let sender = if role == IceRole::Controlling {
+        Some(ConnectPunchSender::start(&gathered, &pairing, &remote))
+    } else {
+        None
+    };
+    let mut candidates = gathered.start_authenticated_path_race(
+        &remote, pairing.credentials.clone(), ICE_CHECK,
+    ).map_err(|_| DirectPeerError::IceCheck)?;
+
     let mut in_flight = JoinSet::new();
     let mut ice_exhausted = false;
     let limit = Instant::now() + ICE_CHECK + QUIC_ACCEPT;
@@ -871,6 +891,15 @@ async fn connect_authenticated_transport(
             path = candidates.next(), if !ice_exhausted => {
                 match path {
                     Some(path) => {
+                        let bound = path.selected.owner.handle.local_address();
+                        let prepared_endpoint = prebound_endpoints.remove(&bound);
+                        let prepared_control = if early_control.as_ref()
+                            .is_some_and(|(local, _)| *local == bound)
+                        {
+                            early_control.take().map(|(_, connection)| connection)
+                        } else {
+                            None
+                        };
                         let cert = client_tls.clone();
                         let server = server_tls.clone();
                         let binding = ManualPairing {
@@ -884,6 +913,7 @@ async fn connect_authenticated_transport(
                         in_flight.spawn(async move {
                             authenticate_on_path(
                                 path, cert, server, binding, offered, role, guard,
+                                prepared_endpoint, prepared_control,
                             ).await
                         });
                     }
@@ -933,8 +963,19 @@ async fn connect_authenticated_transport(
     };
     // 连接成功或失败均应等待 QUIC/ICE 任务取消完成，以及网关租约撤销。
     in_flight.abort_all();
-    while in_flight.join_next().await.is_some() {}
+    while let Some(result) = in_flight.join_next().await {
+        if let Ok(Ok((_, endpoint, loser, _))) = result {
+            loser.close(0u32.into(), b"late Control race loser");
+            endpoint.close(0u32.into(), b"late Control race loser");
+        }
+    }
     drop(sender);
+    for endpoint in prebound_endpoints.into_values() {
+        endpoint.close(0u32.into(), b"unused passive listener");
+    }
+    if let Some((_, unused)) = early_control.take() {
+        unused.close(0u32.into(), b"unused passive Control");
+    }
     candidates.cleanup().await;
     let winner = result?;
     if role == IceRole::Controlling {
