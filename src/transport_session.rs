@@ -203,7 +203,9 @@ impl ConnectedTransportPeer {
                     Err(TransportError::ControlDisconnected) => {
                         break ManagedLinkPhase::ControlLost;
                     }
-                    Err(TransportError::Authentication | TransportError::WrongRole) => {
+                    // 错误角色是本地 API 误用；来自网络的认证失败则
+                    // 必须拒绝当前连接，但不能让恶意探测永久杀死恢复循环。
+                    Err(TransportError::WrongRole) => {
                         break ManagedLinkPhase::AuthenticationFailed;
                     }
                     Err(error) => {
