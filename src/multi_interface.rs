@@ -373,6 +373,37 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn first_candidate_handoff_does_not_close_later_udp_owner() {
+        let mut workers = JoinSet::new();
+        for (index, delay_ms) in [(0, 20), (1, 180)] {
+            let owner = UdpOwner::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+            let local = owner.handle.local_address();
+            workers.spawn(async move {
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                Ok(SelectedDirectPath {
+                    owner,
+                    path: NominatedPath {
+                        local, remote: "127.0.0.1:23456".parse().unwrap(),
+                    },
+                    stun_mapping: None,
+                })
+            });
+            assert!(index < 2);
+        }
+        let mut race = CandidatePathRace {
+            workers, expires: Instant::now() + Duration::from_secs(3),
+        };
+        // 第一条已被 ICE 提名，但随后 QUIC 可能失败。其他 socket 不能
+        // 在第一条路径返回时被取消或重新绑定端口。
+        let first = race.next().await.expect("first path");
+        let first_socket = first.owner.handle.local_address();
+        drop(first);
+        let second = race.next().await.expect("secondary path remains available");
+        assert_ne!(first_socket, second.owner.handle.local_address());
+        assert!(race.next().await.is_none());
+    }
+
+    #[tokio::test]
     async fn gathers_two_sockets_but_never_confuses_their_candidate_bases() {
         let a = "127.0.0.1:0".parse().unwrap();
         let set = gather_interfaces(
