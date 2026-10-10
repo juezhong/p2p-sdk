@@ -74,4 +74,20 @@
 - [SDK PR #64](https://github.com/juezhong/p2p-sdk/pull/64)：在 #62/#63 多路径建连之后，成功/失败/取消都要 `abort_and_join` 未结束的 ICE 和 QUIC tasks，确保 UDP Owner 的主任务已停止。
 - 未入选的 PCP/NAT-PMP/UPnP 租约必须显式 `shutdown().await`（而非只依赖 runtime 中未来某个 task 能执行 Drop 清理）；路径选择消息发送失败、Punch 初始化失败亦要关闭连接并清理获胜租约。
 - 增加没有远端的 ICE 失败时双 UDP Owner 端口可立即复用回归；不允许留下残存 socket 或未释放 GatewayLease worker。
-- **PR #64 仍待跨平台 CI 与主分支合并**。真实路由器删除指令需要现场验收，进程被系统直接杀死无法保证立即删除，租约本身必须保持有限到期时间。
+- **PR #64 已通过全部七组 CI 并合并**（`0cd801f`）。成功和失败的 ICE/QUIC race 均 await worker 退出，未获胜网关租约并发 shutdown，并使用当前 Control QUIC 真实远端作为 Data 重建目标；真实路由器删除指令仍需要现场验收，进程被系统直接杀死无法保证立即删除，租约仍必须保持有限到期时间。
+
+## 十一、功能代码合并和现场验收的严格区别
+
+**2026-10-10 最新已合并**：
+- #60 `cad81b6`：不限时手动配对、Cloudflare + Google STUN、实际 Control 拨号方向。
+- #61 `324e4f8`：STUN/网关并行软截止及迟到租约清理。
+- #62 `454aefc`：跨 UDP Owner 的 ICE→QUIC 多路径失败回退、创建方统一选择认证路径、LAN/IPv6 短暂优先、资源释放回归。
+- #63 `e4a5405`：同 UDP Owner 上多远端候选的 QUIC 认证重试；首选端口不可达时的真实 Quinn 回退测试。
+- #64 `0cd801f`：成功/失败路径上显式等待 ICE/QUIC task 和路由器映射清理，附属 Data QUIC 使用 live Control 远端重拨。
+
+**仅凭 GitHub Actions 仍不能宣称现场等效**：
+- 还缺用户实际不同运营商/家庭路由器的双 NAT/CGNAT/IPv6 有状态防火墙对照运行，及真实 PCP/NAT-PMP/UPnP 的多次映射续租/失效/清理实测。
+- 还缺连续数小时到数日的 Control 和多条附属 QUIC 空闲/吞吐/重拨试验记录。没有任何实现能够保证物理网络永远在线；SDK 必须准确报告 Control 失联。
+- 为避免将“没有实测”误写为“代码没实现”，按两个独立维度验收：**功能行为代码已合并**与**真实网络证据是否充分**。
+
+**发布约束**：上述现场矩阵没有实测证据前，不发布“所有 NAT 环境成功率与 Go 完全一致”的声明。Transfer 的文件业务协议不属于 SDK 验收。
