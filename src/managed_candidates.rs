@@ -170,6 +170,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_ice_race_cleanup_releases_every_udp_owner() {
+        tokio::time::timeout(Duration::from_secs(7), async {
+            let bind = "127.0.0.1:0".parse().unwrap();
+            let collected = ManagedCandidates::gather(
+                &[bind, bind], &[], IceRole::Controlling,
+                Duration::from_millis(200), Duration::ZERO,
+            ).await.unwrap();
+            let occupied = collected.candidates.interfaces.iter()
+                .map(|owner| owner.owner.handle.local_address())
+                .collect::<Vec<_>>();
+            let remote_owner = ManagedCandidates::gather(
+                &[bind], &[], IceRole::Controlled,
+                Duration::from_millis(200), Duration::ZERO,
+            ).await.unwrap();
+            let remote = remote_owner.candidates.combined.clone();
+            drop(remote_owner); // ICE 对端已退出，剩余 UDP Owner 必须能够回收。
+            let credentials = crate::session_binding::SessionCredentials::new(
+                [5; 16], [6; 32],
+            ).unwrap();
+            let mut race = collected.start_authenticated_path_race(
+                &remote, credentials, Duration::from_millis(400),
+            ).unwrap();
+            assert!(race.next().await.is_none());
+            race.cleanup().await;
+            for addr in occupied {
+                tokio::net::UdpSocket::bind(addr).await
+                    .expect("failed ICE owner must have been released");
+            }
+        }).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn zero_map_budget_keeps_plain_lan_candidates() {
         let set = ManagedCandidates::gather(
             &["127.0.0.1:0".parse().unwrap()], &[],
