@@ -14,7 +14,7 @@ use crate::{
     ice_agent::NominatedPath,
     ice_signaling::{IceDescription, IceRole},
     multi_interface::{
-        gather_interfaces_with_mapping, CandidateSet, MultiInterfaceError,
+        gather_interfaces_with_mapping, CandidatePathRace, CandidateSet, MultiInterfaceError,
         SelectedDirectPath,
     },
 };
@@ -29,6 +29,23 @@ pub struct ManagedPath {
     pub selected: SelectedDirectPath,
     /// Hold the winning gateway lease for as long as QUIC uses its socket.
     pub mapping_lease: Option<GatewayLease>,
+}
+
+/// 原始 ICE 端口和相关映射租约必须在 QUIC 握手完成前保留。
+/// 该结构只交付经过 ICE 认证的路径，不将其误报为已连接的 QUIC。
+pub struct ManagedPathRace {
+    candidates: CandidatePathRace,
+    leases: Vec<(SocketAddr, GatewayLease)>,
+}
+
+impl ManagedPathRace {
+    pub async fn next(&mut self) -> Option<ManagedPath> {
+        let selected = self.candidates.next().await?;
+        let local = selected.owner.handle.local_address();
+        let mapping_lease = self.leases.iter().position(|(addr, _)| *addr == local)
+            .map(|index| self.leases.swap_remove(index).1);
+        Some(ManagedPath { selected, mapping_lease })
+    }
 }
 
 impl ManagedCandidates {
@@ -48,6 +65,17 @@ impl ManagedCandidates {
         ).await?;
         let leases = std::mem::take(&mut set.mapping_leases);
         Ok(Self { candidates: set, leases })
+    }
+
+    pub fn start_authenticated_path_race(
+        self, remote: &IceDescription,
+        credentials: crate::session_binding::SessionCredentials,
+        deadline: Duration,
+    ) -> Result<ManagedPathRace, MultiInterfaceError> {
+        let candidates = self.candidates.start_authenticated_path_race(
+            remote, credentials, deadline,
+        )?;
+        Ok(ManagedPathRace { candidates, leases: self.leases })
     }
 
     /// Authenticate runtime NAT endpoints before attempting ICE nomination.

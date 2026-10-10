@@ -424,6 +424,11 @@ impl ConnectedTransportPeer {
     pub async fn shutdown(mut self) {
         self.control.close(0u32.into(), b"control session ended");
         self.endpoint.close(0u32.into(), b"control session ended");
+        // 等待 Quinn 完成所有连接驱动退出，不能在仍持有 socket 时
+        // 就声称 UDP 已经释放。使用有限等待防止异常远端拖住 shutdown。
+        let _ = tokio::time::timeout(
+            Duration::from_secs(3), self.endpoint.wait_idle(),
+        ).await;
         if let Some(punch) = self.punch.take() {
             punch.shutdown().await;
         }

@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
   contents: read
 
@@ -16,6 +20,15 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - name: Reuse downloaded Cargo source packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: sdk-source-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('**/Cargo.toml', 'Cargo.lock') }}
+          restore-keys: |
+            sdk-source-${{ runner.os }}-${{ runner.arch }}-
       - name: 自动格式化 Rust 源码
         run: cargo fmt --all
       - name: 检查格式化后的结果
@@ -36,6 +49,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Reuse downloaded Cargo source packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: sdk-source-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('**/Cargo.toml', 'Cargo.lock') }}
+          restore-keys: |
+            sdk-source-${{ runner.os }}-${{ runner.arch }}-
       - name: Compile and test SDK on native OS / CPU
         run: cargo test --all-targets
 
@@ -57,5 +79,14 @@ jobs:
           targets: ${{ matrix.target }}
       - name: Install musl native compiler
         run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Reuse downloaded Cargo source packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: sdk-source-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('**/Cargo.toml', 'Cargo.lock') }}
+          restore-keys: |
+            sdk-source-${{ runner.os }}-${{ runner.arch }}-
       - name: Compile SDK dependency graph for static musl
         run: cargo build --target ${{ matrix.target }}
