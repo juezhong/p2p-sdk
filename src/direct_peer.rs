@@ -36,7 +36,10 @@ const QUIC_ACCEPT: Duration = Duration::from_secs(45);
 const AUTH_DEADLINE: Duration = Duration::from_secs(10);
 const PUNCH_CADENCE: Duration = Duration::from_secs(2);
 const PASSIVE_POLL: Duration = Duration::from_millis(500);
-const PATH_PREFERENCE_GRACE: Duration = Duration::from_millis(180);
+const PATH_PREFERENCE_GRACE: Duration = Duration::from_millis(600);
+const QUIC_DIRECTION_GRACE: Duration = Duration::from_millis(600);
+const LAN_QUIC_HEAD_START: Duration = Duration::from_millis(150);
+const MAX_PENDING_INBOUND_AUTH: usize = 16;
 const CONTROL_PATH_SELECTED: &[u8] = b"P2P-SDK-CONTROL-PATH-1";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -445,6 +448,10 @@ async fn race_authenticated_control(
     let credentials = pairing.credentials.clone();
     let pin = pairing.remote_tls_cert_sha256;
     let dial_addrs = quic_candidate_destinations(remote, advertised);
+    // 疑似同网段只是一个短暂的选路提示，所有远端候选仍参与竞速。
+    let bound_local = outgoing.local_addr().ok();
+    let prefer_lan = bound_local.is_some_and(|local| dial_addrs.iter()
+        .any(|addr| same_local_interface_subnet(local.ip(), addr.ip())));
     workers.spawn(async move {
         let expires = Instant::now() + QUIC_ACCEPT;
         let mut backlog: VecDeque<_> = dial_addrs.iter().copied().collect();
@@ -454,7 +461,13 @@ async fn race_authenticated_control(
                 let Some(address) = backlog.pop_front() else { break };
                 let endpoint = outgoing.clone();
                 let credentials = credentials.clone();
+                let delay = if prefer_lan && !bound_local.is_some_and(|local| {
+                    same_local_interface_subnet(local.ip(), address.ip())
+                }) { LAN_QUIC_HEAD_START } else { Duration::ZERO };
                 attempts.spawn(async move {
+                    if !delay.is_zero() {
+                        tokio::time::sleep(delay).await;
+                    }
                     let connecting = endpoint.connect(address, "localhost")
                         .map_err(|_| DirectPeerError::QuicHandshake)?;
                     let connection = timeout(Duration::from_secs(3), connecting)
@@ -484,10 +497,23 @@ async fn race_authenticated_control(
             match tokio::time::timeout_at(expires, attempts.join_next()).await {
                 Ok(Some(Ok(Ok(authenticated)))) => {
                     attempts.abort_all();
+                    while let Some(result) = attempts.join_next().await {
+                        if let Ok(Ok((loser, _))) = result {
+                            loser.close(0u32.into(), b"outbound QUIC race loser");
+                        }
+                    }
                     return Ok(authenticated);
                 }
                 Ok(Some(_)) => {}
-                _ => return Err(DirectPeerError::QuicHandshake),
+                _ => {
+                    attempts.abort_all();
+                    while let Some(result) = attempts.join_next().await {
+                        if let Ok(Ok((loser, _))) = result {
+                            loser.close(0u32.into(), b"outbound QUIC attempt timed out");
+                        }
+                    }
+                    return Err(DirectPeerError::QuicHandshake);
+                }
             }
         }
     });
@@ -495,23 +521,54 @@ async fn race_authenticated_control(
     let credentials = pairing.credentials.clone();
     workers.spawn(async move {
         let expires = Instant::now() + QUIC_ACCEPT;
-        while Instant::now() < expires {
-            let remaining = expires.saturating_duration_since(Instant::now());
-            let Some(connecting) = timeout(remaining, incoming.accept())
-                .await.map_err(|_| DirectPeerError::QuicHandshake)?
-            else { return Err(DirectPeerError::QuicHandshake) };
-            let Ok(Ok(connection)) = timeout(AUTH_DEADLINE, connecting).await else {
-                continue;
-            };
-            let verified = PeerCertificatePin::new(pin)
-                .ok().is_some_and(|p| p.verify_connection(&connection).is_ok());
-            if verified && authenticate_responder(
-                connection.clone(), &credentials,
-                ChannelRole::Control, &replay_guard, AUTH_DEADLINE,
-            ).await.is_ok() {
-                return Ok((connection, false));
+        let mut pending = JoinSet::new();
+        loop {
+            if Instant::now() >= expires {
+                break;
             }
-            connection.close(1u32.into(), b"Control identity or proof rejected");
+            tokio::select! {
+                // 与 Go 的 accept worker 一致：一个未完成 HMAC 的连接
+                // 不能串行占据后续合法 QUIC 的 accept 路径。
+                accepted = incoming.accept(), if pending.len() < MAX_PENDING_INBOUND_AUTH => {
+                    let Some(connecting) = accepted else { break };
+                    let credentials = credentials.clone();
+                    let replay_guard = Arc::clone(&replay_guard);
+                    pending.spawn(async move {
+                        let Ok(Ok(connection)) = timeout(AUTH_DEADLINE, connecting).await else {
+                            return None;
+                        };
+                        let verified = PeerCertificatePin::new(pin)
+                            .ok().is_some_and(|p| p.verify_connection(&connection).is_ok());
+                        if verified && authenticate_responder(
+                            connection.clone(), &credentials,
+                            ChannelRole::Control, &replay_guard, AUTH_DEADLINE,
+                        ).await.is_ok() {
+                            Some(connection)
+                        } else {
+                            connection.close(1u32.into(), b"Control identity or proof rejected");
+                            None
+                        }
+                    });
+                }
+                completed = pending.join_next(), if !pending.is_empty() => {
+                    if let Some(Ok(Some(connection))) = completed {
+                        pending.abort_all();
+                        while let Some(result) = pending.join_next().await {
+                            if let Ok(Some(loser)) = result {
+                                loser.close(0u32.into(), b"another authenticated path won");
+                            }
+                        }
+                        return Ok((connection, false));
+                    }
+                }
+                _ = tokio::time::sleep_until(expires) => break,
+            }
+        }
+        pending.abort_all();
+        while let Some(result) = pending.join_next().await {
+            if let Ok(Some(loser)) = result {
+                loser.close(0u32.into(), b"Control accept deadline elapsed");
+            }
         }
         Err(DirectPeerError::QuicHandshake)
     });
@@ -519,6 +576,7 @@ async fn race_authenticated_control(
     let prefer_outbound = role == IceRole::Controlled;
     let result = timeout(QUIC_ACCEPT, async {
         let mut fallback: Option<(quinn::Connection, bool)> = None;
+        let mut fallback_deadline: Option<Instant> = None;
         loop {
             tokio::select! {
                 result = workers.join_next() => {
@@ -532,6 +590,7 @@ async fn race_authenticated_control(
                             }
                             if fallback.is_none() {
                                 fallback = Some((connection, outbound));
+                                fallback_deadline = Some(Instant::now() + QUIC_DIRECTION_GRACE);
                             } else {
                                 connection.close(0u32.into(), b"connection race loser");
                             }
@@ -540,13 +599,22 @@ async fn race_authenticated_control(
                         None => return fallback.ok_or(DirectPeerError::QuicHandshake),
                     }
                 }
-                _ = tokio::time::sleep(Duration::from_millis(300)), if fallback.is_some() => {
+                // 方向宽限从首个有效 fallback 起计算；后续无效连接
+                // 不允许反复重置计时并拖延真实可达的链路。
+                _ = tokio::time::sleep_until(
+                    fallback_deadline.unwrap_or(Instant::now() + QUIC_DIRECTION_GRACE)
+                ), if fallback_deadline.is_some() => {
                     return fallback.ok_or(DirectPeerError::QuicHandshake);
                 }
             }
         }
     }).await;
     workers.abort_all();
+    while let Some(result) = workers.join_next().await {
+        if let Ok(Ok((loser, _))) = result {
+            loser.close(0u32.into(), b"Control race loser");
+        }
+    }
     result.unwrap_or(Err(DirectPeerError::QuicHandshake))
 }
 
@@ -984,6 +1052,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stalled_inbound_control_proof_does_not_block_a_valid_peer() {
+        tokio::time::timeout(Duration::from_secs(75), async {
+            let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+            let now = 1_800_000_000;
+            let (pending, invite) = begin_creator(&[bind], &[], now, 1200).await.unwrap();
+            let (joiner, reply) = begin_joiner(&invite, &[bind], &[], now).await.unwrap();
+            let creator = pending.receive_reply(&reply, now).unwrap();
+            let mut cc = creator.confirmation().unwrap();
+            let mut jc = joiner.confirmation().unwrap();
+            cc.confirm(&creator.comparison_code()).unwrap();
+            jc.confirm(&joiner.comparison_code()).unwrap();
+            let (left, right) = tokio::join!(
+                creator.connect_transport(&cc, now),
+                joiner.connect_transport(&jc, now),
+            );
+            let left = left.unwrap();
+            let right = right.unwrap();
+            let destination = right.path.selected.owner.handle.local_address();
+            let pairing = ManualPairing {
+                credentials: right.credentials.clone(),
+                remote_tls_cert_sha256: right.remote_pin,
+                comparison_code: 123456,
+                expires_at: u64::MAX,
+            };
+            // 阻止本地 outbound 意外成为测试胜者。
+            let no_remote_candidates = IceDescription {
+                role: IceRole::Controlling,
+                ufrag: "unused-ufrag".into(),
+                password: "unused-password".into(),
+                candidates: Vec::new(),
+            };
+            let (received, (stalled, valid)) = timeout(Duration::from_secs(6), async {
+                tokio::join!(
+                    race_authenticated_control(
+                        &right.endpoint, "127.0.0.1:9".parse().unwrap(),
+                        &no_remote_candidates, &pairing, IceRole::Controlled,
+                        Arc::new(ReplayGuard::new(4096).unwrap()),
+                    ),
+                    async {
+                        tokio::time::sleep(Duration::from_millis(60)).await;
+                        // TLS 合法但永不发送 Session HMAC 的先到连接。
+                        let stalled = left.endpoint.connect(destination, "localhost")
+                            .unwrap().await.unwrap();
+                        tokio::time::sleep(Duration::from_millis(120)).await;
+                        let valid = left.endpoint.connect(destination, "localhost")
+                            .unwrap().await.unwrap();
+                        authenticate_initiator(
+                            valid.clone(), &left.credentials, ChannelRole::Control,
+                            AUTH_DEADLINE,
+                        ).await.unwrap();
+                        (stalled, valid)
+                    },
+                )
+            }).await.expect("stalled inbound must not block the next authenticated peer");
+            let (accepted, outbound) = received.unwrap();
+            assert!(!outbound);
+            assert_eq!(accepted.remote_address(), left.path.selected.owner.handle.local_address());
+            accepted.close(0u32.into(), b"test complete");
+            valid.close(0u32.into(), b"test complete");
+            stalled.close(0u32.into(), b"test complete");
+            left.shutdown().await;
+            right.shutdown().await;
+        }).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn overlapping_private_candidates_cannot_replace_verified_reachable_path() {
         // 两个远端可能都公布 192.168.1.0/24，但该前缀不能作为
         // 位于同一物理 LAN 的证据：虚假高优先级私网候选不允许阻塞有效路径。
@@ -1016,6 +1150,37 @@ mod tests {
             let right = right.unwrap();
             assert!(left.diagnostic().actual_remote_udp.ip().is_loopback());
             assert!(right.diagnostic().actual_remote_udp.ip().is_loopback());
+            assert!(left.diagnostic().control_connected);
+            assert!(right.diagnostic().control_connected);
+            left.shutdown().await;
+            right.shutdown().await;
+        }).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn late_hmac_prflx_recovers_stale_signaled_nat_port_through_ice_and_quic() {
+        tokio::time::timeout(Duration::from_secs(70), async {
+            let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+            let now = 1_800_000_000;
+            let (pending, invite) = begin_creator(&[bind], &[], now, 1200).await.unwrap();
+            let (joiner, reply) = begin_joiner(&invite, &[bind], &[], now).await.unwrap();
+            let mut creator = pending.receive_reply(&reply, now).unwrap();
+            let real_joiner = creator.inner.remote.candidates[0].address;
+            // 模拟 NAT 映射改变：信令端口已不可达，实际端口只能从
+            // 经过 Session HMAC 认证的入站 Punch 学到，再经 ICE 提名。
+            creator.inner.remote.candidates[0].address =
+                "127.0.0.1:9".parse().unwrap();
+            let mut cc = creator.confirmation().unwrap();
+            let mut jc = joiner.confirmation().unwrap();
+            cc.confirm(&creator.comparison_code()).unwrap();
+            jc.confirm(&joiner.comparison_code()).unwrap();
+            let (left, right) = tokio::join!(
+                creator.connect_transport(&cc, now),
+                joiner.connect_transport(&jc, now),
+            );
+            let left = left.unwrap();
+            let right = right.unwrap();
+            assert_eq!(left.diagnostic().actual_remote_udp, real_joiner);
             assert!(left.diagnostic().control_connected);
             assert!(right.diagnostic().control_connected);
             left.shutdown().await;
