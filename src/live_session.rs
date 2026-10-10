@@ -16,7 +16,6 @@ use crate::{
     network_diagnostics::{self, NetworkDiagnostic},
     punch::AuthenticatedPunch,
     punch_loop::{PunchLoop, PunchStatus},
-    resilient_data::ResilientDataLanes,
     udp_owner::UdpOwnerError,
     verified_session::VerifiedManualSession,
 };
@@ -98,15 +97,13 @@ impl LiveSdkSession {
         self.punch.as_ref().expect("active live session").subscribe()
     }
 
-    pub async fn diagnostic(
-        &self, pool: Option<&ResilientDataLanes>,
-    ) -> NetworkDiagnostic {
+    pub async fn diagnostic(&self) -> NetworkDiagnostic {
         let sources = self.punch.as_ref()
             .expect("active live session").subscribe().borrow().discovered.clone();
         network_diagnostics::snapshot(
             &self.session, &self.path,
             &self.local_description, &self.remote_description,
-            pool, &sources,
+            &sources,
         ).await
     }
 
