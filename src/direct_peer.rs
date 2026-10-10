@@ -398,10 +398,13 @@ mod tests {
             let b = b.unwrap();
             let (mut tx, mut rx) =
                 a.session.verified().control().open_bi().await.unwrap();
-            let (mut reply_tx, mut reply_rx) =
-                b.session.verified().control().accept_bi().await.unwrap();
+            // QUIC does not notify the peer of a newly opened stream until
+            // the initiator actually sends STREAM data. Waiting for accept_bi
+            // before the first write causes a deterministic application deadlock.
             tx.write_all(b"control-echo").await.unwrap();
             tx.finish().unwrap();
+            let (mut reply_tx, mut reply_rx) =
+                b.session.verified().control().accept_bi().await.unwrap();
             assert_eq!(reply_rx.read_to_end(64).await.unwrap(), b"control-echo");
             reply_tx.write_all(b"ok").await.unwrap();
             reply_tx.finish().unwrap();
