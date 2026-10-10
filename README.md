@@ -17,7 +17,7 @@ Rust/Tokio 的通用 P2P 安全网络连接 SDK，供 Transfer、聊天、隧道
 - **SDK**：网卡、STUN、NAT、网关端口映射、ICE、认证 Punch、QUIC/mTLS、会话 HMAC、连接保活和恢复、诊断。
 - **Transfer**：是否建立四条 Data QUIC，以及应用的 Data lane 编号、Stream 调度、文件分片、ACK、重传、断点续传、访问控制和 UI。
 - **其他应用**：可只用 Control QUIC，无须创建四条数据连接。
-- `ResilientDataLanes` 是兼容旧 Transfer 的历史池，迁移完成后才删除；新项目不要依赖它。
+- 原 `ResilientDataLanes` 固定四路历史池已在 SDK #58 删除；Transfer 四路策略转移至 Transfer #28。只有两边 CI 通过合并后，此变更才成为主分支状态。
 
 详细 API 与迁移见 [SDK / application boundary](docs/SDK_APPLICATION_BOUNDARY.md)，架构长期决策记录在 [SDK 文档 PR #2](https://github.com/juezhong/p2p-sdk/pull/2)。
 
