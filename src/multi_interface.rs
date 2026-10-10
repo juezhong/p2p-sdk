@@ -13,7 +13,7 @@
 
 use std::{collections::HashSet, net::SocketAddr, time::Duration};
 
-use tokio::{task::JoinSet, time::{Instant, sleep_until}};
+use tokio::{task::JoinSet, time::{Instant, sleep_until, timeout_at}};
 
 use crate::{
     ice_agent::NominatedPath,
@@ -62,6 +62,31 @@ pub struct SelectedDirectPath {
     pub owner: UdpOwner,
     pub path: NominatedPath,
     pub stun_mapping: Option<MappingReport>,
+}
+
+/// ICE 结果流：保留未获胜的网络接口，直到某条路径真正完成
+/// QUIC/mTLS/会话认证。Drop 会停止剩余 ICE 检查并关闭其 UDP Owner。
+pub struct CandidatePathRace {
+    workers: JoinSet<Result<SelectedDirectPath, MultiInterfaceError>>,
+    expires: Instant,
+}
+
+impl CandidatePathRace {
+    pub async fn next(&mut self) -> Option<SelectedDirectPath> {
+        loop {
+            let joined = timeout_at(self.expires, self.workers.join_next())
+                .await.ok().flatten()?;
+            if let Ok(Ok(path)) = joined {
+                return Some(path);
+            }
+        }
+    }
+}
+
+impl Drop for CandidatePathRace {
+    fn drop(&mut self) {
+        self.workers.abort_all();
+    }
 }
 
 /// Bind one UDP owner per requested local address, concurrently gather Host
@@ -239,6 +264,40 @@ pub async fn gather_interfaces_with_mapping(
 }
 
 impl CandidateSet {
+    /// 多接口持续竞速：成功的 ICE 路径只作为候选，不在 QUIC 真正完成
+    /// 相互认证前关闭其他 UDP Owner。避免首条 ICE 提名路径的 QUIC 失败
+    /// 直接导致整个 P2P 建连失败。
+    pub fn start_authenticated_path_race(
+        self,
+        remote: &IceDescription,
+        credentials: SessionCredentials,
+        deadline: Duration,
+    ) -> Result<CandidatePathRace, MultiInterfaceError> {
+        remote.validate().map_err(|_| MultiInterfaceError::InvalidAddress)?;
+        if deadline <= Duration::from_millis(200) {
+            return Err(MultiInterfaceError::NoDirectPath);
+        }
+        let mut workers = JoinSet::new();
+        for mut interface in self.interfaces {
+            let remote = remote.clone();
+            let proof = AuthenticatedPunch::new(credentials.clone(), interface.local.role);
+            workers.spawn(async move {
+                let result = nominate_with_authenticated_punch(
+                    &mut interface.owner, &interface.local, &remote, &proof, deadline,
+                ).await.map_err(|_| MultiInterfaceError::NoDirectPath)?;
+                Ok(SelectedDirectPath {
+                    owner: interface.owner,
+                    path: result,
+                    stun_mapping: interface.stun_mapping,
+                })
+            });
+        }
+        Ok(CandidatePathRace {
+            workers,
+            expires: Instant::now() + deadline,
+        })
+    }
+
     /// Run real authenticated ICE checks across all bound sockets in
     /// parallel rather than serially waiting for IPv6 to time out before IPv4.
     /// The returned winning owner retains exactly the ICE-validated UDP socket
