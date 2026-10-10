@@ -576,6 +576,7 @@ async fn race_authenticated_control(
     let prefer_outbound = role == IceRole::Controlled;
     let result = timeout(QUIC_ACCEPT, async {
         let mut fallback: Option<(quinn::Connection, bool)> = None;
+        let mut fallback_deadline: Option<Instant> = None;
         loop {
             tokio::select! {
                 result = workers.join_next() => {
@@ -589,6 +590,7 @@ async fn race_authenticated_control(
                             }
                             if fallback.is_none() {
                                 fallback = Some((connection, outbound));
+                                fallback_deadline = Some(Instant::now() + QUIC_DIRECTION_GRACE);
                             } else {
                                 connection.close(0u32.into(), b"connection race loser");
                             }
@@ -597,13 +599,22 @@ async fn race_authenticated_control(
                         None => return fallback.ok_or(DirectPeerError::QuicHandshake),
                     }
                 }
-                _ = tokio::time::sleep(QUIC_DIRECTION_GRACE), if fallback.is_some() => {
+                // 方向宽限从首个有效 fallback 起计算；后续无效连接
+                // 不允许反复重置计时并拖延真实可达的链路。
+                _ = tokio::time::sleep_until(
+                    fallback_deadline.unwrap_or(Instant::now() + QUIC_DIRECTION_GRACE)
+                ), if fallback_deadline.is_some() => {
                     return fallback.ok_or(DirectPeerError::QuicHandshake);
                 }
             }
         }
     }).await;
     workers.abort_all();
+    while let Some(result) = workers.join_next().await {
+        if let Ok(Ok((loser, _))) = result {
+            loser.close(0u32.into(), b"Control race loser");
+        }
+    }
     result.unwrap_or(Err(DirectPeerError::QuicHandshake))
 }
 
