@@ -265,7 +265,7 @@ impl ConnectedTransportPeer {
             .unwrap_or_default();
         TransportDiagnostic {
             actual_local_udp: self.path.selected.path.local,
-            actual_remote_udp: self.path.selected.path.remote,
+            actual_remote_udp: self.control.remote_address(),
             control_connected: self.control.close_reason().is_none(),
             control_outbound: self.control_outbound,
             gateway_mapping: self.path.mapping_lease.as_ref()
@@ -297,7 +297,10 @@ impl ConnectedTransportPeer {
         if deadline.is_zero() { return Err(TransportError::Timeout); }
         // 独立 UDP 尝试与共享路径回退必须使用同一个绝对截止时间。
         let expires = Instant::now() + deadline;
-        let remote = self.path.selected.path.remote;
+        // QUIC 可以在保持 Control 存活时更新 peer 的实际 NAT 端点。
+        // 附属连接应优先拨到当前已认证 Control 的真实远端，而不是
+        // 只能重试最初 ICE 时记录的旧映射。
+        let remote = self.control.remote_address();
         let dedicated = tokio::select! {
             _ = self.control.closed() => return Err(TransportError::ControlDisconnected),
             result = timeout_at(expires, self.try_dedicated_endpoint()) =>

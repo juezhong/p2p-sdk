@@ -46,6 +46,21 @@ impl ManagedPathRace {
             .map(|index| self.leases.swap_remove(index).1);
         Some(ManagedPath { selected, mapping_lease })
     }
+
+    /// 无论成功/失败均要完成取消任务与路由器映射删除，不能仅依赖
+    /// Drop 中的 best-effort 通知（应用可能马上退出 Tokio runtime）。
+    pub async fn cleanup(mut self) {
+        self.candidates.abort_and_join().await;
+        // 多个路由器删除命令必须并发等待；逐个 await 会把成功建连
+        // 延迟累加成 N 个网关超时，不符合 Go 的快速可用路径语义。
+        let mut cleanup = tokio::task::JoinSet::new();
+        for (_, lease) in self.leases.drain(..) {
+            cleanup.spawn(async move {
+                let _ = lease.shutdown().await;
+            });
+        }
+        while cleanup.join_next().await.is_some() {}
+    }
 }
 
 impl ManagedCandidates {
@@ -158,6 +173,46 @@ mod tests {
         );
         assert!(l.unwrap().nominated().remote == rd.candidates[0].address);
         assert!(r.unwrap().nominated().remote == ld.candidates[0].address);
+    }
+
+    #[tokio::test]
+    async fn failed_ice_race_cleanup_releases_every_udp_owner() {
+        tokio::time::timeout(Duration::from_secs(7), async {
+            let bind = "127.0.0.1:0".parse().unwrap();
+            let collected = ManagedCandidates::gather(
+                &[bind, bind], &[], IceRole::Controlling,
+                Duration::from_millis(200), Duration::ZERO,
+            ).await.unwrap();
+            let occupied = collected.candidates.interfaces.iter()
+                .map(|owner| owner.owner.handle.local_address())
+                .collect::<Vec<_>>();
+            let remote_owner = ManagedCandidates::gather(
+                &[bind], &[], IceRole::Controlled,
+                Duration::from_millis(200), Duration::ZERO,
+            ).await.unwrap();
+            let remote = remote_owner.candidates.combined.clone();
+            drop(remote_owner); // ICE 对端已退出，剩余 UDP Owner 必须能够回收。
+            let credentials = crate::session_binding::SessionCredentials::new(
+                [5; 16], [6; 32],
+            ).unwrap();
+            let mut race = collected.start_authenticated_path_race(
+                &remote, credentials, Duration::from_millis(400),
+            ).unwrap();
+            assert!(race.next().await.is_none());
+            race.cleanup().await;
+            for addr in occupied {
+                // UDP Owner 的 recv task 可能需要一次 runtime 轮询处理 abort；
+                // 不允许永久占用端口，但不要依赖任务调度的纳秒级顺序。
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    loop {
+                        if tokio::net::UdpSocket::bind(addr).await.is_ok() {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                }).await.expect("failed ICE owner must have been released");
+            }
+        }).await.unwrap();
     }
 
     #[tokio::test]
