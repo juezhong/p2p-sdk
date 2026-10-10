@@ -420,6 +420,33 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn joiner_waits_for_verified_creator_activity_without_ice_timeout() {
+        let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let now = 1_800_000_000;
+        let (pending, invite) = begin_creator(&[bind], &[], now, 1200).await.unwrap();
+        let (joiner, reply) = begin_joiner(&invite, &[bind], &[], now).await.unwrap();
+        let creator = pending.receive_reply(&reply, now).unwrap();
+        let mut cc = creator.confirmation().unwrap();
+        let mut jc = joiner.confirmation().unwrap();
+        cc.confirm(&creator.comparison_code()).unwrap();
+        jc.confirm(&joiner.comparison_code()).unwrap();
+        let waiting = tokio::spawn(async move { joiner.connect(&jc, now).await });
+        // An authenticated REPLY alone must never start the joiner's ICE
+        // deadline. A missing creator remains a pending, not failed, session.
+        tokio::time::sleep(Duration::from_millis(1400)).await;
+        assert!(!waiting.is_finished(), "joiner started ICE before creator activity");
+        let connected = creator.connect(&cc, now);
+        let (creator_result, joiner_result) = tokio::time::timeout(
+            Duration::from_secs(60),
+            async { tokio::join!(connected, waiting) },
+        ).await.unwrap();
+        let left = creator_result.unwrap();
+        let right = joiner_result.unwrap().unwrap();
+        left.shutdown().await;
+        right.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn complete_creator_joiner_pairing_and_control_roundtrip() {
         tokio::time::timeout(Duration::from_secs(60), async {
             let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
