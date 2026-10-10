@@ -18,8 +18,10 @@ use tokio::task::JoinSet;
 use crate::{
     ice_agent::NominatedPath,
     ice_gather::{gather, CandidateGatherError},
-    ice_multi::nominate_direct_candidates,
+    ice_multi::{nominate_direct_candidates, nominate_with_authenticated_punch},
     ice_signaling::{IceDescription, IceRole, MAX_CANDIDATES},
+    punch::AuthenticatedPunch,
+    session_binding::SessionCredentials,
     udp_owner::UdpOwner,
 };
 
@@ -153,6 +155,42 @@ impl CandidateSet {
         }).await;
         result.unwrap_or(Err(MultiInterfaceError::NoDirectPath))
     }
+    /// Like nominate_first, but first send authenticated probes and add only
+    /// HMAC-verified peer-reflexive endpoints to the subsequent ICE checks.
+    /// A learned source never counts as a nominated path without ICE proof.
+    pub async fn nominate_first_with_authenticated_punch(
+        self,
+        remote: &IceDescription,
+        credentials: SessionCredentials,
+        deadline: Duration,
+    ) -> Result<SelectedDirectPath, MultiInterfaceError> {
+        remote.validate().map_err(|_| MultiInterfaceError::InvalidAddress)?;
+        if deadline <= Duration::from_millis(200) {
+            return Err(MultiInterfaceError::NoDirectPath);
+        }
+        let mut tasks = JoinSet::new();
+        for mut interface in self.interfaces {
+            let remote = remote.clone();
+            let proof = AuthenticatedPunch::new(credentials.clone(), interface.local.role);
+            tasks.spawn(async move {
+                let result = nominate_with_authenticated_punch(
+                    &mut interface.owner, &interface.local, &remote, &proof, deadline,
+                ).await;
+                (interface.owner, result)
+            });
+        }
+        let result = tokio::time::timeout(deadline, async {
+            while let Some(joined) = tasks.join_next().await {
+                if let Ok((owner, Ok(path))) = joined {
+                    tasks.abort_all();
+                    return Ok(SelectedDirectPath { owner, path });
+                }
+            }
+            Err(MultiInterfaceError::NoDirectPath)
+        }).await;
+        result.unwrap_or(Err(MultiInterfaceError::NoDirectPath))
+    }
+
 }
 
 #[cfg(test)]
