@@ -770,6 +770,18 @@ mod tests {
             assert!(joiner.diagnostic().control_connected);
             assert!(received.close_reason().is_some());
 
+            // 真正的 Control 断线会终止重拨，不能伪报会话仍健康。
+            creator.control.close(0u32.into(), b"test control close");
+            tokio::time::timeout(Duration::from_secs(5), async {
+                let mut updates = outgoing.subscribe();
+                loop {
+                    if updates.borrow().phase == ManagedLinkPhase::ControlLost {
+                        break;
+                    }
+                    updates.changed().await.unwrap();
+                }
+            }).await.unwrap();
+            assert!(outgoing.current().is_none());
             outgoing.shutdown().await;
             incoming.shutdown().await;
             Arc::try_unwrap(creator).ok().unwrap().shutdown().await;
