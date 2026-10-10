@@ -44,13 +44,13 @@ pub enum DirectPeerError {
 }
 
 pub struct PendingCreator {
-    identity: rcgen::CertifiedKey,
+    identity: rcgen::CertifiedKey<rcgen::KeyPair>,
     gathered: ManagedCandidates,
     pending: ManualIceInvite,
 }
 
 struct ReadyBase {
-    identity: rcgen::CertifiedKey,
+    identity: rcgen::CertifiedKey<rcgen::KeyPair>,
     gathered: ManagedCandidates,
     pairing: ManualPairing,
     remote: IceDescription,
@@ -67,7 +67,7 @@ pub struct ConnectedDirectPeer {
     pub session: LiveSdkSession,
 }
 
-fn identity() -> Result<rcgen::CertifiedKey, DirectPeerError> {
+fn identity() -> Result<rcgen::CertifiedKey<rcgen::KeyPair>, DirectPeerError> {
     rcgen::generate_simple_self_signed(vec!["localhost".into()])
         .map_err(|_| DirectPeerError::Identity)
 }
