@@ -7,8 +7,11 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 use quinn::{Connection, Endpoint};
 use crate::{
     channel::ChannelRole,
-    ice_signaling::IceRole,
+    ice_signaling::{IceRole, IceCandidateType},
+    gateway::GatewayLease,
     managed_candidates::ManagedPath,
+    multi_stun::MappingConsistency,
+    network_diagnostics::GatewayMethod,
     peer_pin::PeerCertificatePin,
     punch_loop::PunchLoop,
     quinn_socket::{demux_endpoint_config, QuinnUdpAdapter},
@@ -27,12 +30,19 @@ pub enum TransportError {
     Timeout,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TransportDiagnostic {
     pub actual_local_udp: SocketAddr,
     pub actual_remote_udp: SocketAddr,
     pub control_connected: bool,
     pub gateway_mapping: Option<SocketAddr>,
+    pub gateway_method: Option<GatewayMethod>,
+    pub remote_candidate_kind: Option<IceCandidateType>,
+    pub ice_role: IceRole,
+    /// These were offered during ICE; loser sockets need not remain open.
+    pub offered_host_candidates: Vec<SocketAddr>,
+    pub stun_consistency: Option<MappingConsistency>,
+    pub authenticated_peer_reflexive: Vec<SocketAddr>,
 }
 
 /// One authenticated auxiliary QUIC connection. An independent port, if
@@ -70,16 +80,35 @@ pub struct ConnectedTransportPeer {
     pub(crate) role: IceRole,
     pub(crate) client_tls: Option<quinn::ClientConfig>,
     pub(crate) replay_guard: Arc<ReplayGuard>,
+    pub(crate) remote_candidate_kind: Option<IceCandidateType>,
+    pub(crate) offered_host_candidates: Vec<SocketAddr>,
 }
 
 impl ConnectedTransportPeer {
     pub fn diagnostic(&self) -> TransportDiagnostic {
+        let mut offered_host_candidates = self.offered_host_candidates.clone();
+        offered_host_candidates.sort();
+        offered_host_candidates.dedup();
+        let authenticated_peer_reflexive = self.punch.as_ref()
+            .map(|punch| punch.subscribe().borrow().discovered.clone())
+            .unwrap_or_default();
         TransportDiagnostic {
             actual_local_udp: self.path.selected.path.local,
             actual_remote_udp: self.path.selected.path.remote,
             control_connected: self.control.close_reason().is_none(),
             gateway_mapping: self.path.mapping_lease.as_ref()
                 .and_then(|lease| lease.subscribe().mapped_address()),
+            gateway_method: self.path.mapping_lease.as_ref().map(|lease| match lease {
+                GatewayLease::Pcp(_) => GatewayMethod::Pcp,
+                GatewayLease::NatPmp(_) => GatewayMethod::NatPmp,
+                GatewayLease::Upnp(_) => GatewayMethod::Upnp,
+            }),
+            remote_candidate_kind: self.remote_candidate_kind,
+            ice_role: self.role,
+            offered_host_candidates,
+            stun_consistency: self.path.selected.stun_mapping.as_ref()
+                .map(|report| report.consistency()),
+            authenticated_peer_reflexive,
         }
     }
 
