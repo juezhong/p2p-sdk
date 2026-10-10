@@ -11,20 +11,17 @@ use crate::{
     ice_signaling::{IceDescription, IceRole, IceCandidateType},
     local_network::local_addresses,
     multi_interface::MAX_ACTIVE_INTERFACES,
-    live_session::LiveSdkSession,
     managed_candidates::ManagedCandidates,
     punch::{AuthenticatedPunch, unix_seconds},
     manual_ice_v2::{self, ManualIceInvite},
     manual_pairing::ManualPairing,
     peer_pin::{ManualConfirmation, PeerCertificatePin},
     quinn_socket::{demux_endpoint_config, QuinnUdpAdapter},
-    resilient_data::{ResilientDataLanes, MAX_DATA_LANES},
     session_binding::{ReplayGuard, authenticate_initiator, authenticate_responder},
     channel::ChannelRole,
     transport_session::ConnectedTransportPeer,
     punch_loop::PunchLoop,
     tls_identity::{authenticated_client_config, authenticated_server_config},
-    verified_session::{establish_initiator, establish_responder},
 };
 
 const GATHER: Duration = Duration::from_secs(3);
@@ -68,13 +65,6 @@ struct ReadyBase {
 
 pub struct ReadyCreator { inner: ReadyBase }
 pub struct ReadyJoiner { inner: ReadyBase }
-
-/// Own the Quinn Endpoint until all authenticated streams have shut down.
-pub struct ConnectedDirectPeer {
-    pub endpoint: quinn::Endpoint,
-    pub data_lanes: ResilientDataLanes,
-    pub session: LiveSdkSession,
-}
 
 fn identity() -> Result<rcgen::CertifiedKey<rcgen::KeyPair>, DirectPeerError> {
     rcgen::generate_simple_self_signed(vec!["localhost".into()])
@@ -332,12 +322,6 @@ fn trusted_certificate(bytes: Vec<u8>)
 }
 
 impl ReadyCreator {
-    pub async fn connect_now(self, confirmed: &ManualConfirmation)
-        -> Result<ConnectedDirectPeer, DirectPeerError>
-    {
-        self.connect(confirmed, current_unix_seconds()?).await
-    }
-
     pub fn comparison_code(&self) -> String {
         self.inner.pairing.comparison_code_text()
     }
@@ -345,88 +329,10 @@ impl ReadyCreator {
         confirmation(&self.inner.pairing)
     }
 
-    /// Only one authenticated Data connection is created by default.
-    /// The application explicitly selects additional concurrent connections.
-    pub async fn connect(
-        self, confirmed: &ManualConfirmation, now: u64,
-    ) -> Result<ConnectedDirectPeer, DirectPeerError> {
-        self.connect_with_data_connections(confirmed, now, 1).await
-    }
 
-    /// Choose transport connection concurrency; this is NOT a file lane
-    /// scheduler. The application owns message framing and stream allocation.
-    pub async fn connect_with_data_connections(
-        self, confirmed: &ManualConfirmation, now: u64,
-        desired_data_connections: usize,
-    ) -> Result<ConnectedDirectPeer, DirectPeerError> {
-        if !(1..=MAX_DATA_LANES).contains(&desired_data_connections) {
-            return Err(DirectPeerError::DataLanePool);
-        }
-        let ReadyBase {
-            identity, gathered, pairing, remote, remote_certificate,
-        } = self.inner;
-        confirmed.ensure_pairing_confirmed(
-            pairing.credentials.session_id(), pairing.comparison_code,
-        ).map_err(|_| DirectPeerError::Confirmation)?;
-        let local_description = gathered.candidates.combined.clone();
-        #[cfg(test)]
-        eprintln!("DIRECT_TEST: creator starts ICE and authenticated Punch");
-        let sending = ConnectPunchSender::start(&gathered, &pairing, &remote);
-        let mut selected = gathered.nominate_first_with_authenticated_punch(
-            &remote, pairing.credentials.clone(), ICE_CHECK).await
-            .map_err(|_| DirectPeerError::IceCheck)?;
-        drop(sending);
-        let nominated = selected.nominated();
-        #[cfg(test)]
-        eprintln!("DIRECT_TEST: creator ICE done, configuring client");
-        let client_config = authenticated_client_config(
-            vec![identity.cert.der().clone()],
-            rustls::pki_types::PrivateKeyDer::Pkcs8(
-                identity.signing_key.serialize_der().into()
-            ),
-            trusted_certificate(remote_certificate)?,
-        ).map_err(|_| DirectPeerError::TlsConfig)?;
-        let adapter = QuinnUdpAdapter::from_owner(&mut selected.selected.owner)
-            .map_err(|_| DirectPeerError::UdpAdapter)?;
-        let mut endpoint = quinn::Endpoint::new_with_abstract_socket(
-            demux_endpoint_config(), None, Arc::new(adapter),
-            quinn::default_runtime().ok_or(DirectPeerError::QuicEndpoint)?,
-        ).map_err(|_| DirectPeerError::QuicEndpoint)?;
-        endpoint.set_default_client_config(client_config.clone());
-        #[cfg(test)]
-        eprintln!("DIRECT_TEST: creator dialing Control");
-        let control = endpoint.connect(nominated.remote, "localhost")
-            .map_err(|_| DirectPeerError::QuicHandshake)?.await
-            .map_err(|_| DirectPeerError::QuicHandshake)?;
-        let data = endpoint.connect(nominated.remote, "localhost")
-            .map_err(|_| DirectPeerError::QuicHandshake)?.await
-            .map_err(|_| DirectPeerError::QuicHandshake)?;
-        #[cfg(test)]
-        eprintln!("DIRECT_TEST: creator QUIC done, HMAC");
-        let secure = establish_initiator(
-            control, data, &pairing, confirmed, now, AUTH_DEADLINE,
-        ).await.map_err(|_| DirectPeerError::VerifiedSession)?;
-        let data_lanes = ResilientDataLanes::start_creator_with_independent_udp(
-            &secure, endpoint.clone(), nominated.remote, &pairing,
-            client_config, desired_data_connections,
-        ).map_err(|_| DirectPeerError::DataLanePool)?;
-        #[cfg(test)]
-        eprintln!("DIRECT_TEST: establishing live session");
-        let session = LiveSdkSession::attach(
-            secure, selected, &pairing, local_description, remote,
-            IceRole::Controlling, PUNCH_CADENCE,
-        ).map_err(|_| DirectPeerError::LiveSession)?;
-        Ok(ConnectedDirectPeer { endpoint, data_lanes, session })
-    }
 }
 
 impl ReadyJoiner {
-    pub async fn connect_now(self, confirmed: &ManualConfirmation)
-        -> Result<ConnectedDirectPeer, DirectPeerError>
-    {
-        self.connect(confirmed, current_unix_seconds()?).await
-    }
-
     pub fn comparison_code(&self) -> String {
         self.inner.pairing.comparison_code_text()
     }
@@ -434,81 +340,7 @@ impl ReadyJoiner {
         confirmation(&self.inner.pairing)
     }
 
-    /// Only one authenticated Data connection is created by default.
-    /// The application explicitly selects additional concurrent connections.
-    pub async fn connect(
-        self, confirmed: &ManualConfirmation, now: u64,
-    ) -> Result<ConnectedDirectPeer, DirectPeerError> {
-        self.connect_with_data_connections(confirmed, now, 1).await
-    }
 
-    /// Choose transport connection concurrency; this is NOT a file lane
-    /// scheduler. The application owns message framing and stream allocation.
-    pub async fn connect_with_data_connections(
-        self, confirmed: &ManualConfirmation, now: u64,
-        desired_data_connections: usize,
-    ) -> Result<ConnectedDirectPeer, DirectPeerError> {
-        if !(1..=MAX_DATA_LANES).contains(&desired_data_connections) {
-            return Err(DirectPeerError::DataLanePool);
-        }
-        let ReadyBase {
-            identity, gathered, pairing, remote, remote_certificate,
-        } = self.inner;
-        confirmed.ensure_pairing_confirmed(
-            pairing.credentials.session_id(), pairing.comparison_code,
-        ).map_err(|_| DirectPeerError::Confirmation)?;
-        let local_description = gathered.candidates.combined.clone();
-        let mut gathered = gathered;
-        wait_for_authenticated_creator(&mut gathered, &pairing, &remote).await?;
-        #[cfg(test)]
-        eprintln!("DIRECT_TEST: joiner starts ICE after verified creator activity");
-        let mut selected = gathered.nominate_first_with_authenticated_punch(
-            &remote, pairing.credentials.clone(), ICE_CHECK).await
-            .map_err(|_| DirectPeerError::IceCheck)?;
-        #[cfg(test)]
-        eprintln!("DIRECT_TEST: joiner ICE done, configuring server");
-        let tls = authenticated_server_config(
-            vec![identity.cert.der().clone()],
-            rustls::pki_types::PrivateKeyDer::Pkcs8(
-                identity.signing_key.serialize_der().into()
-            ),
-            trusted_certificate(remote_certificate)?,
-        ).map_err(|_| DirectPeerError::TlsConfig)?;
-        let adapter = QuinnUdpAdapter::from_owner(&mut selected.selected.owner)
-            .map_err(|_| DirectPeerError::UdpAdapter)?;
-        let endpoint = quinn::Endpoint::new_with_abstract_socket(
-            demux_endpoint_config(), Some(tls), Arc::new(adapter),
-            quinn::default_runtime().ok_or(DirectPeerError::QuicEndpoint)?,
-        ).map_err(|_| DirectPeerError::QuicEndpoint)?;
-        #[cfg(test)]
-        eprintln!("DIRECT_TEST: joiner waiting Control");
-        let control = tokio::time::timeout(QUIC_ACCEPT, endpoint.accept())
-            .await.map_err(|_| DirectPeerError::QuicHandshake)?
-            .ok_or(DirectPeerError::QuicHandshake)?
-            .await.map_err(|_| DirectPeerError::QuicHandshake)?;
-        let data = tokio::time::timeout(QUIC_ACCEPT, endpoint.accept())
-            .await.map_err(|_| DirectPeerError::QuicHandshake)?
-            .ok_or(DirectPeerError::QuicHandshake)?
-            .await.map_err(|_| DirectPeerError::QuicHandshake)?;
-        let guard = Arc::new(ReplayGuard::new(4096)
-            .map_err(|_| DirectPeerError::VerifiedSession)?);
-        #[cfg(test)]
-        eprintln!("DIRECT_TEST: joiner QUIC done, HMAC");
-        let secure = establish_responder(
-            control, data, &pairing, confirmed, &guard,
-            now, AUTH_DEADLINE,
-        ).await.map_err(|_| DirectPeerError::VerifiedSession)?;
-        let data_lanes = ResilientDataLanes::start_joiner(
-            &secure, endpoint.clone(), &pairing, guard, desired_data_connections,
-        ).map_err(|_| DirectPeerError::DataLanePool)?;
-        #[cfg(test)]
-        eprintln!("DIRECT_TEST: establishing live session");
-        let session = LiveSdkSession::attach(
-            secure, selected, &pairing, local_description, remote,
-            IceRole::Controlled, PUNCH_CADENCE,
-        ).map_err(|_| DirectPeerError::LiveSession)?;
-        Ok(ConnectedDirectPeer { endpoint, data_lanes, session })
-    }
 }
 
 /// 与 Go connectQUIC/waitForPeerThenConnect 一致，两端同时 Listen/Dial。
@@ -751,13 +583,6 @@ impl ReadyJoiner {
     }
 }
 
-impl ConnectedDirectPeer {
-    pub async fn shutdown(self) {
-        self.data_lanes.shutdown().await;
-        self.endpoint.close(0u32.into(), b"direct sdk peer stopped");
-        self.session.shutdown().await;
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -774,12 +599,12 @@ mod tests {
         let mut jc = joiner.confirmation().unwrap();
         cc.confirm(&creator.comparison_code()).unwrap();
         jc.confirm(&joiner.comparison_code()).unwrap();
-        let waiting = tokio::spawn(async move { joiner.connect(&jc, now).await });
+        let waiting = tokio::spawn(async move { joiner.connect_transport(&jc, now).await });
         // An authenticated REPLY alone must never start the joiner's ICE
         // deadline. A missing creator remains a pending, not failed, session.
         tokio::time::sleep(Duration::from_millis(1400)).await;
         assert!(!waiting.is_finished(), "joiner started ICE before creator activity");
-        let connected = creator.connect(&cc, now);
+        let connected = creator.connect_transport(&cc, now);
         let (creator_result, joiner_result) = tokio::time::timeout(
             Duration::from_secs(60),
             async { tokio::join!(connected, waiting) },
@@ -945,90 +770,5 @@ mod tests {
         }).await.unwrap();
     }
 
-    #[tokio::test]
-    async fn application_can_request_four_links_and_recover_one_failed_data_quic() {
-        tokio::time::timeout(Duration::from_secs(50), async {
-            let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
-            let now = 1_800_000_000;
-            let (pending, invite) = begin_creator(&[bind], &[], now, 1200).await.unwrap();
-            let (joiner, reply) = begin_joiner(&invite, &[bind], &[], now).await.unwrap();
-            let creator = pending.receive_reply(&reply, now).unwrap();
-            let mut cc = creator.confirmation().unwrap();
-            let mut jc = joiner.confirmation().unwrap();
-            cc.confirm(&creator.comparison_code()).unwrap();
-            jc.confirm(&joiner.comparison_code()).unwrap();
-            let (left, right) = tokio::join!(
-                creator.connect_with_data_connections(&cc, now, 4),
-                joiner.connect_with_data_connections(&jc, now, 4),
-            );
-            let left = left.unwrap();
-            let right = right.unwrap();
-            let initial = left.data_lanes.wait_for_count(4, Duration::from_secs(15))
-                .await.unwrap();
-            right.data_lanes.wait_for_count(4, Duration::from_secs(15))
-                .await.unwrap();
-            let failed = initial[1].clone();
-            let old_id = failed.stable_id();
-            failed.close(1u32.into(), b"test induced data failure");
-            tokio::time::timeout(Duration::from_secs(15), async {
-                loop {
-                    let active = left.data_lanes.available().await;
-                    if active.len() == 4 && active.iter().all(|c| c.stable_id() != old_id) {
-                        break;
-                    }
-                    assert!(left.session.verified().control().close_reason().is_none());
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
-            }).await.unwrap();
-            left.shutdown().await;
-            right.shutdown().await;
-        }).await.unwrap();
-    }
 
-    #[tokio::test]
-    async fn complete_creator_joiner_pairing_and_control_roundtrip() {
-        tokio::time::timeout(Duration::from_secs(60), async {
-            let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
-            let now = 1_800_000_000;
-            let (pending, invite) =
-                begin_creator(&[bind], &[], now, 1200).await.unwrap();
-            let (joiner, reply) =
-                begin_joiner(&invite, &[bind], &[], now).await.unwrap();
-            let creator = pending.receive_reply(&reply, now).unwrap();
-            assert_eq!(creator.comparison_code(), joiner.comparison_code());
-            let mut cc = creator.confirmation().unwrap();
-            let mut jc = joiner.confirmation().unwrap();
-            cc.confirm(&creator.comparison_code()).unwrap();
-            jc.confirm(&joiner.comparison_code()).unwrap();
-            eprintln!("DIRECT_TEST: paired codes confirmed, start connect");
-            let (a, b) = tokio::join!(
-                creator.connect(&cc, now),
-                joiner.connect(&jc, now),
-            );
-            eprintln!("DIRECT_TEST: both connected");
-            let a = a.unwrap();
-            let b = b.unwrap();
-            assert_eq!(a.data_lanes.subscribe().borrow().desired, 1);
-            assert_eq!(b.data_lanes.subscribe().borrow().desired, 1);
-            let (mut tx, mut rx) =
-                a.session.verified().control().open_bi().await.unwrap();
-            // QUIC does not notify the peer of a newly opened stream until
-            // the initiator actually sends STREAM data. Waiting for accept_bi
-            // before the first write causes a deterministic application deadlock.
-            tx.write_all(b"control-echo").await.unwrap();
-            tx.finish().unwrap();
-            let (mut reply_tx, mut reply_rx) =
-                b.session.verified().control().accept_bi().await.unwrap();
-            assert_eq!(reply_rx.read_to_end(64).await.unwrap(), b"control-echo");
-            reply_tx.write_all(b"ok").await.unwrap();
-            reply_tx.finish().unwrap();
-            assert_eq!(rx.read_to_end(64).await.unwrap(), b"ok");
-            assert_eq!(a.session.actual_path().1, b.session.actual_path().0);
-            eprintln!("DIRECT_TEST: control echo completed, shutdown creator");
-            a.shutdown().await;
-            eprintln!("DIRECT_TEST: shutdown joiner");
-            b.shutdown().await;
-            eprintln!("DIRECT_TEST: finished");
-        }).await.unwrap();
-    }
 }
