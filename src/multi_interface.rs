@@ -81,6 +81,12 @@ impl CandidatePathRace {
             }
         }
     }
+
+    /// 等待全部失败候选的 ICE task 结束，确保其 UDP Owner 在返回前 Drop。
+    pub async fn abort_and_join(&mut self) {
+        self.workers.abort_all();
+        while self.workers.join_next().await.is_some() {}
+    }
 }
 
 impl Drop for CandidatePathRace {
