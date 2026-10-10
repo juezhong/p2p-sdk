@@ -10,7 +10,6 @@ use crate::{
     gateway::GatewayLease,
     managed_candidates::ManagedPath,
     multi_stun::MappingConsistency,
-    resilient_data::ResilientDataLanes,
     verified_session::VerifiedManualSession,
 };
 
@@ -54,7 +53,6 @@ pub async fn snapshot(
     selected: &ManagedPath,
     local_description: &IceDescription,
     remote_description: &IceDescription,
-    pool: Option<&ResilientDataLanes>,
     authenticated_sources: &[SocketAddr],
 ) -> NetworkDiagnostic {
     let path = selected.selected.path;
@@ -72,18 +70,12 @@ pub async fn snapshot(
     offered_host_candidates.dedup();
     let control_connected = session.control().close_reason().is_none();
     let base_data_connected = session.data().close_reason().is_none();
-    let (desired_data_lanes, active_data_lanes, data_remotes) = match pool {
-        Some(pool) => {
-            let s = *pool.subscribe().borrow();
-            let lanes = pool.available().await;
-            let remotes = lanes.iter().map(|c| c.remote_address()).collect();
-            (s.desired, lanes.len(), remotes)
-        }
-        None => (
-            1, usize::from(base_data_connected),
-            if base_data_connected { vec![session.data().remote_address()] }
-            else { Vec::new() },
-        ),
+    let desired_data_lanes = 1;
+    let active_data_lanes = usize::from(base_data_connected);
+    let data_remotes = if base_data_connected {
+        vec![session.data().remote_address()]
+    } else {
+        Vec::new()
     };
     let remote_candidate_kind = remote_description.candidates.iter()
         .find(|c| c.address == path.remote).map(|c| c.kind);
