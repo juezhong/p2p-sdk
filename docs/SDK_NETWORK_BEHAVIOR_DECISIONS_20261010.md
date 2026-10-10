@@ -60,4 +60,11 @@
 - [SDK PR #62](https://github.com/juezhong/p2p-sdk/pull/62)：使用 `CandidatePathRace` / `ManagedPathRace` 保留其他 UDP Owner 的 ICE 检查结果，不再在第一次 ICE 提名后全部终止。每条候选须完成 QUIC/mTLS/HMAC 才能参与胜出；创建方通过经过认证的 QUIC 发送路径选择消息，加入方只接纳被选择的 Control。
 - 已在 PR 中实现短暂 LAN/全球 IPv6 优先，仅对真正通过 ICE+QUIC 认证的候选生效；两个完全不同的 `192.168.1.x` 家庭网络不会因为 IP 前缀相同就直接判定已联通。
 - 已增加候选 UDP Owner 保持测试、双端多端口关闭后重新绑定测试，以及路径评分的确定性测试。这是**代码和自动化测试**，不是 CGNAT/IPv6 有状态防火墙的真实设备结果。
-- **当前 PR #62 尚未通过最终全部 CI / 合并**。必须查看该 PR 最新 revision 检查结果；如有回归或死锁须修复，不应跳过验证。
+- **PR #62 七组 CI 已全部成功并合并到主分支**（`454aefc`）：跨 UDP Owner 的 ICE→QUIC 多路径失败回退、创建方最终控制连接选路、局域网/公网 IPv6 的短暂优先及 UDP 资源关闭回归。
+
+## 九、同一 UDP Owner 多远端地址 QUIC 失败回退
+
+- [SDK PR #63](https://github.com/juezhong/p2p-sdk/pull/63)：继续处理 Go 的多候选拨号。原已 ICE 提名地址优先尝试，失败后同 socket 竞速其他人工确认信令的合法同族候选；全局限定并发最多 4，且每条 QUIC 都必须重新通过 mTLS PIN + Session HMAC。
+- 实际 QUIC 成功连接到替代 IP/端口后，SDK 使用认证成功的实际远端地址更新所选择的路径，而不是继续向错误的首选 IP 发 Data/Punch。
+- 新增测试：首选 UDP 端口拒绝 QUIC、备用已交换候选可以通过真实 Quinn/mTLS/会话认证；以及候选排序、IPv4/IPv6 家族隔离。
+- **PR #63 当前仍待 CI 与合并**；现场 CGNAT、多层 NAT、家庭 IPv6 防火墙、真实路由器映射变化及多天长时运行仍必须在实际网络设备上比较。
