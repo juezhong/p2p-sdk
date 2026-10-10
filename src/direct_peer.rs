@@ -732,6 +732,15 @@ mod tests {
             let joiner = joiner.unwrap();
             assert!(creator.diagnostic().control_connected);
             assert!(joiner.diagnostic().control_connected);
+            // API 不接受零预算，且不能在未认证前返回附属 QUIC。
+            assert!(matches!(
+                creator.open_authenticated_data(Duration::ZERO).await,
+                Err(crate::transport_session::TransportError::Timeout)
+            ));
+            assert!(matches!(
+                joiner.accept_authenticated_data(Duration::ZERO).await,
+                Err(crate::transport_session::TransportError::Timeout)
+            ));
             let (mut tx, _) = creator.control.open_bi().await.unwrap();
             tx.write_all(b"generic control").await.unwrap();
             tx.finish().unwrap();

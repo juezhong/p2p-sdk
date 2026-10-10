@@ -5,6 +5,7 @@
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use quinn::{Connection, Endpoint};
+use tokio::time::{timeout_at, Instant};
 use crate::{
     channel::ChannelRole,
     ice_signaling::{IceRole, IceCandidateType},
@@ -71,7 +72,9 @@ impl AuthenticatedDataLink {
 /// Applications may open any number of auxiliary connections using these
 /// methods, without importing the Transfer-specific four-lane policy.
 pub struct ConnectedTransportPeer {
-    pub endpoint: Endpoint,
+    // 不能向应用公开原始 Endpoint，否则可绕过每条连接的会话认证。
+    pub(crate) endpoint: Endpoint,
+    /// 已通过 mTLS 和会话绑定认证的 Control 连接。
     pub control: Connection,
     pub(crate) path: ManagedPath,
     pub(crate) punch: Option<PunchLoop>,
@@ -123,12 +126,20 @@ impl ConnectedTransportPeer {
             return Err(TransportError::ControlDisconnected);
         }
         if deadline.is_zero() { return Err(TransportError::Timeout); }
+        // 独立 UDP 尝试与共享路径回退必须使用同一个绝对截止时间。
+        let expires = Instant::now() + deadline;
         let remote = self.path.selected.path.remote;
-        if let Some((owner, endpoint)) = self.try_dedicated_endpoint().await {
+        let dedicated = tokio::select! {
+            _ = self.control.closed() => return Err(TransportError::ControlDisconnected),
+            result = timeout_at(expires, self.try_dedicated_endpoint()) =>
+                result.map_err(|_| TransportError::Timeout)?,
+        };
+        if let Some((owner, endpoint)) = dedicated {
             let attempt = self.authenticated_dial(&endpoint, remote);
+            let attempt_expires = expires.min(Instant::now() + Duration::from_secs(6));
             let result = tokio::select! {
                 _ = self.control.closed() => return Err(TransportError::ControlDisconnected),
-                result = tokio::time::timeout(deadline.min(Duration::from_secs(6)), attempt) => result,
+                result = timeout_at(attempt_expires, attempt) => result,
             };
             if let Ok(Ok(connection)) = result {
                 return Ok(self.supervise_data(connection, Some(endpoint), Some(owner)));
@@ -136,7 +147,7 @@ impl ConnectedTransportPeer {
         }
         let result = tokio::select! {
             _ = self.control.closed() => return Err(TransportError::ControlDisconnected),
-            result = tokio::time::timeout(deadline, self.authenticated_dial(&self.endpoint, remote)) => result,
+            result = timeout_at(expires, self.authenticated_dial(&self.endpoint, remote)) => result,
         };
         let connection = result.map_err(|_| TransportError::Timeout)??;
         Ok(self.supervise_data(connection, None, None))
@@ -151,15 +162,17 @@ impl ConnectedTransportPeer {
         if self.control.close_reason().is_some() {
             return Err(TransportError::ControlDisconnected);
         }
+        if deadline.is_zero() { return Err(TransportError::Timeout); }
+        let expires = Instant::now() + deadline;
         let connecting = tokio::select! {
             _ = self.control.closed() => return Err(TransportError::ControlDisconnected),
-            result = tokio::time::timeout(deadline, self.endpoint.accept()) =>
+            result = timeout_at(expires, self.endpoint.accept()) =>
                 result.map_err(|_| TransportError::Timeout)?
                     .ok_or(TransportError::QuicConnection)?,
         };
         let connection = tokio::select! {
             _ = self.control.closed() => return Err(TransportError::ControlDisconnected),
-            result = tokio::time::timeout(deadline, connecting) =>
+            result = timeout_at(expires, connecting) =>
                 result.map_err(|_| TransportError::Timeout)?
                     .map_err(|_| TransportError::QuicConnection)?,
         };
@@ -167,11 +180,20 @@ impl ConnectedTransportPeer {
             connection.close(1u32.into(), b"unverified remote certificate");
             return Err(error);
         }
-        if authenticate_responder(connection.clone(), &self.credentials,
-            ChannelRole::Data, &self.replay_guard, deadline).await.is_err()
-        {
-            connection.close(1u32.into(), b"invalid data session proof");
-            return Err(TransportError::Authentication);
+        let proof = tokio::select! {
+            _ = self.control.closed() => return Err(TransportError::ControlDisconnected),
+            result = timeout_at(expires, authenticate_responder(
+                connection.clone(), &self.credentials, ChannelRole::Data,
+                &self.replay_guard, deadline,
+            )) => result,
+        };
+        if !matches!(&proof, Ok(Ok(_))) {
+            connection.close(1u32.into(), b"invalid or timed-out data session proof");
+            return Err(if proof.is_err() {
+                TransportError::Timeout
+            } else {
+                TransportError::Authentication
+            });
         }
         Ok(self.supervise_data(connection, None, None))
     }
