@@ -494,6 +494,13 @@ fn quic_candidate_destinations(
     destinations
 }
 
+/// 同一 UDP Owner 上的动态 ICE 复验状态；只有提名成功的地址进入白名单。
+struct DynamicIcePath<'a> {
+    owner: &'a mut crate::udp_owner::UdpOwner,
+    local: &'a IceDescription,
+    verified: Arc<std::sync::Mutex<HashSet<SocketAddr>>>,
+}
+
 async fn race_authenticated_control(
     endpoint: &quinn::Endpoint,
     remote: SocketAddr,
@@ -501,26 +508,20 @@ async fn race_authenticated_control(
     pairing: &ManualPairing,
     role: IceRole,
     replay_guard: Arc<ReplayGuard>,
-    dynamic_path: Option<(
-        &mut crate::udp_owner::UdpOwner,
-        &IceDescription,
-        Arc<std::sync::Mutex<HashSet<SocketAddr>>>,
-    )>,
+    dynamic_path: Option<DynamicIcePath<'_>>,
 ) -> Result<(quinn::Connection, bool), DirectPeerError> {
     let (verified_tx, mut verified_rx) =
         tokio::sync::mpsc::channel::<SocketAddr>(MAX_CANDIDATES);
-    let late_whitelist = dynamic_path.as_ref().map(|(_, _, whitelist)|
-        Arc::clone(whitelist)
-    );
+    let late_whitelist = dynamic_path.as_ref().map(|path| Arc::clone(&path.verified));
     let mut checking_active = dynamic_path.is_some();
     let dynamic_ice = async {
         match dynamic_path {
-            Some((owner, local, _)) => {
+            Some(path) => {
                 let proof = AuthenticatedPunch::new(
                     pairing.credentials.clone(), role,
                 );
                 let _ = crate::ice_multi::verify_dynamic_peer_reflexive(
-                    owner, local, advertised, &proof, verified_tx, QUIC_ACCEPT,
+                    path.owner, path.local, advertised, &proof, verified_tx, QUIC_ACCEPT,
                 ).await;
             }
             None => std::future::pending::<()>().await,
@@ -778,10 +779,11 @@ async fn authenticate_on_path(
     } else {
         match race_authenticated_control(
             &endpoint, remote, &advertised, &pairing, role, replay_guard,
-            Some((
-                &mut path.selected.owner, &local_ice,
-                Arc::clone(&dynamic_verified),
-            )),
+            Some(DynamicIcePath {
+                owner: &mut path.selected.owner,
+                local: &local_ice,
+                verified: Arc::clone(&dynamic_verified),
+            }),
         ).await {
             Ok(result) => result,
             Err(error) => {
