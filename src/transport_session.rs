@@ -35,7 +35,7 @@ pub struct TransportDiagnostic {
     pub actual_local_udp: SocketAddr,
     pub actual_remote_udp: SocketAddr,
     pub bootstrap_connected: bool,
-    /// QUIC Control 是否由本端拨号建立（与配对创建/加入角色无关）。
+    /// 初始认证 QUIC 是否由本端拨号建立（与配对创建/加入角色无关）。
     pub bootstrap_outbound: bool,
     pub gateway_mapping: Option<SocketAddr>,
     pub gateway_method: Option<GatewayMethod>,
@@ -128,7 +128,7 @@ impl Drop for ManagedAuthenticatedLink {
 pub struct ConnectedTransportPeer {
     // 不能向应用公开原始 Endpoint，否则可绕过每条连接的会话认证。
     pub(crate) endpoint: Endpoint,
-    /// 已通过 mTLS 和会话绑定认证的 Control 连接。
+    /// 已通过 mTLS 和会话绑定认证的初始物理 QUIC。
     pub bootstrap: Connection,
     pub(crate) bootstrap_outbound: bool,
     pub(crate) path: ManagedPath,
@@ -267,7 +267,7 @@ impl ConnectedTransportPeer {
     }
 
     /// Creator requests a fresh authenticated QUIC transport. Prefer a fresh
-    /// local UDP port, then fall back to the nominated Control UDP path.
+    /// local UDP port, then fall back to the nominated initial UDP path.
     /// Every attempt authenticates TLS certificate and session HMAC anew.
     pub async fn open_link(
         &self, deadline: Duration,
