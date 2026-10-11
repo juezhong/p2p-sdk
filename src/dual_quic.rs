@@ -71,7 +71,7 @@ mod tests {
     /// Local TLS test trust anchors are explicitly pinned. No disabled
     /// certificate verification, and no production P2P identity claims.
     #[tokio::test]
-    async fn data_quic_close_does_not_close_control_quic_on_one_udp_endpoint() {
+    async fn second_link_close_does_not_close_first_link() {
         tokio::time::timeout(Duration::from_secs(15), async {
             let certified = rcgen::generate_simple_self_signed(vec!["localhost".into()])
                 .expect("generate test certificate");
@@ -102,7 +102,7 @@ mod tests {
                 let first = server.accept().await.expect("first incoming")
                     .await.expect("first handshake");
                 // Accept the second connection while independently serving first.
-                let control_task = tokio::spawn(async move {
+                let first_task = tokio::spawn(async move {
                     for expected in [b"first".as_slice(), b"second".as_slice()] {
                         let (mut send, mut recv) = first.accept_bi().await.expect("first RPC stream");
                         let second = recv.read_to_end(128).await.expect("read RPC");
@@ -115,7 +115,7 @@ mod tests {
                 let second = server.accept().await.expect("second incoming")
                     .await.expect("second handshake");
                 second.closed().await;
-                let first = control_task.await.expect("first task join");
+                let first = first_task.await.expect("first task join");
                 assert!(first.close_reason().is_none(), "first QUIC must remain connected");
                 // Do not tear down the server Endpoint before the client has
                 // asserted that the first QUIC survived the second QUIC close.
