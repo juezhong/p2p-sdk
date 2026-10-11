@@ -72,12 +72,11 @@ impl LiveSdkSession {
         let proof = AuthenticatedPunch::new(
             pairing.credentials.clone(), local_role,
         );
-        let punch = PunchLoop::start_for_control(
+        let punch = PunchLoop::start(
             &mut path.selected.owner,
             proof,
             remote_description.clone(),
             punch_period,
-            session.first().clone(),
         ).map_err(LiveSessionError::Punch)?;
         Ok(Self {
             session, path, punch: Some(punch),
