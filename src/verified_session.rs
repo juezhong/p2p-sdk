@@ -40,8 +40,8 @@ pub struct VerifiedManualSession {
 /// Receiving an event does NOT imply that ICE or the QUIC lane was repaired.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SessionLinkEvent {
-    DataDisconnected,
-    ControlDisconnected,
+    SecondDisconnected,
+    FirstDisconnected,
 }
 
 impl VerifiedManualSession {
@@ -67,9 +67,9 @@ impl VerifiedManualSession {
 
     /// Observe link termination independently of First RPC traffic.
     /// The monitor does not extend lifetimes or suppress actual disconnects.
-    /// The caller may continue First operations after DataDisconnected,
+    /// The application can continue using the first link after SecondDisconnected,
     /// but must reauthenticate a replacement Second QUIC connection before
-    /// resuming second. ControlDisconnected requires a new verified session.
+    /// resuming the second link. FirstDisconnected requires a new verified session.
     ///
     /// Dropping the receiver stops the watcher without closing either QUIC
     /// connection. All events are emitted once for this watcher.
@@ -82,11 +82,11 @@ impl VerifiedManualSession {
                 biased;
                 _ = sender.closed() => return,
                 _ = first.closed() => {
-                    let _ = sender.send(SessionLinkEvent::ControlDisconnected);
+                    let _ = sender.send(SessionLinkEvent::FirstDisconnected);
                     return;
                 },
                 _ = second.closed() => {
-                    if sender.send(SessionLinkEvent::DataDisconnected).is_err() {
+                    if sender.send(SessionLinkEvent::SecondDisconnected).is_err() {
                         return;
                     }
                 },
@@ -94,7 +94,7 @@ impl VerifiedManualSession {
             tokio::select! {
                 _ = sender.closed() => {},
                 _ = first.closed() => {
-                    let _ = sender.send(SessionLinkEvent::ControlDisconnected);
+                    let _ = sender.send(SessionLinkEvent::FirstDisconnected);
                 },
             }
         });
