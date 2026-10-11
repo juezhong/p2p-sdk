@@ -1845,7 +1845,7 @@ mod tests {
                     return snapshot.connection.unwrap();
                 }
                 assert_ne!(snapshot.phase, ManagedLinkPhase::AuthenticationFailed);
-                assert_ne!(snapshot.phase, ManagedLinkPhase::ControlLost);
+                assert_ne!(snapshot.phase, ManagedLinkPhase::BootstrapLost);
                 events.changed().await.unwrap();
             }
         }
@@ -1890,7 +1890,7 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(5), async {
                 let mut updates = outgoing.subscribe();
                 loop {
-                    if updates.borrow().phase == ManagedLinkPhase::ControlLost {
+                    if updates.borrow().phase == ManagedLinkPhase::BootstrapLost {
                         break;
                     }
                     updates.changed().await.unwrap();
