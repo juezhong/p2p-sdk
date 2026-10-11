@@ -1,0 +1,35 @@
+name: Tag accepted Transfer v0.1.3 SDK baseline
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/tag-transfer-v0.1.3-sdk-baseline.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Create immutable baseline tag at the SDK commit used by Transfer v0.1.3
+        shell: bash
+        run: |
+          set -euo pipefail
+          TARGET="7b7873c46c9f66f8eedef28b7cd7e53c97ba32e4"
+          TAG="transfer-v0.1.3-sdk-baseline"
+          git cat-file -e "$TARGET^{commit}"
+          if git show-ref --verify --quiet "refs/tags/$TAG"; then
+            ACTUAL="$(git rev-parse "$TAG^{commit}")"
+            test "$ACTUAL" = "$TARGET" || { echo "Tag name already points elsewhere" >&2; exit 1; }
+            echo "$TAG already correctly points to $TARGET"
+            exit 0
+          fi
+          git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            tag -a "$TAG" "$TARGET" -m "Accepted SDK baseline pinned by p2p-transfer v0.1.3; preserve original source"
+          git push origin "refs/tags/$TAG"
