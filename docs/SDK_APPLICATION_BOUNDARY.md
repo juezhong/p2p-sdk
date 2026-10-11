@@ -1,63 +1,66 @@
-# SDK / application boundary for authenticated direct networking
+# SDK / application boundary: generic authenticated P2P links
 
-The Rust SDK is a **reusable peer-to-peer transport**, not a file-transfer
-implementation. Compatibility with Go `p2p-friend v0.16.4` is judged by
-observable network and session behavior, not by duplicating Go's application
-file-pipeline internals.
+The SDK is a reusable network library. It does not understand file transfer,
+SSH, tunnel, pipe, or application-defined Control/Data lanes.
 
-## SDK responsibilities
+## SDK owns
 
-- Enumerate local IPv4/IPv6 interfaces and public candidate observations, including
-  STUN, verified router mappings and authenticated peer-reflexive sources.
-- Exchange session-bound manual signaling, explicitly verify SAS, perform secure
-  connectivity checks and nominate an actual UDP socket/path.
-- Establish mutually authenticated QUIC sessions and new independently
-  authenticated connections, validate remote certificate pins and replay guards.
-- Detect unreachable or dead connections, maintain healthy NAT mappings,
-  retry permitted connections and report actual shutdown/failure status.
-- Expose sanitized networking diagnostics, candidate/mapping state and connection
-  state changes. Never pretend an interrupted connection is healthy.
+- ICE candidate gathering/nomination and the actual UDP Owner, QUIC Endpoint,
+  authenticated dial/accept, certificate PIN, session HMAC and replay protection.
+- Connection state and error reporting for each authenticated QUIC Link.
+- Explicit lifecycle: new link construction on application request, bounded
+  retry and reauthentication for managed links, and orderly release.
+- The first successfully authenticated connection is a **bootstrap link**:
+  it binds the manually verified peer session and serves as a rendezvous basis
+  for optional later connections. **Bootstrap is not an application Control
+  channel.** Subsequent links have the generic `Additional` proof class,
+  independent of any application payload or stream semantics.
+- The independent bootstrap/additional proof tags preserve the existing 1/2
+  domain separation on the wire. Never remove or ignore link authentication to
+  achieve API neutrality.
 
-## Responsibilities of an SDK consumer
+## Application owns
 
-- Start a generic network session with `ReadyCreator::connect_transport()`
-  or `ReadyJoiner::connect_transport()`: exactly one authenticated Control
-  QUIC is established. No Data QUIC is created by default.
-- The application may call `ConnectedTransportPeer::open_authenticated_data()`
-  on the creator and `accept_authenticated_data()` on the joiner for each
-  additional independently authenticated transport. No fixed four-lane
-  scheduling, file framing or retransmission belongs to the SDK.
-- If stable auxiliary QUIC connectivity is needed, wrap the transport peer in
-  `Arc` and call `peer.manage_authenticated_data()` **once for each
-  application-requested connection**. Its `ManagedAuthenticatedLink` publishes
-  `Connecting / Connected / Reconnecting / ControlLost / Stopped` and a
-  generation counter. The SDK automatically retries failed links with bounded
-  backoff, per-link TLS PIN / session HMAC verification and source-port
-  preference / fallback. An unverified or closed connection is never advertised
-  as healthy. Call `manager.shutdown().await` before consuming the peer with
-  `Arc::try_unwrap(peer).ok().unwrap().shutdown().await`.
-- The managed link API does not create files, streams or data-lane indexes. It
-  reconnects over the already nominated UDP path; after **Control loss** it
-  stops instead of inventing ICE Restart or pretending a QUIC session survived
-  network failure. Physical NAT/IPv6 firewall success still requires field tests.
-- The fixed `connect_with_data_connections(..., n)` facade and old `ResilientDataLanes` pool are removed on SDK PR #59; Transfer PR #29 owns all four-lane application scheduling. Neither removal is considered released before both PRs are validated and merged.
-- Define application channel and stream semantics. In particular, Transfer owns
-  the exact `4-lane` business strategy, file chunk assignment, ACK, ordering,
-  cancellation and resumable transmission. The SDK must not transmit any file
-  metadata or bytes without an application supplying them.
-- If application-level recovery after a Control QUIC loss is desired, establish
-  a new verified session using a safe renewal mechanism. Go v0.16.4 itself
-  terminates its logical session on Control loss; seamless ICE Restart is a
-  distinct enhancement, not a prerequisite to claiming Go-equivalent behavior.
+- Whether to start a peer session and when to request or stop each link.
+- How many managed links to request: zero, one, four, or other bounded values
+  that the application decides; SDK has no four-link Transfer policy.
+- Interpreting the bootstrap and additional links as any application purpose.
+  Transfer maps bootstrap to its Control and requests four additional Data
+  connections as an **application policy**.
+- Application stream scheduling, retry of interrupted streams, file hash,
+  cancellation, acknowledgements, and task/session semantics.
 
-## Critical parity gates
+## Current API in the generic-link transition
 
-An SDK release must not be called Go-parity-complete while any of the following
-is missing: delayed joiner readiness; live IPv4/IPv6 path nomination; dynamic
-NAT candidate handling; independent UDP-port preference with shared-path
-fallback; mutual reauthentication of every repaired connection; router mapping
-renewal/cleanup; unambiguous Control-lost status; reproducible native
-Linux/macOS/Windows/ARM-musl and real-network fault tests.
+1. The application calls `begin_creator/begin_joiner` and then
+   `ReadyCreator/ReadyJoiner::connect_transport()`; the SDK performs actual
+   ICE and QUIC connection establishment and yields
+   `ConnectedTransportPeer { bootstrap, ... }`.
+2. The application explicitly requests a managed additional QUIC using
+   `Arc<ConnectedTransportPeer>::manage_link()`. Each invocation creates one
+   manager and no implicit extra connections.
+3. `ManagedAuthenticatedLink::subscribe()`, `current()`, and `shutdown()`
+   observe, use, and release that independently reauthenticated link. SDK
+   chooses actual network dial/listen direction; it is not necessarily the
+   invitation creator.
+4. The application may use explicit `open_link()/accept_link()` for manual
+   low-level lifecycle when appropriate, but must not bypass certificate PIN,
+   session HMAC, or replay validation.
 
-A green localhost CI run checks only software invariants. It cannot validate
-router, CGNAT, mobile network or long-running firewall behavior.
+## Limits and compatibility
+
+- Breaking the initial QUIC does **not** itself mark every additional link
+  closed. A managed link can continue on its own physical QUIC until explicitly
+  stopped or its own transport fails. The SDK retains a peer-session context
+  and uses bootstrap's last known authenticated remote address for subsequent
+  attempts; ongoing NAT reachability after bootstrap disconnect is **not**
+  proven and needs dedicated real-network validation.
+- Generic link physical repair is not automatic recovery of interrupted
+  application QUIC streams, file blocks, or logical sessions. The consuming
+  application decides recovery and resumption.
+- API migration is cross-repository and intentionally staged: **SDK PR #73
+  first**, then a new Transfer PR pinned to that exact SDK commit. During
+  migration the last released Transfer stays pinned to the preceding SDK.
+- If a new public API or wire format becomes incompatible, publish coordinated
+  upgrades and explicitly state cross-version support.
+- Do not claim NAT/CGNAT/IPv6 real-world parity from localhost CI results.
