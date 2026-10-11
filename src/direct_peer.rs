@@ -1828,7 +1828,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn generic_managed_data_recovers_without_transfer_lane_scheduler() {
+    async fn generic_link_reconnects_independently_of_initial_quic() {
         use crate::transport_session::{
             ManagedAuthenticatedLink, ManagedLinkPhase,
         };
@@ -1845,7 +1845,6 @@ mod tests {
                     return snapshot.connection.unwrap();
                 }
                 assert_ne!(snapshot.phase, ManagedLinkPhase::AuthenticationFailed);
-                assert_ne!(snapshot.phase, ManagedLinkPhase::BootstrapLost);
                 events.changed().await.unwrap();
             }
         }
@@ -1867,7 +1866,7 @@ mod tests {
             let creator = Arc::new(creator.unwrap());
             let joiner = Arc::new(joiner.unwrap());
 
-            // 两边都由应用选择创建一条托管 Data QUIC，不预建四条。
+            // 由业务两端显式请求通用 Link，不由 SDK 固定连接数量。
             let outgoing = creator.manage_link();
             let incoming = joiner.manage_link();
             let (first, received) = tokio::join!(
@@ -1876,7 +1875,7 @@ mod tests {
             let old_id = first.stable_id();
             assert_eq!(outgoing.current().unwrap().stable_id(), old_id);
 
-            first.close(1u32.into(), b"inject data quic fault");
+            first.close(1u32.into(), b"inject generic quic fault");
             let (replaced, _accepted) = tokio::join!(
                 await_link(&outgoing, 2), await_link(&incoming, 2),
             );
@@ -1885,18 +1884,12 @@ mod tests {
             assert!(joiner.diagnostic().bootstrap_connected);
             assert!(received.close_reason().is_some());
 
-            // 真正的 Control 断线会终止重拨，不能伪报会话仍健康。
-            creator.bootstrap.close(0u32.into(), b"test control close");
-            tokio::time::timeout(Duration::from_secs(5), async {
-                let mut updates = outgoing.subscribe();
-                loop {
-                    if updates.borrow().phase == ManagedLinkPhase::BootstrapLost {
-                        break;
-                    }
-                    updates.changed().await.unwrap();
-                }
-            }).await.unwrap();
-            assert!(outgoing.current().is_none());
+            // 初始认证 QUIC 关闭不得隐式终止业务申请的独立 Link。
+            creator.bootstrap.close(0u32.into(), b"test bootstrap close");
+            assert!(!creator.diagnostic().bootstrap_connected);
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert!(outgoing.current().is_some());
+            assert!(incoming.current().is_some());
             outgoing.shutdown().await;
             incoming.shutdown().await;
             Arc::try_unwrap(creator).ok().unwrap().shutdown().await;
@@ -1905,7 +1898,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn generic_sdk_control_only_and_on_demand_authenticated_quic() {
+    async fn generic_sdk_on_demand_authenticated_quic_is_independent() {
         tokio::time::timeout(Duration::from_secs(45), async {
             let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
             let now = 1_800_000_000;
@@ -1924,7 +1917,7 @@ mod tests {
             let joiner = joiner.unwrap();
             assert!(creator.diagnostic().bootstrap_connected);
             assert!(joiner.diagnostic().bootstrap_connected);
-            // 额外连接由实际 Control 拨号方发起，不由邀请码创建/加入角色决定。
+            // 额外连接由初始 QUIC 的实际拨号方建立，业务不必知道 ICE 角色。
             assert_ne!(creator.bootstrap_outbound, joiner.bootstrap_outbound);
             let (dialer, listener) = if creator.bootstrap_outbound {
                 (&creator, &joiner)
@@ -1953,7 +1946,7 @@ mod tests {
             let (_, mut rx) = joiner.bootstrap.accept_bi().await.unwrap();
             assert_eq!(rx.read_to_end(64).await.unwrap(), b"generic control");
 
-            // No Data QUIC was created until this explicit application call.
+            // SDK 只有业务明确请求时，才建立下一条经认证的 QUIC。
             let (outgoing, incoming) = tokio::join!(
                 dialer.open_link(Duration::from_secs(12)),
                 listener.accept_link(Duration::from_secs(12)),
@@ -1965,10 +1958,10 @@ mod tests {
             out.finish().unwrap();
             let mut input = incoming.connection.accept_uni().await.unwrap();
             assert_eq!(input.read_to_end(64).await.unwrap(), b"generic data");
-            creator.bootstrap.close(0u32.into(), b"test control disconnected");
-            tokio::time::timeout(Duration::from_secs(5), outgoing.connection.closed())
-                .await.unwrap();
+            creator.bootstrap.close(0u32.into(), b"test bootstrap disconnected");
             assert!(!creator.diagnostic().bootstrap_connected);
+            assert!(outgoing.connection.close_reason().is_none());
+            assert!(incoming.connection.close_reason().is_none());
             outgoing.shutdown();
             incoming.shutdown();
             creator.shutdown().await;
