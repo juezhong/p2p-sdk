@@ -2,7 +2,7 @@
 //!
 //! 通用应用入口为 direct_peer 的 INVITE/REPLY 配对与
 //! ReadyCreator/ReadyJoiner::connect_transport()。
-//! Transport session 默认只建立认证 Control QUIC；额外 QUIC 由应用按需请求。
+//! SDK 会话首先建立一条认证 QUIC；额外 QUIC 由应用按需请求，SDK 不知道 Control/Data 等业务用途。
 //! 文件数据分配、分片、ACK、重传和四路 Stripe 策略不属于 SDK。
 //! 自动化 CI 与环回连接成功不代表真实复杂 NAT 环境已完成对等验收。
 
@@ -60,7 +60,7 @@ pub mod network_diagnostics;
 #[doc(hidden)]
 pub mod live_session;
 pub mod direct_peer;
-/// Generic Control-only network session with opt-in authenticated QUIC links.
+/// Authenticated peer session with caller-requested generic QUIC links.
 pub mod transport_session;
 
 /// 面向业务程序的精简推荐 API；旧模块路径继续兼容现有 Transfer。
@@ -69,7 +69,7 @@ pub use direct_peer::{
     DirectPeerError, PendingCreator, ReadyCreator, ReadyJoiner,
 };
 pub use transport_session::{
-    AuthenticatedDataLink, ConnectedTransportPeer, ManagedAuthenticatedLink,
+    AuthenticatedQuicLink, ConnectedTransportPeer, ManagedAuthenticatedLink,
     ManagedLinkPhase, ManagedLinkStatus, TransportDiagnostic, TransportError,
 };
 pub mod upnp_lease;

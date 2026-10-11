@@ -64,20 +64,19 @@ impl LiveSdkSession {
             return Err(LiveSessionError::InvalidRole);
         }
         if path.selected.owner.handle.local_address() != path.selected.path.local
-            || path.selected.path.remote != session.control().remote_address()
-            || session.control().close_reason().is_some()
+            || path.selected.path.remote != session.first().remote_address()
+            || session.first().close_reason().is_some()
         {
             return Err(LiveSessionError::InvalidPath);
         }
         let proof = AuthenticatedPunch::new(
             pairing.credentials.clone(), local_role,
         );
-        let punch = PunchLoop::start_for_control(
+        let punch = PunchLoop::start(
             &mut path.selected.owner,
             proof,
             remote_description.clone(),
             punch_period,
-            session.control().clone(),
         ).map_err(LiveSessionError::Punch)?;
         Ok(Self {
             session, path, punch: Some(punch),
@@ -110,8 +109,8 @@ impl LiveSdkSession {
     /// Explicit shutdown closes authenticated QUIC links, stops the Punch
     /// scheduler, then waits for the active gateway map to be removed.
     pub async fn shutdown(mut self) {
-        self.session.control().close(0u32.into(), b"session ended");
-        self.session.data().close(0u32.into(), b"session ended");
+        self.session.first().close(0u32.into(), b"session ended");
+        self.session.second().close(0u32.into(), b"session ended");
         if let Some(punch) = self.punch.take() {
             punch.shutdown().await;
         }

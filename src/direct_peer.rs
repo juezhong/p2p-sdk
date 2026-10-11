@@ -21,7 +21,7 @@ use crate::{
     peer_pin::{ManualConfirmation, PeerCertificatePin},
     quinn_socket::{demux_endpoint_config, QuinnUdpAdapter},
     session_binding::{ReplayGuard, authenticate_initiator, authenticate_responder},
-    channel::ChannelRole,
+    channel::LinkProofClass,
     transport_session::ConnectedTransportPeer,
     punch_loop::PunchLoop,
     tls_identity::{authenticated_client_config, authenticated_server_config},
@@ -350,7 +350,7 @@ async fn wait_for_authenticated_creator(
                             let verified = PeerCertificatePin::new(pin)
                                 .ok().is_some_and(|p| p.verify_connection(&connection).is_ok());
                             if verified && authenticate_responder(
-                                connection.clone(), &credentials, ChannelRole::Control,
+                                connection.clone(), &credentials, LinkProofClass::Bootstrap,
                                 &guard, AUTH_DEADLINE,
                             ).await.is_ok() {
                                 Some(connection)
@@ -561,7 +561,7 @@ async fn race_authenticated_control(
                     let verified = PeerCertificatePin::new(pin).ok()
                         .is_some_and(|p| p.verify_connection(&conn).is_ok());
                     if verified && authenticate_initiator(
-                        conn.clone(), &credentials, ChannelRole::Control, AUTH_DEADLINE,
+                        conn.clone(), &credentials, LinkProofClass::Bootstrap, AUTH_DEADLINE,
                     ).await.is_ok() {
                         Some((conn, true))
                     } else {
@@ -622,7 +622,7 @@ async fn race_authenticated_control(
                             let verified = PeerCertificatePin::new(pin).ok()
                                 .is_some_and(|p| p.verify_connection(&connection).is_ok());
                             if verified && authenticate_responder(
-                                connection.clone(), &credentials, ChannelRole::Control,
+                                connection.clone(), &credentials, LinkProofClass::Bootstrap,
                                 &guard, AUTH_DEADLINE,
                             ).await.is_ok() {
                                 Some((connection, false))
@@ -720,7 +720,7 @@ async fn race_authenticated_control(
                         .ok().is_some_and(|p| p.verify_connection(&connection).is_ok());
                     if verified && authenticate_initiator(
                         connection.clone(), &credentials,
-                        ChannelRole::Control, AUTH_DEADLINE,
+                        LinkProofClass::Bootstrap, AUTH_DEADLINE,
                     ).await.is_ok() {
                         Ok((connection, true))
                     } else {
@@ -800,7 +800,7 @@ async fn race_authenticated_control(
                             .ok().is_some_and(|p| p.verify_connection(&connection).is_ok());
                         if verified && authenticate_responder(
                             connection.clone(), &credentials,
-                            ChannelRole::Control, &replay_guard, AUTH_DEADLINE,
+                            LinkProofClass::Bootstrap, &replay_guard, AUTH_DEADLINE,
                         ).await.is_ok() {
                             Some(connection)
                         } else {
@@ -1256,15 +1256,17 @@ async fn connect_authenticated_transport(
             return Err(error);
         }
     }
-    let (mut path, endpoint, control, control_outbound) = winner;
+    let (mut path, endpoint, control, bootstrap_outbound) = winner;
     let nominated = path.nominated();
     let remote_candidate_kind = remote.candidates.iter()
         .find(|candidate| candidate.address == nominated.remote)
         .map(|candidate| candidate.kind);
-    let punch = match PunchLoop::start_for_control(
+    // 打洞状态属于经认证的 peer session，不依附某条物理 QUIC 的关闭事件。
+    // 上层仍持有会话或托管 Link 时，UDP keepalive 可以维持独立 Link 的恢复。
+    let punch = match PunchLoop::start(
         &mut path.selected.owner,
         AuthenticatedPunch::new(pairing.credentials.clone(), role),
-        remote, PUNCH_CADENCE, control.clone(),
+        remote, PUNCH_CADENCE,
     ) {
         Ok(punch) => punch,
         Err(_) => {
@@ -1275,11 +1277,11 @@ async fn connect_authenticated_transport(
         }
     };
     Ok(ConnectedTransportPeer {
-        endpoint, control, path, punch: Some(punch),
+        endpoint, bootstrap: control, path, punch: Some(punch),
         credentials: pairing.credentials,
         remote_pin: pairing.remote_tls_cert_sha256,
         role, client_tls: Some(client_tls), replay_guard,
-        control_outbound, remote_candidate_kind, offered_host_candidates,
+        bootstrap_outbound, remote_candidate_kind, offered_host_candidates,
     })
 }
 
@@ -1417,7 +1419,7 @@ mod tests {
                     PeerCertificatePin::new(recv_pin).unwrap()
                         .verify_connection(&connection).unwrap();
                     authenticate_responder(
-                        connection.clone(), &recv_proof, ChannelRole::Control,
+                        connection.clone(), &recv_proof, LinkProofClass::Bootstrap,
                         &ReplayGuard::new(4096).unwrap(), AUTH_DEADLINE,
                     ).await.unwrap();
                     connection
@@ -1482,7 +1484,7 @@ mod tests {
                         let valid = left.endpoint.connect(destination, "localhost")
                             .unwrap().await.unwrap();
                         authenticate_initiator(
-                            valid.clone(), &left.credentials, ChannelRole::Control,
+                            valid.clone(), &left.credentials, LinkProofClass::Bootstrap,
                             AUTH_DEADLINE,
                         ).await.unwrap();
                         // 新 Control 协议只允许创建方明确选定的认证连接获胜。
@@ -1538,8 +1540,8 @@ mod tests {
             let right = right.unwrap();
             assert!(left.diagnostic().actual_remote_udp.ip().is_loopback());
             assert!(right.diagnostic().actual_remote_udp.ip().is_loopback());
-            assert!(left.diagnostic().control_connected);
-            assert!(right.diagnostic().control_connected);
+            assert!(left.diagnostic().bootstrap_connected);
+            assert!(right.diagnostic().bootstrap_connected);
             left.shutdown().await;
             right.shutdown().await;
         }).await.unwrap();
@@ -1569,8 +1571,8 @@ mod tests {
             let left = left.unwrap();
             let right = right.unwrap();
             assert_eq!(left.diagnostic().actual_remote_udp, real_joiner);
-            assert!(left.diagnostic().control_connected);
-            assert!(right.diagnostic().control_connected);
+            assert!(left.diagnostic().bootstrap_connected);
+            assert!(right.diagnostic().bootstrap_connected);
             left.shutdown().await;
             right.shutdown().await;
         }).await.unwrap();
@@ -1764,7 +1766,7 @@ mod tests {
                     let connection = creator_endpoint.connect(destination, "localhost")
                         .unwrap().await.unwrap();
                     authenticate_initiator(
-                        connection.clone(), &creds, ChannelRole::Control,
+                        connection.clone(), &creds, LinkProofClass::Bootstrap,
                         AUTH_DEADLINE,
                     ).await.unwrap();
                     connection
@@ -1828,7 +1830,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn generic_managed_data_recovers_without_transfer_lane_scheduler() {
+    async fn generic_link_reconnects_independently_of_initial_quic() {
         use crate::transport_session::{
             ManagedAuthenticatedLink, ManagedLinkPhase,
         };
@@ -1845,7 +1847,6 @@ mod tests {
                     return snapshot.connection.unwrap();
                 }
                 assert_ne!(snapshot.phase, ManagedLinkPhase::AuthenticationFailed);
-                assert_ne!(snapshot.phase, ManagedLinkPhase::ControlLost);
                 events.changed().await.unwrap();
             }
         }
@@ -1867,36 +1868,30 @@ mod tests {
             let creator = Arc::new(creator.unwrap());
             let joiner = Arc::new(joiner.unwrap());
 
-            // 两边都由应用选择创建一条托管 Data QUIC，不预建四条。
-            let outgoing = creator.manage_authenticated_data();
-            let incoming = joiner.manage_authenticated_data();
+            // 由业务两端显式请求通用 Link，不由 SDK 固定连接数量。
+            let outgoing = creator.manage_link();
+            let incoming = joiner.manage_link();
             let (first, received) = tokio::join!(
                 await_link(&outgoing, 1), await_link(&incoming, 1),
             );
             let old_id = first.stable_id();
             assert_eq!(outgoing.current().unwrap().stable_id(), old_id);
 
-            first.close(1u32.into(), b"inject data quic fault");
+            first.close(1u32.into(), b"inject generic quic fault");
             let (replaced, _accepted) = tokio::join!(
                 await_link(&outgoing, 2), await_link(&incoming, 2),
             );
             assert_ne!(replaced.stable_id(), old_id);
-            assert!(creator.diagnostic().control_connected);
-            assert!(joiner.diagnostic().control_connected);
+            assert!(creator.diagnostic().bootstrap_connected);
+            assert!(joiner.diagnostic().bootstrap_connected);
             assert!(received.close_reason().is_some());
 
-            // 真正的 Control 断线会终止重拨，不能伪报会话仍健康。
-            creator.control.close(0u32.into(), b"test control close");
-            tokio::time::timeout(Duration::from_secs(5), async {
-                let mut updates = outgoing.subscribe();
-                loop {
-                    if updates.borrow().phase == ManagedLinkPhase::ControlLost {
-                        break;
-                    }
-                    updates.changed().await.unwrap();
-                }
-            }).await.unwrap();
-            assert!(outgoing.current().is_none());
+            // 初始认证 QUIC 关闭不得隐式终止业务申请的独立 Link。
+            creator.bootstrap.close(0u32.into(), b"test bootstrap close");
+            assert!(!creator.diagnostic().bootstrap_connected);
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert!(outgoing.current().is_some());
+            assert!(incoming.current().is_some());
             outgoing.shutdown().await;
             incoming.shutdown().await;
             Arc::try_unwrap(creator).ok().unwrap().shutdown().await;
@@ -1905,7 +1900,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn generic_sdk_control_only_and_on_demand_authenticated_quic() {
+    async fn generic_sdk_on_demand_authenticated_quic_is_independent() {
         tokio::time::timeout(Duration::from_secs(45), async {
             let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
             let now = 1_800_000_000;
@@ -1922,41 +1917,41 @@ mod tests {
             );
             let creator = creator.unwrap();
             let joiner = joiner.unwrap();
-            assert!(creator.diagnostic().control_connected);
-            assert!(joiner.diagnostic().control_connected);
-            // 额外连接由实际 Control 拨号方发起，不由邀请码创建/加入角色决定。
-            assert_ne!(creator.control_outbound, joiner.control_outbound);
-            let (dialer, listener) = if creator.control_outbound {
+            assert!(creator.diagnostic().bootstrap_connected);
+            assert!(joiner.diagnostic().bootstrap_connected);
+            // 额外连接由初始 QUIC 的实际拨号方建立，业务不必知道 ICE 角色。
+            assert_ne!(creator.bootstrap_outbound, joiner.bootstrap_outbound);
+            let (dialer, listener) = if creator.bootstrap_outbound {
                 (&creator, &joiner)
             } else {
                 (&joiner, &creator)
             };
             assert!(matches!(
-                listener.open_authenticated_data(Duration::from_secs(1)).await,
+                listener.open_link(Duration::from_secs(1)).await,
                 Err(crate::transport_session::TransportError::WrongRole)
             ));
             assert!(matches!(
-                dialer.accept_authenticated_data(Duration::from_secs(1)).await,
+                dialer.accept_link(Duration::from_secs(1)).await,
                 Err(crate::transport_session::TransportError::WrongRole)
             ));
             assert!(matches!(
-                dialer.open_authenticated_data(Duration::ZERO).await,
+                dialer.open_link(Duration::ZERO).await,
                 Err(crate::transport_session::TransportError::Timeout)
             ));
             assert!(matches!(
-                listener.accept_authenticated_data(Duration::ZERO).await,
+                listener.accept_link(Duration::ZERO).await,
                 Err(crate::transport_session::TransportError::Timeout)
             ));
-            let (mut tx, _) = creator.control.open_bi().await.unwrap();
+            let (mut tx, _) = creator.bootstrap.open_bi().await.unwrap();
             tx.write_all(b"generic control").await.unwrap();
             tx.finish().unwrap();
-            let (_, mut rx) = joiner.control.accept_bi().await.unwrap();
+            let (_, mut rx) = joiner.bootstrap.accept_bi().await.unwrap();
             assert_eq!(rx.read_to_end(64).await.unwrap(), b"generic control");
 
-            // No Data QUIC was created until this explicit application call.
+            // SDK 只有业务明确请求时，才建立下一条经认证的 QUIC。
             let (outgoing, incoming) = tokio::join!(
-                dialer.open_authenticated_data(Duration::from_secs(12)),
-                listener.accept_authenticated_data(Duration::from_secs(12)),
+                dialer.open_link(Duration::from_secs(12)),
+                listener.accept_link(Duration::from_secs(12)),
             );
             let outgoing = outgoing.unwrap();
             let incoming = incoming.unwrap();
@@ -1965,10 +1960,10 @@ mod tests {
             out.finish().unwrap();
             let mut input = incoming.connection.accept_uni().await.unwrap();
             assert_eq!(input.read_to_end(64).await.unwrap(), b"generic data");
-            creator.control.close(0u32.into(), b"test control disconnected");
-            tokio::time::timeout(Duration::from_secs(5), outgoing.connection.closed())
-                .await.unwrap();
-            assert!(!creator.diagnostic().control_connected);
+            creator.bootstrap.close(0u32.into(), b"test bootstrap disconnected");
+            assert!(!creator.diagnostic().bootstrap_connected);
+            assert!(outgoing.connection.close_reason().is_none());
+            assert!(incoming.connection.close_reason().is_none());
             outgoing.shutdown();
             incoming.shutdown();
             creator.shutdown().await;
