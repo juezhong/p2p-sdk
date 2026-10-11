@@ -1261,10 +1261,12 @@ async fn connect_authenticated_transport(
     let remote_candidate_kind = remote.candidates.iter()
         .find(|candidate| candidate.address == nominated.remote)
         .map(|candidate| candidate.kind);
-    let punch = match PunchLoop::start_for_control(
+    // 打洞状态属于经认证的 peer session，不依附某条物理 QUIC 的关闭事件。
+    // 上层仍持有会话或托管 Link 时，UDP keepalive 可以维持独立 Link 的恢复。
+    let punch = match PunchLoop::start(
         &mut path.selected.owner,
         AuthenticatedPunch::new(pairing.credentials.clone(), role),
-        remote, PUNCH_CADENCE, control.clone(),
+        remote, PUNCH_CADENCE,
     ) {
         Ok(punch) => punch,
         Err(_) => {
