@@ -23,7 +23,6 @@ use crate::{
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TransportError {
     WrongRole,
-    BootstrapDisconnected,
     UdpBind,
     QuicEndpoint,
     QuicConnection,
@@ -76,7 +75,6 @@ pub enum ManagedLinkPhase {
     Connecting,
     Connected,
     Reconnecting,
-    BootstrapLost,
     AuthenticationFailed,
     Stopped,
 }
@@ -148,8 +146,8 @@ impl ConnectedTransportPeer {
     /// 可选托管一条 additional QUIC；创建者重拨，加入者重新接受，每轮均做
     /// mTLS PIN + Session HMAC。可以创建多个实例，不固定四条也不负责选流。
     ///
-    /// 托管对象持有 Arc<Self>。先关闭托管对象，再结束整个 Control 会话；
-    /// Control 真正断开后不伪造 ICE Restart 或逻辑会话连续性。
+    /// 每个管理句柄维护独立物理连接，初始认证 QUIC 关闭不应中断其它 Link。
+    /// 应用显式 shutdown，SDK 保留会话认证凭据与防重放上下文。
     pub fn manage_link(self: &Arc<Self>) -> ManagedAuthenticatedLink {
         let initial = ManagedLinkStatus {
             phase: ManagedLinkPhase::Connecting, generation: 0,
@@ -163,14 +161,10 @@ impl ConnectedTransportPeer {
             let mut backoff = Duration::from_millis(500);
             let final_phase = loop {
                 if *stopping.borrow() { break ManagedLinkPhase::Stopped; }
-                if peer.bootstrap.close_reason().is_some() {
-                    break ManagedLinkPhase::BootstrapLost;
-                }
                 let result = tokio::select! {
                     _ = stopping.changed() => break ManagedLinkPhase::Stopped,
-                    _ = peer.bootstrap.closed() => break ManagedLinkPhase::BootstrapLost,
                     result = async {
-                        // 控制连接真正的拨号方负责主动建立附属连接；
+                        // 初始 QUIC 的拨号方负责主动建立附属连接；
                         // 邀请码创建/加入角色不代表网络方向。
                         match peer.bootstrap_outbound {
                             true => peer.open_link(Duration::from_secs(12)).await,
@@ -180,11 +174,6 @@ impl ConnectedTransportPeer {
                 };
                 match result {
                     Ok(link) => {
-                        // 连接结果与 Control 关闭可能同时就绪，不能发布虚假的 Healthy。
-                        if peer.bootstrap.close_reason().is_some() {
-                            link.shutdown();
-                            break ManagedLinkPhase::BootstrapLost;
-                        }
                         if link.connection.close_reason().is_some() {
                             link.shutdown();
                             updates.send_replace(ManagedLinkStatus {
@@ -204,7 +193,6 @@ impl ConnectedTransportPeer {
                         });
                         let reason = tokio::select! {
                             _ = stopping.changed() => ManagedLinkPhase::Stopped,
-                            _ = peer.bootstrap.closed() => ManagedLinkPhase::BootstrapLost,
                             _ = link.connection.closed() => ManagedLinkPhase::Reconnecting,
                         };
                         link.shutdown();
@@ -218,9 +206,6 @@ impl ConnectedTransportPeer {
                             last_error: Some(TransportError::QuicConnection),
                         });
                     }
-                    Err(TransportError::BootstrapDisconnected) => {
-                        break ManagedLinkPhase::BootstrapLost;
-                    }
                     // 错误角色是本地 API 误用；来自网络的认证失败则
                     // 必须拒绝当前连接，但不能让恶意探测永久杀死恢复循环。
                     Err(TransportError::WrongRole) => {
@@ -233,10 +218,9 @@ impl ConnectedTransportPeer {
                         });
                     }
                 }
-                // 有界指数退避，停止与 Control 关闭不会被 sleep 阻塞。
+                // 有界指数退避，停止与 应用停止不会被 sleep 阻塞。
                 tokio::select! {
                     _ = stopping.changed() => break ManagedLinkPhase::Stopped,
-                    _ = peer.bootstrap.closed() => break ManagedLinkPhase::BootstrapLost,
                     _ = sleep(backoff) => {}
                 }
                 backoff = backoff.saturating_mul(2).min(Duration::from_secs(5));
@@ -244,9 +228,7 @@ impl ConnectedTransportPeer {
             updates.send_replace(ManagedLinkStatus {
                 phase: final_phase, generation,
                 connection: None,
-                last_error: if final_phase == ManagedLinkPhase::BootstrapLost {
-                    Some(TransportError::BootstrapDisconnected)
-                } else if final_phase == ManagedLinkPhase::AuthenticationFailed {
+                last_error: if final_phase == ManagedLinkPhase::AuthenticationFailed {
                     Some(TransportError::Authentication)
                 } else { None },
             });
@@ -291,18 +273,14 @@ impl ConnectedTransportPeer {
         &self, deadline: Duration,
     ) -> Result<AuthenticatedQuicLink, TransportError> {
         if !self.bootstrap_outbound { return Err(TransportError::WrongRole); }
-        if self.bootstrap.close_reason().is_some() {
-            return Err(TransportError::BootstrapDisconnected);
-        }
         if deadline.is_zero() { return Err(TransportError::Timeout); }
         // 独立 UDP 尝试与共享路径回退必须使用同一个绝对截止时间。
         let expires = Instant::now() + deadline;
-        // QUIC 可以在保持 Control 存活时更新 peer 的实际 NAT 端点。
-        // 附属连接应优先拨到当前已认证 Control 的真实远端，而不是
+        // QUIC 可以在维持已验证对端地址时更新 peer 的实际 NAT 端点。
+        // 附属连接应优先拨到当前最初已认证连接的真实远端，而不是
         // 只能重试最初 ICE 时记录的旧映射。
         let remote = self.bootstrap.remote_address();
         let dedicated = tokio::select! {
-            _ = self.bootstrap.closed() => return Err(TransportError::BootstrapDisconnected),
             result = timeout_at(expires, self.try_dedicated_endpoint()) =>
                 result.map_err(|_| TransportError::Timeout)?,
         };
@@ -310,15 +288,13 @@ impl ConnectedTransportPeer {
             let attempt = self.authenticated_dial(&endpoint, remote);
             let attempt_expires = expires.min(Instant::now() + Duration::from_secs(6));
             let result = tokio::select! {
-                _ = self.bootstrap.closed() => return Err(TransportError::BootstrapDisconnected),
-                result = timeout_at(attempt_expires, attempt) => result,
+                    result = timeout_at(attempt_expires, attempt) => result,
             };
             if let Ok(Ok(connection)) = result {
                 return Ok(self.supervise_link(connection, Some(endpoint), Some(owner)));
             }
         }
         let result = tokio::select! {
-            _ = self.bootstrap.closed() => return Err(TransportError::BootstrapDisconnected),
             result = timeout_at(expires, self.authenticated_dial(&self.endpoint, remote)) => result,
         };
         let connection = result.map_err(|_| TransportError::Timeout)??;
@@ -331,19 +307,14 @@ impl ConnectedTransportPeer {
         &self, deadline: Duration,
     ) -> Result<AuthenticatedQuicLink, TransportError> {
         if self.bootstrap_outbound { return Err(TransportError::WrongRole); }
-        if self.bootstrap.close_reason().is_some() {
-            return Err(TransportError::BootstrapDisconnected);
-        }
         if deadline.is_zero() { return Err(TransportError::Timeout); }
         let expires = Instant::now() + deadline;
         let connecting = tokio::select! {
-            _ = self.bootstrap.closed() => return Err(TransportError::BootstrapDisconnected),
             result = timeout_at(expires, self.endpoint.accept()) =>
                 result.map_err(|_| TransportError::Timeout)?
                     .ok_or(TransportError::QuicConnection)?,
         };
         let connection = tokio::select! {
-            _ = self.bootstrap.closed() => return Err(TransportError::BootstrapDisconnected),
             result = timeout_at(expires, connecting) =>
                 result.map_err(|_| TransportError::Timeout)?
                     .map_err(|_| TransportError::QuicConnection)?,
@@ -353,14 +324,13 @@ impl ConnectedTransportPeer {
             return Err(error);
         }
         let proof = tokio::select! {
-            _ = self.bootstrap.closed() => return Err(TransportError::BootstrapDisconnected),
             result = timeout_at(expires, authenticate_responder(
                 connection.clone(), &self.credentials, LinkProofClass::Additional,
                 &self.replay_guard, deadline,
             )) => result,
         };
         if !matches!(&proof, Ok(Ok(_))) {
-            connection.close(1u32.into(), b"invalid or timed-out data session proof");
+            connection.close(1u32.into(), b"invalid or timed-out additional link proof");
             return Err(if proof.is_err() {
                 TransportError::Timeout
             } else {
@@ -397,7 +367,7 @@ impl ConnectedTransportPeer {
         if authenticate_initiator(connection.clone(), &self.credentials,
             LinkProofClass::Additional, Duration::from_secs(6)).await.is_err()
         {
-            connection.close(1u32.into(), b"invalid data session proof");
+            connection.close(1u32.into(), b"invalid additional link proof");
             return Err(TransportError::Authentication);
         }
         Ok(connection)
@@ -413,20 +383,12 @@ impl ConnectedTransportPeer {
     fn supervise_link(
         &self, connection: Connection, endpoint: Option<Endpoint>, owner: Option<UdpOwner>,
     ) -> AuthenticatedQuicLink {
-        let parent = self.bootstrap.clone();
-        let data = connection.clone();
-        tokio::spawn(async move {
-            tokio::select! {
-                _ = parent.closed() => data.close(0u32.into(), b"control disconnected"),
-                _ = data.closed() => {}
-            }
-        });
         AuthenticatedQuicLink { connection, endpoint, owner }
     }
 
     pub async fn shutdown(mut self) {
-        self.bootstrap.close(0u32.into(), b"control session ended");
-        self.endpoint.close(0u32.into(), b"control session ended");
+        self.bootstrap.close(0u32.into(), b"peer session ended");
+        self.endpoint.close(0u32.into(), b"peer session ended");
         // 等待 Quinn 完成所有连接驱动退出，不能在仍持有 socket 时
         // 就声称 UDP 已经释放。使用有限等待防止异常远端拖住 shutdown。
         let _ = tokio::time::timeout(
