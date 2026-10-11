@@ -6,7 +6,7 @@
 //! This is an experimental transport building block; ICE is not wired up.
 
 use quinn::Connection;
-use crate::{channel::ChannelRole, session_binding::AuthenticatedLink};
+use crate::{channel::LinkProofClass, session_binding::AuthenticatedLink};
 
 #[derive(Clone)]
 #[allow(dead_code)]
@@ -27,7 +27,7 @@ impl DualQuic {
     /// Internal transport assembly only. The public VerifiedManualSession
     /// additionally enforces peer certificate pins and manual confirmation.
     pub(crate) fn from_authenticated_links(control: AuthenticatedLink, data: AuthenticatedLink) -> Result<Self, DualQuicError> {
-        if control.role() != ChannelRole::Control || data.role() != ChannelRole::Data {
+        if control.role() != LinkProofClass::Bootstrap || data.role() != LinkProofClass::Additional {
             return Err(DualQuicError::InvalidRole);
         }
         if control.session_id() != data.session_id() {

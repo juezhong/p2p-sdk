@@ -11,7 +11,7 @@ use quinn::Connection;
 use tokio::sync::mpsc;
 
 use crate::{
-    channel::ChannelRole,
+    channel::LinkProofClass,
     dual_quic::{DualQuic, DualQuicError},
     manual_pairing::ManualPairing,
     peer_pin::{ManualConfirmation, PeerCertificatePin, PeerPinError},
@@ -138,10 +138,10 @@ pub async fn establish_initiator(
 ) -> Result<VerifiedManualSession, VerifiedSessionError> {
     authorize(pairing, confirmation, &control, &data, now)?;
     let first = authenticate_initiator(
-        control, &pairing.credentials, ChannelRole::Control, deadline,
+        control, &pairing.credentials, LinkProofClass::Bootstrap, deadline,
     ).await.map_err(VerifiedSessionError::Binding)?;
     let second = authenticate_initiator(
-        data, &pairing.credentials, ChannelRole::Data, deadline,
+        data, &pairing.credentials, LinkProofClass::Additional, deadline,
     ).await.map_err(VerifiedSessionError::Binding)?;
     let connections = DualQuic::from_authenticated_links(first, second)
         .map_err(VerifiedSessionError::Lanes)?;
@@ -165,10 +165,10 @@ pub async fn establish_responder(
 ) -> Result<VerifiedManualSession, VerifiedSessionError> {
     authorize(pairing, confirmation, &control, &data, now)?;
     let first = authenticate_responder(
-        control, &pairing.credentials, ChannelRole::Control, guard, deadline,
+        control, &pairing.credentials, LinkProofClass::Bootstrap, guard, deadline,
     ).await.map_err(VerifiedSessionError::Binding)?;
     let second = authenticate_responder(
-        data, &pairing.credentials, ChannelRole::Data, guard, deadline,
+        data, &pairing.credentials, LinkProofClass::Additional, guard, deadline,
     ).await.map_err(VerifiedSessionError::Binding)?;
     let connections = DualQuic::from_authenticated_links(first, second)
         .map_err(VerifiedSessionError::Lanes)?;

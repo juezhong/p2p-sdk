@@ -18,7 +18,7 @@ use hmac::{Hmac, Mac};
 use quinn::Connection;
 use sha2::Sha256;
 
-use crate::channel::ChannelRole;
+use crate::channel::LinkProofClass;
 
 type HmacSha256 = Hmac<Sha256>;
 const MAGIC: [u8; 4] = *b"P2PB";
@@ -153,7 +153,7 @@ impl ReplayGuard {
 pub struct AuthenticatedLink {
     connection: Connection,
     session_id: [u8; 16],
-    role: ChannelRole,
+    role: LinkProofClass,
 }
 
 impl AuthenticatedLink {
@@ -161,7 +161,7 @@ impl AuthenticatedLink {
         &self.connection
     }
 
-    pub fn role(&self) -> ChannelRole {
+    pub fn role(&self) -> LinkProofClass {
         self.role
     }
 
@@ -178,7 +178,7 @@ impl AuthenticatedLink {
 pub async fn authenticate_initiator(
     connection: Connection,
     credentials: &SessionCredentials,
-    role: ChannelRole,
+    role: LinkProofClass,
     deadline: Duration,
 ) -> Result<AuthenticatedLink, BindingError> {
     if deadline.is_zero() {
@@ -231,7 +231,7 @@ pub async fn authenticate_initiator(
 pub async fn authenticate_responder(
     connection: Connection,
     credentials: &SessionCredentials,
-    expected_role: ChannelRole,
+    expected_role: LinkProofClass,
     guard: &ReplayGuard,
     deadline: Duration,
 ) -> Result<AuthenticatedLink, BindingError> {
@@ -282,15 +282,15 @@ pub async fn authenticate_responder(
     }).await.map_err(|_| BindingError::Timeout)?
 }
 
-fn role_tag(role: ChannelRole) -> u8 {
+fn role_tag(role: LinkProofClass) -> u8 {
     match role {
-        ChannelRole::Control => 1,
-        ChannelRole::Data => 2,
+        LinkProofClass::Bootstrap => 1,
+        LinkProofClass::Additional => 2,
     }
 }
 
 fn mac_for(
-    credentials: &SessionCredentials, role: ChannelRole,
+    credentials: &SessionCredentials, role: LinkProofClass,
     client_nonce: &[u8; NONCE_LEN], server_nonce: &[u8; NONCE_LEN],
     direction: u8,
 ) -> HmacSha256 {
@@ -304,7 +304,7 @@ fn mac_for(
 }
 
 fn proof(
-    credentials: &SessionCredentials, role: ChannelRole,
+    credentials: &SessionCredentials, role: LinkProofClass,
     client_nonce: &[u8; NONCE_LEN], server_nonce: &[u8; NONCE_LEN],
     direction: u8,
 ) -> [u8; PROOF_LEN] {
@@ -316,7 +316,7 @@ fn proof(
 }
 
 fn verify_proof(
-    credentials: &SessionCredentials, role: ChannelRole,
+    credentials: &SessionCredentials, role: LinkProofClass,
     client_nonce: &[u8; NONCE_LEN], server_nonce: &[u8; NONCE_LEN],
     direction: u8, expected: &[u8],
 ) -> Result<(), BindingError> {
@@ -337,13 +337,13 @@ mod tests {
         let creds = creds();
         let c = [7; 32];
         let s = [8; 32];
-        let tag = proof(&creds, ChannelRole::Control, &c, &s, SERVER_PROOF);
-        assert!(verify_proof(&creds, ChannelRole::Control, &c, &s, SERVER_PROOF, &tag).is_ok());
-        assert_eq!(verify_proof(&creds, ChannelRole::Data, &c, &s, SERVER_PROOF, &tag), Err(BindingError::InvalidProof));
-        assert_eq!(verify_proof(&creds, ChannelRole::Control, &c, &s, CLIENT_PROOF, &tag), Err(BindingError::InvalidProof));
-        assert_eq!(verify_proof(&creds, ChannelRole::Control, &[9; 32], &s, SERVER_PROOF, &tag), Err(BindingError::InvalidProof));
+        let tag = proof(&creds, LinkProofClass::Bootstrap, &c, &s, SERVER_PROOF);
+        assert!(verify_proof(&creds, LinkProofClass::Bootstrap, &c, &s, SERVER_PROOF, &tag).is_ok());
+        assert_eq!(verify_proof(&creds, LinkProofClass::Additional, &c, &s, SERVER_PROOF, &tag), Err(BindingError::InvalidProof));
+        assert_eq!(verify_proof(&creds, LinkProofClass::Bootstrap, &c, &s, CLIENT_PROOF, &tag), Err(BindingError::InvalidProof));
+        assert_eq!(verify_proof(&creds, LinkProofClass::Bootstrap, &[9; 32], &s, SERVER_PROOF, &tag), Err(BindingError::InvalidProof));
         let other = SessionCredentials::new([3; 16], [2; 32]).unwrap();
-        assert_eq!(verify_proof(&other, ChannelRole::Control, &c, &s, SERVER_PROOF, &tag), Err(BindingError::InvalidProof));
+        assert_eq!(verify_proof(&other, LinkProofClass::Bootstrap, &c, &s, SERVER_PROOF, &tag), Err(BindingError::InvalidProof));
     }
 
     #[test]
@@ -401,7 +401,7 @@ mod quinn_integration_tests {
                 // Keep both authenticated QUIC handles alive until the client
                 // has completed the full dual-lane handshake.
                 let mut accepted_links = Vec::new();
-                for role in [ChannelRole::Control, ChannelRole::Data] {
+                for role in [LinkProofClass::Bootstrap, LinkProofClass::Additional] {
                     let incoming = server.accept().await.expect("incoming connection");
                     let connection = incoming.await.expect("TLS authentication");
                     let link = authenticate_responder(
@@ -418,11 +418,11 @@ mod quinn_integration_tests {
 
             let control = client.connect(address, "localhost").unwrap().await.unwrap();
             let control = authenticate_initiator(
-                control, &credentials, ChannelRole::Control, Duration::from_secs(3),
+                control, &credentials, LinkProofClass::Bootstrap, Duration::from_secs(3),
             ).await.unwrap();
             let data = client.connect(address, "localhost").unwrap().await.unwrap();
             let data = authenticate_initiator(
-                data, &credentials, ChannelRole::Data, Duration::from_secs(3),
+                data, &credentials, LinkProofClass::Additional, Duration::from_secs(3),
             ).await.unwrap();
             assert_eq!(client.local_addr().unwrap(), client_local_addr);
             let pair = crate::dual_quic::DualQuic::from_authenticated_links(control, data)
@@ -441,5 +441,5 @@ pub(crate) fn test_session_proof(
     client_nonce: &[u8; 32],
     server_nonce: &[u8; 32],
 ) -> [u8; 32] {
-    proof(credentials, ChannelRole::Control, client_nonce, server_nonce, SERVER_PROOF)
+    proof(credentials, LinkProofClass::Bootstrap, client_nonce, server_nonce, SERVER_PROOF)
 }
