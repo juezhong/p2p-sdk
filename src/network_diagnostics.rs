@@ -16,8 +16,8 @@ use crate::{
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LinkHealth {
     Healthy,
-    DataDegraded,
-    ControlDisconnected,
+    AdditionalUnavailable,
+    BootstrapLost,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -36,12 +36,12 @@ pub struct NetworkDiagnostic {
     pub gateway_method: Option<GatewayMethod>,
     pub remote_candidate_kind: Option<IceCandidateType>,
     pub ipv6: bool,
-    pub control_remote_udp: SocketAddr,
-    pub control_connected: bool,
-    pub base_data_connected: bool,
-    pub desired_data_lanes: usize,
-    pub active_data_lanes: usize,
-    pub data_remotes: Vec<SocketAddr>,
+    pub bootstrap_remote_udp: SocketAddr,
+    pub bootstrap_connected: bool,
+    pub additional_connected: bool,
+    pub requested_additional_links: usize,
+    pub active_additional_links: usize,
+    pub additional_remotes: Vec<SocketAddr>,
     pub stun_mappings: Vec<SocketAddr>,
     pub gateway_mapping: Option<SocketAddr>,
     pub authenticated_peer_reflexive: Vec<SocketAddr>,
@@ -68,12 +68,12 @@ pub async fn snapshot(
         .map(|candidate| candidate.address).collect::<Vec<_>>();
     offered_host_candidates.sort();
     offered_host_candidates.dedup();
-    let control_connected = session.control().close_reason().is_none();
-    let base_data_connected = session.data().close_reason().is_none();
-    let desired_data_lanes = 1;
-    let active_data_lanes = usize::from(base_data_connected);
-    let data_remotes = if base_data_connected {
-        vec![session.data().remote_address()]
+    let bootstrap_connected = session.first().close_reason().is_none();
+    let additional_connected = session.second().close_reason().is_none();
+    let requested_additional_links = 1;
+    let active_additional_links = usize::from(additional_connected);
+    let additional_remotes = if additional_connected {
+        vec![session.second().remote_address()]
     } else {
         Vec::new()
     };
@@ -89,12 +89,12 @@ pub async fn snapshot(
     let mut authenticated_peer_reflexive = authenticated_sources.to_vec();
     authenticated_peer_reflexive.sort();
     authenticated_peer_reflexive.dedup();
-    // The absence of data lanes is not treated as Control loss. The upper
-    // transfer protocol is responsible for retrying unacknowledged blocks.
-    let health = if !control_connected {
-        LinkHealth::ControlDisconnected
-    } else if active_data_lanes == 0 {
-        LinkHealth::DataDegraded
+    // The absence of additional links is not treated as bootstrap link loss. The upper
+    // application is responsible for retrying unacknowledged blocks.
+    let health = if !bootstrap_connected {
+        LinkHealth::BootstrapLost
+    } else if active_additional_links == 0 {
+        LinkHealth::AdditionalUnavailable
     } else {
         LinkHealth::Healthy
     };
@@ -103,9 +103,9 @@ pub async fn snapshot(
         ice_role: local_description.role,
         offered_host_candidates, stun_consistency, gateway_method,
         remote_candidate_kind, ipv6: path.local.is_ipv6(),
-        control_remote_udp: session.control().remote_address(),
-        control_connected, base_data_connected,
-        desired_data_lanes, active_data_lanes, data_remotes,
+        bootstrap_remote_udp: session.first().remote_address(),
+        bootstrap_connected, additional_connected,
+        requested_additional_links, active_additional_links, additional_remotes,
         stun_mappings, gateway_mapping,
         authenticated_peer_reflexive, health,
     }
@@ -126,18 +126,18 @@ mod tests {
             stun_consistency: None,
             gateway_method: None,
             ipv6: false,
-            control_remote_udp: "198.51.100.4:42000".parse().unwrap(),
-            control_connected: true,
-            base_data_connected: false,
-            active_data_lanes: 0, desired_data_lanes: 4,
-            data_remotes: vec![],
+            bootstrap_remote_udp: "198.51.100.4:42000".parse().unwrap(),
+            bootstrap_connected: true,
+            additional_connected: false,
+            active_additional_links: 0, requested_additional_links: 4,
+            additional_remotes: vec![],
             stun_mappings: vec![],
             gateway_mapping: None,
             authenticated_peer_reflexive: vec![],
-            health: LinkHealth::DataDegraded,
+            health: LinkHealth::AdditionalUnavailable,
         };
         let out = format!("{value:?}");
-        assert!(out.contains("DataDegraded"));
+        assert!(out.contains("AdditionalUnavailable"));
         assert!(!out.contains("ufrag"));
         assert!(!out.contains("secret"));
         assert!(!out.contains("private"));

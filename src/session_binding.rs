@@ -425,9 +425,9 @@ mod quinn_integration_tests {
                 data, &credentials, LinkProofClass::Additional, Duration::from_secs(3),
             ).await.unwrap();
             assert_eq!(client.local_addr().unwrap(), client_local_addr);
-            let pair = crate::dual_quic::DualQuic::from_authenticated_links(control, data)
+            let pair = crate::dual_quic::QuicLinkPair::from_authenticated_links(control, data)
                 .expect("same verified application session");
-            assert_ne!(pair.control().stable_id(), pair.data().stable_id());
+            assert_ne!(pair.first().stable_id(), pair.second().stable_id());
             complete_tx.send(()).expect("signal successful role pairing");
             server_task.await.unwrap();
             client.close(0u32.into(), b"test complete");

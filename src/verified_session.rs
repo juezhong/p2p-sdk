@@ -1,7 +1,7 @@
 //! Single public entry point for an authorized, manually paired QUIC session.
 //!
 //! Requires independent human confirmation, current pairing lifetime, peer TLS
-//! leaf pin on BOTH connections, and distinct Control/Data HMAC role proofs.
+//! leaf pin on BOTH connections, and distinct First/Second HMAC role proofs.
 //! The caller still MUST configure strict mutual TLS, manage certificate
 //! rotation and validate an ICE-nominated UDP path before using this for P2P.
 
@@ -12,7 +12,7 @@ use tokio::sync::mpsc;
 
 use crate::{
     channel::LinkProofClass,
-    dual_quic::{DualQuic, DualQuicError},
+    dual_quic::{QuicLinkPair, LinkPairError},
     manual_pairing::ManualPairing,
     peer_pin::{ManualConfirmation, PeerCertificatePin, PeerPinError},
     session_binding::{
@@ -26,17 +26,17 @@ pub enum VerifiedSessionError {
     Confirmation(PeerPinError),
     PeerIdentity(PeerPinError),
     Binding(BindingError),
-    Lanes(DualQuicError),
+    Lanes(LinkPairError),
 }
 
 pub struct VerifiedManualSession {
-    connections: DualQuic,
+    connections: QuicLinkPair,
     session_id: [u8; 16],
     remote_certificate_sha256: [u8; 32],
 }
 
-/// An authenticated QUIC link is no longer usable. Data and Control failures
-/// are separate events: losing a data lane must not tear down healthy Control.
+/// An authenticated QUIC link is no longer usable. Second and First failures
+/// are separate events: losing a second lane must not tear down healthy First.
 /// Receiving an event does NOT imply that ICE or the QUIC lane was repaired.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SessionLinkEvent {
@@ -45,12 +45,12 @@ pub enum SessionLinkEvent {
 }
 
 impl VerifiedManualSession {
-    pub fn control(&self) -> &Connection {
-        self.connections.control()
+    pub fn first(&self) -> &Connection {
+        self.connections.first()
     }
 
-    pub fn data(&self) -> &Connection {
-        self.connections.data()
+    pub fn second(&self) -> &Connection {
+        self.connections.second()
     }
 
     pub fn session_id(&self) -> [u8; 16] {
@@ -61,31 +61,31 @@ impl VerifiedManualSession {
         self.remote_certificate_sha256
     }
 
-    pub fn close_data(&self) {
-        self.connections.close_data();
+    pub fn close_second(&self) {
+        self.connections.close_second();
     }
 
-    /// Observe link termination independently of Control RPC traffic.
+    /// Observe link termination independently of First RPC traffic.
     /// The monitor does not extend lifetimes or suppress actual disconnects.
-    /// The caller may continue Control operations after DataDisconnected,
-    /// but must reauthenticate a replacement Data QUIC connection before
-    /// resuming data. ControlDisconnected requires a new verified session.
+    /// The caller may continue First operations after DataDisconnected,
+    /// but must reauthenticate a replacement Second QUIC connection before
+    /// resuming second. ControlDisconnected requires a new verified session.
     ///
     /// Dropping the receiver stops the watcher without closing either QUIC
     /// connection. All events are emitted once for this watcher.
     pub fn watch_link_termination(&self) -> mpsc::UnboundedReceiver<SessionLinkEvent> {
-        let control = self.control().clone();
-        let data = self.data().clone();
+        let first = self.first().clone();
+        let second = self.second().clone();
         let (sender, receiver) = mpsc::unbounded_channel();
         tokio::spawn(async move {
             tokio::select! {
                 biased;
                 _ = sender.closed() => return,
-                _ = control.closed() => {
+                _ = first.closed() => {
                     let _ = sender.send(SessionLinkEvent::ControlDisconnected);
                     return;
                 },
-                _ = data.closed() => {
+                _ = second.closed() => {
                     if sender.send(SessionLinkEvent::DataDisconnected).is_err() {
                         return;
                     }
@@ -93,7 +93,7 @@ impl VerifiedManualSession {
             }
             tokio::select! {
                 _ = sender.closed() => {},
-                _ = control.closed() => {
+                _ = first.closed() => {
                     let _ = sender.send(SessionLinkEvent::ControlDisconnected);
                 },
             }
@@ -105,8 +105,8 @@ impl VerifiedManualSession {
 fn authorize(
     pairing: &ManualPairing,
     confirmation: &ManualConfirmation,
-    control: &Connection,
-    data: &Connection,
+    first: &Connection,
+    second: &Connection,
     now: u64,
 ) -> Result<(), VerifiedSessionError> {
     if now >= pairing.expires_at {
@@ -118,10 +118,10 @@ fn authorize(
     ).map_err(VerifiedSessionError::Confirmation)?;
     let expected = PeerCertificatePin::new(pairing.remote_tls_cert_sha256)
         .map_err(VerifiedSessionError::PeerIdentity)?;
-    expected.verify_connection(control).map_err(VerifiedSessionError::PeerIdentity)?;
-    expected.verify_connection(data).map_err(VerifiedSessionError::PeerIdentity)?;
-    if control.stable_id() == data.stable_id() {
-        return Err(VerifiedSessionError::Lanes(DualQuicError::SameConnection));
+    expected.verify_connection(first).map_err(VerifiedSessionError::PeerIdentity)?;
+    expected.verify_connection(second).map_err(VerifiedSessionError::PeerIdentity)?;
+    if first.stable_id() == second.stable_id() {
+        return Err(VerifiedSessionError::Lanes(LinkPairError::SameConnection));
     }
     Ok(())
 }
@@ -129,21 +129,21 @@ fn authorize(
 /// Both QUIC connections MUST already have completed mutually authenticated
 /// TLS. Only this function can assemble the public verified session handle.
 pub async fn establish_initiator(
-    control: Connection,
-    data: Connection,
+    first: Connection,
+    second: Connection,
     pairing: &ManualPairing,
     confirmation: &ManualConfirmation,
     now: u64,
     deadline: Duration,
 ) -> Result<VerifiedManualSession, VerifiedSessionError> {
-    authorize(pairing, confirmation, &control, &data, now)?;
+    authorize(pairing, confirmation, &first, &second, now)?;
     let first = authenticate_initiator(
-        control, &pairing.credentials, LinkProofClass::Bootstrap, deadline,
+        first, &pairing.credentials, LinkProofClass::Bootstrap, deadline,
     ).await.map_err(VerifiedSessionError::Binding)?;
     let second = authenticate_initiator(
-        data, &pairing.credentials, LinkProofClass::Additional, deadline,
+        second, &pairing.credentials, LinkProofClass::Additional, deadline,
     ).await.map_err(VerifiedSessionError::Binding)?;
-    let connections = DualQuic::from_authenticated_links(first, second)
+    let connections = QuicLinkPair::from_authenticated_links(first, second)
         .map_err(VerifiedSessionError::Lanes)?;
     Ok(VerifiedManualSession {
         connections,
@@ -153,24 +153,24 @@ pub async fn establish_initiator(
 }
 
 /// The responder's replay guard must be owned by the application session,
-/// shared across both lanes, and not recreated when a data lane is retried.
+/// shared across both lanes, and not recreated when a second lane is retried.
 pub async fn establish_responder(
-    control: Connection,
-    data: Connection,
+    first: Connection,
+    second: Connection,
     pairing: &ManualPairing,
     confirmation: &ManualConfirmation,
     guard: &ReplayGuard,
     now: u64,
     deadline: Duration,
 ) -> Result<VerifiedManualSession, VerifiedSessionError> {
-    authorize(pairing, confirmation, &control, &data, now)?;
+    authorize(pairing, confirmation, &first, &second, now)?;
     let first = authenticate_responder(
-        control, &pairing.credentials, LinkProofClass::Bootstrap, guard, deadline,
+        first, &pairing.credentials, LinkProofClass::Bootstrap, guard, deadline,
     ).await.map_err(VerifiedSessionError::Binding)?;
     let second = authenticate_responder(
-        data, &pairing.credentials, LinkProofClass::Additional, guard, deadline,
+        second, &pairing.credentials, LinkProofClass::Additional, guard, deadline,
     ).await.map_err(VerifiedSessionError::Binding)?;
-    let connections = DualQuic::from_authenticated_links(first, second)
+    let connections = QuicLinkPair::from_authenticated_links(first, second)
         .map_err(VerifiedSessionError::Lanes)?;
     Ok(VerifiedManualSession {
         connections,
