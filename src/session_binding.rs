@@ -2,7 +2,7 @@
 //!
 //! QUIC/TLS MUST have authenticated its transport peer independently.
 //! This handshake proves possession of one fresh, shared 256-bit session
-//! secret, binds the application session ID and the Control/Data role, and
+//! secret, binds the application session ID and the transport-level link proof class, and
 //! authenticates both sides with independent challenges. It does NOT yet
 //! implement persistent device identity or ICE.
 //!
@@ -115,7 +115,7 @@ impl SessionCredentials {
 }
 
 /// Keeps the nonces of *successfully authenticated* peer connections for
-/// one application session. Must be shared between control/data acceptors.
+/// one application session. Must be shared between all authenticated link acceptors.
 ///
 /// Fail closed when full; don't evict entries while session credentials live.
 pub struct ReplayGuard {
@@ -416,16 +416,16 @@ mod quinn_integration_tests {
                 server.close(0u32.into(), b"test complete");
             });
 
-            let control = client.connect(address, "localhost").unwrap().await.unwrap();
-            let control = authenticate_initiator(
-                control, &credentials, LinkProofClass::Bootstrap, Duration::from_secs(3),
+            let first = client.connect(address, "localhost").unwrap().await.unwrap();
+            let first = authenticate_initiator(
+                first, &credentials, LinkProofClass::Bootstrap, Duration::from_secs(3),
             ).await.unwrap();
-            let data = client.connect(address, "localhost").unwrap().await.unwrap();
-            let data = authenticate_initiator(
-                data, &credentials, LinkProofClass::Additional, Duration::from_secs(3),
+            let second = client.connect(address, "localhost").unwrap().await.unwrap();
+            let second = authenticate_initiator(
+                second, &credentials, LinkProofClass::Additional, Duration::from_secs(3),
             ).await.unwrap();
             assert_eq!(client.local_addr().unwrap(), client_local_addr);
-            let pair = crate::dual_quic::QuicLinkPair::from_authenticated_links(control, data)
+            let pair = crate::dual_quic::QuicLinkPair::from_authenticated_links(first, second)
                 .expect("same verified application session");
             assert_ne!(pair.first().stable_id(), pair.second().stable_id());
             complete_tx.send(()).expect("signal successful role pairing");
